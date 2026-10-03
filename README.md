@@ -177,6 +177,13 @@ Needs a model: any OpenAI-compatible `/chat/completions` endpoint via
 the agent loaded the page, clicked through, typed a signup form, submitted,
 and verified the confirmation — in a fresh browser and via CDP attach.
 
+`--max-cost-usd` caps the run's estimated model spend (default 0 =
+unlimited). The first model call is always issued — there's no estimate
+yet — then after each call the run stops *before* the next model call
+would exceed the ceiling, with status `blocked` and the ceiling named in
+the summary. The ceiling and the stop are recorded in `perform.json`,
+`PERFORM.md`, and the ledger.
+
 Env knobs: `QALOOP_RUNS`, `QALOOP_DB`, `QALOOP_EXECUTABLE_PATH` (chromium
 binary override), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
 `QALOOP_MODEL_*` (base url, name, key, per-1M prices).
