@@ -343,18 +343,108 @@ def test_mock_validation():
     base = "name: t\ntarget: http://x\nsetup:\n  - mock: {url: '**/a', json: {x: 1}}\nsteps:\n  - {goto: /}\n"
     s = load(base)
     check("mock op parses", s.setup[0].op == "mock" and s.setup[0].params["url"] == "**/a")
-    for bad in [
-        "name: t\nsetup:\n  - mock: {json: {x: 1}}\n",                              # no url
-        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, body: 'z'}\n",  # two payloads
-        "name: t\nsetup:\n  - mock: {url: '**/a'}\n",                             # no payload
-        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, method: get}\n",   # lowercase
-        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, times: 0}\n",      # times<=0
+    for bad_mock, label in [
+        ("mock: {json: {x: 1}}", "no url"),
+        ("mock: {url: '**/a', json: {x: 1}, body: 'z'}", "two payloads"),
+        ("mock: {url: '**/a'}", "no payload"),
+        ("mock: {url: '**/a', json: {x: 1}, method: get}", "lowercase"),
+        ("mock: {url: '**/a', json: {x: 1}, times: 0}", "times<=0"),
+        ("mock: {url: '**/a', json: {x: 1}, delay_ms: -1}", "delay_ms<0"),
+        ("mock: {url: '**/a', json: {x: 1}, delay_ms: '250'}", "delay_ms str"),
+        ("mock: {url: '**/a', json: {x: 1}, delay_ms: 1.5}", "delay_ms float"),
+        ("mock: {url: '**/a', json: {x: 1}, delay_ms: true}", "delay_ms bool"),
     ]:
+        bad = base.replace("mock: {url: '**/a', json: {x: 1}}", bad_mock)
         try:
             load(bad)
-            check(f"bad mock rejected: {bad.splitlines()[1].strip()}", False, "no error")
+            check(f"bad mock rejected ({label})", False, "no error")
         except SpecError:
-            check(f"bad mock rejected: {bad.splitlines()[1].strip()}", True)
+            check(f"bad mock rejected ({label})", True)
+    for good, val in [
+        (base.replace("mock: {url: '**/a', json: {x: 1}}",
+                      "mock: {url: '**/a', json: {x: 1}, delay_ms: 0}"), 0),
+        (base.replace("mock: {url: '**/a', json: {x: 1}}",
+                      "mock: {url: '**/a', json: {x: 1}, delay_ms: 250}"), 250),
+    ]:
+        s = load(good)
+        check(f"valid mock accepted: delay_ms={val}",
+              s.setup[0].params.get("delay_ms") == val, s.setup[0].params)
+
+
+def test_mock_delay_ms_runner():
+    """Real browser proof: a mock with delay_ms=250 holds the response ~250ms;
+    delay_ms absent still responds instantly (no timing regression)."""
+    import socket
+    import subprocess
+    import time
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        have_pw = True
+    except ImportError:
+        have_pw = False
+    if not have_pw or not os.path.exists(exe):
+        check("delay_ms runner tests skipped (no browser)", True)
+        return
+    from qaloop.spec import load_spec
+    from qaloop.runner import run_flow
+
+    def fetch_js(url, assertion):
+        return ("(async () => { const t0 = performance.now(); "
+                "await fetch('" + url + "').then(r => r.json()); "
+                "const e = performance.now() - t0; " + assertion + "; "
+                "return 'elapsed ' + Math.round(e) + 'ms'; })()")
+
+    def make_flow(url, mock_extra, assertion):
+        js = fetch_js(url, assertion).replace('"', '\\"')
+        return (
+            "name: delay-demo\ntarget: http://127.0.0.1:PORT\n"
+            "setup:\n  - mock: {url: '**" + url + "', json: {ok: true}" + mock_extra + "}\n"
+            "steps:\n"
+            "  - name: fetch timing\n"
+            '    script: {js: "' + js + '"}\n'
+            "    expect: {noop: true}\n")
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "index.html"), "w") as f:
+            f.write("<html><body><h1>delay demo</h1></body></html>")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            flow = make_flow(
+                "/api/slow", ", delay_ms: 250",
+                "if (e < 200) throw new Error('delay not applied: ' + e + 'ms')"
+            ).replace("PORT", str(port))
+            flow_path = os.path.join(d, "delay-flow.yaml")
+            with open(flow_path, "w") as f:
+                f.write(flow)
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(load_spec(flow_path), run_dir=run_dir,
+                                  executable_path=exe)
+                check("delay_ms=250 holds response >= 200ms",
+                      result.status == "passed", result.status)
+            flow = make_flow(
+                "/api/fast", "",
+                "if (e > 2000) throw new Error('unexpected delay: ' + e + 'ms')"
+            ).replace("PORT", str(port))
+            flow_path = os.path.join(d, "fast-flow.yaml")
+            with open(flow_path, "w") as f:
+                f.write(flow)
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(load_spec(flow_path), run_dir=run_dir,
+                                  executable_path=exe)
+                check("delay_ms absent still responds fast (< 2000ms)",
+                      result.status == "passed", result.status)
+        finally:
+            srv.terminate()
 
 
 def test_visual_ax_assertion_validation():

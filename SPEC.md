@@ -84,7 +84,7 @@ and previously booted services are stopped.
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
 | `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
-| `mock` | `{url, json?|body?|path?, status?, method?, headers?, times?}` | register a network mock before navigation (see below) |
+| `mock` | `{url, json?|body?|path?, status?, method?, headers?, times?, delay_ms?}` | register a network mock before navigation (see below) |
 | `script` | `{js: "..."}` | `page.evaluate`; result ignored |
 
 Step meta keys: `name`, `expect`, `continue_on_fail` (default false —
@@ -112,6 +112,16 @@ setup:
 
 Later requests to the same URL fall through to the real network, so flows
 can mix mocked data with real endpoints.
+
+`delay_ms` (optional int ≥ 0, default 0) delays the mocked response by exactly
+that many milliseconds — the route fires on the first request, the response
+is just held back. The hold does not freeze the automation: the handler
+yields back to the browser driver while waiting, so mid-flight assertions
+keep running during the delay. With 0 the mock responds instantly (current
+behavior, no timing change). With a delay, flows can deterministically assert
+loading states: show the spinner or skeleton on click, assert the indicator
+`visible` while the delayed response is in flight, then `wait` for it to be
+hidden and assert the settled content with `text_contains`.
 
 ## Assertions (`expect:` mapping)
 
