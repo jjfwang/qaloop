@@ -1436,6 +1436,144 @@ def test_step_retry_runner():
             srv.wait()
 
 
+@contextlib.contextmanager
+def temp_ledger():
+    with tempfile.TemporaryDirectory() as d:
+        old = os.environ.get("QALOOP_LEDGER")
+        os.environ["QALOOP_LEDGER"] = os.path.join(d, "ledger.jsonl")
+        try:
+            yield os.environ["QALOOP_LEDGER"]
+        finally:
+            if old is None:
+                del os.environ["QALOOP_LEDGER"]
+            else:
+                os.environ["QALOOP_LEDGER"] = old
+
+
+def test_ledger_round_trip_and_ts():
+    from qaloop import ledger
+    with temp_ledger() as path:
+        ledger.append({"kind": "scripted", "flow": "demo", "cost_usd_est": 0.0})
+        entries = ledger.read_all()
+        check("ledger append/read round trip", len(entries) == 1
+              and entries[0]["flow"] == "demo", str(len(entries)))
+        check("ledger append stamps ts",
+              bool(entries[0].get("ts")), str(entries[0].get("ts")))
+
+
+def test_ledger_read_all_missing_and_blanks():
+    from qaloop import ledger
+    with temp_ledger():
+        check("read_all on missing path returns []", ledger.read_all() == [])
+        ledger.append({"kind": "scripted"})
+        path = ledger.ledger_path()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n   \n")
+        entries = ledger.read_all()
+        check("read_all skips blank lines", len(entries) == 1, str(len(entries)))
+
+
+def test_ledger_path_override():
+    from qaloop import ledger
+    with temp_ledger() as path:
+        check("QALOOP_LEDGER override honored", ledger.ledger_path() == path)
+        ledger.append({"kind": "investigation", "cost_usd_est": 0.01})
+        check("append writes to override path", os.path.exists(path))
+
+
+def test_ledger_summarize():
+    from qaloop import ledger
+    entries = [
+        {"kind": "scripted", "cost_usd_est": 0.0},
+        {"kind": "scripted"},  # missing cost treated as 0
+        {"kind": "investigation", "cost_usd_est": 0.01234},
+        {"kind": "investigation", "cost_usd_est": 0.1},
+    ]
+    s = ledger.summarize(entries=entries)
+    check("summarize counts scripted runs", s["scripted_runs"] == 2,
+          str(s["scripted_runs"]))
+    check("summarize counts investigations", s["investigations"] == 2,
+          str(s["investigations"]))
+    check("summarize counts all runs", s["runs"] == 4, str(s["runs"]))
+    check("summarize totals cost", s["total_cost_usd_est"] == round(0.11234, 4),
+          str(s["total_cost_usd_est"]))
+    check("summarize totals investigation cost",
+          s["investigation_cost_usd_est"] == round(0.11234, 4),
+          str(s["investigation_cost_usd_est"]))
+    with temp_ledger():
+        ledger.append({"kind": "scripted"})
+        ledger.append({"kind": "investigation", "cost_usd_est": 0.5})
+        s2 = ledger.summarize()  # entries=None reads the ledger from disk
+        check("summarize() reads ledger when entries=None",
+              s2["runs"] == 2 and s2["investigations"] == 1, str(s2))
+
+
+def _write_run_json(runs_root, run_id, run):
+    run_dir = os.path.join(runs_root, run_id)
+    os.makedirs(run_dir)
+    with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(run, f)
+    return run_dir
+
+
+def test_dashboard_build():
+    from qaloop import dashboard
+    with tempfile.TemporaryDirectory() as d, temp_ledger():
+        from qaloop import ledger
+        ledger.append({"kind": "scripted", "cost_usd_est": 0.0})
+        ledger.append({"kind": "investigation", "cost_usd_est": 0.25})
+        runs_root = os.path.join(d, "runs")
+        os.makedirs(runs_root)
+        _write_run_json(runs_root, "run-ok", {
+            "run_dir": "runs/run-ok", "flow_name": "smoke",
+            "status": "passed", "started": 1728000000, "duration_ms": 1234,
+            "steps": [{"name": "open", "attempts": 1}]})
+        # missing started -> ts() fallback renders an em dash, no crash
+        _write_run_json(runs_root, "run-nostart", {
+            "run_dir": "runs/run-nostart", "flow_name": "smoke",
+            "status": "passed", "duration_ms": 5,
+            "steps": [{"name": "open", "attempts": 1}]})
+        _write_run_json(runs_root, "run-bad", {
+            "run_dir": "runs/run-bad", "flow_name": "smoke",
+            "status": "failed", "started": 1728003600, "duration_ms": 5678,
+            "diagnosis": {"likely_cause": "selector drift on the login button"},
+            "steps": [{"name": "login", "attempts": 3}]})
+        out = dashboard.build(runs_root, os.path.join(d, "dash"))
+        html = open(out, encoding="utf-8").read()
+        check("dashboard build returns index.html",
+              out.endswith("index.html") and os.path.exists(out))
+        check("dashboard cards count 2 runs", ">3</b>runs" in html)
+        check("dashboard cards count passed/failed",
+              ">2</b>passed" in html and ">1</b>failed" in html)
+        check("dashboard cards count investigations",
+              ">1</b>investigations" in html)
+        check("dashboard failed row shows diagnosis excerpt",
+              "dx: " in html and "selector drift on the login button" in html)
+        check("dashboard retry row shows attempts", "3 attempts" in html)
+        check("dashboard report href",
+              "../runs/run-bad/REPORT.md" in html
+              and "../runs/run-ok/REPORT.md" in html)
+        check("dashboard shows timestamps", "2024-10-04" in html)
+        check("dashboard ts fallback renders em dash", "<td>—</td>" in html)
+
+
+def test_dashboard_empty_runs():
+    from qaloop import dashboard
+    with tempfile.TemporaryDirectory() as d, temp_ledger():
+        runs_root = os.path.join(d, "runs")
+        os.makedirs(runs_root)
+        # one malformed run.json must be skipped silently, not crash the build
+        bad = os.path.join(runs_root, "broken")
+        os.makedirs(bad)
+        open(os.path.join(bad, "run.json"), "w").write("{not json")
+        out = dashboard.build(runs_root, os.path.join(d, "dash"))
+        html = open(out, encoding="utf-8").read()
+        check("dashboard empty runs renders 'no runs yet'",
+              "no runs yet" in html)
+        check("dashboard empty runs still writes index.html",
+              os.path.exists(out))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
