@@ -231,6 +231,7 @@ client-facing changes to ship a flow spec.
 qaloop/            the framework
   spec.py          YAML loader + validator (schema v1)
   runner.py        deterministic Playwright runner
+  perform.py       natural-language browser task agent (reads the AX tree, acts semantically, stops honestly when blocked)
   artifacts.py     screenshots, AX snapshots (CDP), console/network collectors
   report.py        REPORT.md + run.json + stdout card
   env.py           boot static/command targets, wait-for-ready
@@ -238,6 +239,7 @@ qaloop/            the framework
   worker.py        claim → boot → run → report
   webhook.py       GitHub webhook + /enqueue
   investigate.py   bounded agentic investigator
+  evaluate.py      semantic judge: does the change actually make sense (claim + diff + run evidence)
   dashboard.py     static HTML dashboard
   ledger.py        JSONL cost ledger
   cli.py           CLI
