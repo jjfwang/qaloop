@@ -157,11 +157,13 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
             status, run_dir = worst, last_dir
         else:
             raise ValueError(f"unknown job kind {kind!r}")
-        q.complete(job["id"], "done" if status == "passed" else "failed",
-                   run_dir=run_dir, note=f"{kind} -> {status}")
+        if status == "passed":
+            q.complete(job["id"], "done", run_dir=run_dir, note=f"{kind} -> {status}")
+        else:
+            q.record_failure(job["id"], f"{kind} -> {status}")
     except Exception as e:  # noqa: BLE001 — job failure is recorded, not raised
         traceback.print_exc()
-        q.complete(job["id"], "failed", note=f"worker error: {e}"[:2000])
+        q.record_failure(job["id"], f"worker error: {e}"[:2000])
     finally:
         for t in targets:
             t.stop()

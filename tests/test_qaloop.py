@@ -111,6 +111,149 @@ def test_queue_stale_requeue():
         check("reclaimed after requeue", job is not None and job["id"] == jid)
 
 
+def _job_row(jid):
+    from qaloop import queue
+    con = queue.connect()
+    try:
+        return dict(con.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
+    finally:
+        con.close()
+
+
+def test_retry_first_failure_requeues():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"}, max_retries=2)
+        job = queue.claim()
+        check("first claim starts with attempts 0", job["attempts"] == 0, str(job["attempts"]))
+        out = queue.record_failure(job["id"], "boom")
+        check("first failure requeues", out == "requeued", out)
+        row = _job_row(jid)
+        check("requeued job back to pending", row["status"] == "pending", row["status"])
+        check("attempts incremented after failure 1", row["attempts"] == 1, str(row["attempts"]))
+        check("claim cleared on requeue", row["claimed_at"] is None)
+        check("retry note recorded", "retry 1 of 2" in (row["note"] or ""), row["note"] or "")
+        job2 = queue.claim()
+        check("requeued job claimed again", job2 is not None and job2["id"] == jid)
+        out = queue.record_failure(job2["id"], "boom")
+        check("second failure requeues", out == "requeued", out)
+        row = _job_row(jid)
+        check("attempts incremented after failure 2", row["attempts"] == 2, str(row["attempts"]))
+        check("still pending after failure 2", row["status"] == "pending", row["status"])
+
+
+def test_retry_fails_twice_then_passes():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"}, max_retries=2)
+        claims = 0
+        for _ in range(2):
+            job = queue.claim()
+            claims += 1
+            queue.record_failure(job["id"], "boom")
+        job = queue.claim()
+        claims += 1
+        queue.complete(job["id"], "done", run_dir="/tmp/r")
+        row = _job_row(jid)
+        check("fails-twice-then-passes is done", row["status"] == "done", row["status"])
+        check("fails-twice-then-passes takes 3 claims", claims == 3, str(claims))
+
+
+def test_retry_exhausted_leaves_failed():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"}, max_retries=2)
+        for _ in range(2):
+            job = queue.claim()
+            queue.record_failure(job["id"], "boom")
+        job = queue.claim()
+        out = queue.record_failure(job["id"], "boom")
+        check("third failure ends failed", out == "failed", out)
+        row = _job_row(jid)
+        check("exhausted job status failed", row["status"] == "failed", row["status"])
+        check("attempts == 3 after three failures", row["attempts"] == 3, str(row["attempts"]))
+        check("no requeue after exhaustion", queue.claim() is None)
+
+
+def test_retry_default_zero_terminal():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"})
+        job = queue.claim()
+        out = queue.record_failure(job["id"], "boom")
+        check("default max_retries stays terminal", out == "failed", out)
+        row = _job_row(jid)
+        check("one failure marks failed", row["status"] == "failed", row["status"])
+        check("attempts == 1 with no retries", row["attempts"] == 1, str(row["attempts"]))
+        check("nothing to reclaim", queue.claim() is None)
+
+
+def test_requeue_failed_primitive():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"}, max_retries=5)
+        job = queue.claim()
+        queue.requeue_failed(job["id"], "transient glitch")
+        row = _job_row(jid)
+        check("requeue_failed resets to pending", row["status"] == "pending", row["status"])
+        check("requeue_failed increments attempts", row["attempts"] == 1, str(row["attempts"]))
+        check("requeue_failed clears claim", row["claimed_at"] is None)
+        check("requeue_failed keeps note", "transient glitch" in (row["note"] or ""), row["note"] or "")
+        jid2 = queue.enqueue("verify-flow", {"flow": "z.yaml"})
+        job2 = queue.claim()
+        check("requeued job wins the claim (oldest id first)", job2 is not None and job2["id"] == jid, str(job2 and job2["id"]))
+
+
+def test_enqueue_stores_max_retries():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml"}, max_retries=2)
+        row = _job_row(jid)
+        check("max_retries stored on insert", row["max_retries"] == 2, str(row["max_retries"]))
+        check("attempts starts at 0", row["attempts"] == 0, str(row["attempts"]))
+        jobs = queue.list_jobs()
+        check("list_jobs surfaces max_retries", jobs[0]["max_retries"] == 2)
+        for bad in (-1, "2", 2.5):
+            try:
+                queue.enqueue("verify-flow", {}, max_retries=bad)
+                check(f"max_retries {bad!r} rejected", False, "no error raised")
+            except (ValueError, TypeError):
+                check(f"max_retries {bad!r} rejected", True)
+
+
+def test_retry_migration_from_old_schema():
+    import sqlite3
+    from qaloop import queue
+    with temp_db():
+        con = sqlite3.connect(os.environ["QALOOP_DB"])
+        con.execute(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " created_at REAL NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,"
+            " status TEXT NOT NULL DEFAULT 'pending', claimed_at REAL,"
+            " finished_at REAL, run_dir TEXT, note TEXT)")
+        con.execute("INSERT INTO jobs (created_at, kind, payload) VALUES (1.0, 'verify-flow', '{}')")
+        con.commit()
+        con.close()
+        jid = queue.enqueue("verify-flow", {"flow": "y.yaml"}, max_retries=1)
+        queue.complete(jid, "done", note="ok")
+        row = _job_row(jid)
+        check("migrated db accepts new rows", row["status"] == "done" and row["max_retries"] == 1,
+              f"{row['status']} max_retries={row['max_retries']}")
+        old = _job_row(1)
+        check("pre-existing row upgraded in place",
+              old["status"] == "pending" and old["max_retries"] == 0 and old["attempts"] == 0,
+              f"{old['status']} max_retries={old['max_retries']} attempts={old['attempts']}")
+
+
+def test_cli_enqueue_max_retries_flag():
+    from qaloop.cli import build_parser
+    args = build_parser().parse_args(["enqueue", "--kind", "verify-flow", "--flow", "x.yaml",
+                                      "--max-retries", "2"])
+    check("cli parses --max-retries", args.max_retries == 2)
+    args0 = build_parser().parse_args(["enqueue"])
+    check("cli default --max-retries 0", args0.max_retries == 0)
+
+
 def test_webhook_signature():
     import hmac as _hmac
     import hashlib as _hl

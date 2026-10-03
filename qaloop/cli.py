@@ -242,13 +242,16 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_enqueue(args: argparse.Namespace) -> int:
     from qaloop import queue as q
     import json as _json
+    if args.max_retries < 0:
+        print(f"error: --max-retries must be >= 0 (got {args.max_retries})")
+        return 2
     payload = _json.loads(args.payload or "{}")
     if args.kind == "verify-flow":
         payload.setdefault("flow", args.flow)
         if args.target:
             payload["target"] = args.target
-    job_id = q.enqueue(args.kind, payload)
-    print(f"enqueued job #{job_id} ({args.kind})")
+    job_id = q.enqueue(args.kind, payload, max_retries=args.max_retries)
+    print(f"enqueued job #{job_id} ({args.kind}, max_retries={args.max_retries})")
     return 0
 
 
@@ -323,6 +326,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--target", help="target URL override (verify-flow)")
     e.add_argument("--payload", default="{}",
                    help="extra JSON payload (e.g. '{\"repo\": \"x\"}')")
+    e.add_argument("--max-retries", type=int, default=0,
+                   help="retry the job up to N extra attempts after the first failure (default 0 = terminal)")
     e.set_defaults(fn=cmd_enqueue)
 
     w = sub.add_parser("worker", help="run the job worker")
