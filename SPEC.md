@@ -65,10 +65,31 @@ max_investigation_actions: 20
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
 | `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
+| `mock` | `{url, json?|body?|path?, status?, method?, headers?, times?}` | register a network mock before navigation (see below) |
 | `script` | `{js: "..."}` | `page.evaluate`; result ignored |
 
 Step meta keys: `name`, `expect`, `continue_on_fail` (default false —
 a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`).
+
+### `mock` — deterministic data without a backend
+
+`mock` registers a Playwright route before the requests are made, so it
+belongs in `setup` (or at least before the `goto` that triggers the
+request). Exactly one of `json`, `body`, or `path` must be given.
+
+```yaml
+setup:
+  - name: companions API returns two pets
+    mock:
+      url: "**/api/companions"   # URL glob
+      method: GET                 # optional; uppercase
+      status: 200                 # optional, default 200
+      json: {companions: [{id: c1, name: 阿岩}, {id: c2, name: 小雪}]}
+      times: 3                    # optional: mock only the first N hits, then passthrough
+```
+
+Later requests to the same URL fall through to the real network, so flows
+can mix mocked data with real endpoints.
 
 ## Assertions (`expect:` mapping)
 
@@ -82,6 +103,43 @@ a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`).
 | `noop` | `true` — documents an intentionally dead control |
 | `console_clean` | `true` — no new console/page errors since the step started |
 | `js` | `{script, contains}` — evaluate JS, output must contain text |
+| `screenshot_matches` | `{baseline, selector?, max_diff?}` — visual pinning (see below) |
+| `ax` | `{role, name?, state?}` — accessibility-contract assertion (see below) |
+
+### `screenshot_matches` — visual UX pinning
+
+Takes a screenshot (full page, or an element via `selector`) and compares it
+against a checked-in baseline with a normalized RMS pixel difference
+(0.0 = identical). `max_diff` defaults to 0.02 (2% RMS). Baselines resolve
+relative to the flow file's directory — conventionally `baselines/`.
+
+```yaml
+expect:
+  - screenshot_matches: {baseline: "baselines/companion-card.png", max_diff: 0.03}
+```
+
+Generate baselines explicitly, never by accident:
+
+```bash
+python3 -m qaloop.cli baselines flows/my-flow.yaml
+```
+
+A missing baseline fails the assertion with a pointer to this command;
+`qaloop verify` never writes baselines.
+
+### `ax` — user-centric accessibility assertions
+
+Asserts against the accessibility tree via Playwright role locators, i.e.
+what a screen-reader user (and the agent) actually sees:
+
+```yaml
+expect:
+  - ax: {role: button, name: "Save profile"}        # visible (default)
+  - ax: {role: dialog, state: hidden}               # state: visible|hidden|attached
+```
+
+Prefer `ax` over CSS selectors when the contract is "the user can perceive
+and operate this control", not "this class exists in the DOM".
 
 ## Conventions
 

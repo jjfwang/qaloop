@@ -154,6 +154,22 @@ def save_json(path: str, obj) -> None:
         f.write("\n")
 
 
+def screenshot_rms_diff(a_path: str, b_path: str) -> float:
+    """Normalized RMS pixel difference between two images, 0.0 (identical)
+    to ~1.0. Used by the screenshot_matches assertion."""
+    from PIL import Image, ImageChops
+    import math
+    a = Image.open(a_path).convert("RGB")
+    b = Image.open(b_path).convert("RGB")
+    if a.size != b.size:
+        b = b.resize(a.size)
+    diff = ImageChops.difference(a, b)
+    h = diff.histogram()
+    sq = sum(count * ((i % 256) ** 2) for i, count in enumerate(h))
+    n = a.size[0] * a.size[1]
+    return math.sqrt(sq / n) / 255.0 if n else 0.0
+
+
 @dataclass
 class StepArtifacts:
     screenshot: str | None = None

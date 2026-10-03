@@ -1,0 +1,48 @@
+version: 1
+name: demo-mock-ux
+description: >-
+  Self-contained demo of qaloop's data-mocking and UX assertions: the
+  /api/greeting endpoint is mocked (no backend), the button click renders
+  mocked data, the accessible button is asserted via its ARIA role, and the
+  mocked state is pinned with a visual baseline.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the greeting API (no backend needed)
+    mock: {url: "**/api/greeting", json: {greeting: "Hello from mock"}}
+  - name: open the demo page
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: mocked data renders on click
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from mock"}
+
+  - name: button is exposed to assistive tech
+    expect:
+      - ax: {role: button, name: "Load greeting"}
+
+  - name: mocked state matches the visual baseline
+    expect:
+      - screenshot_matches: {baseline: "baselines/mock-demo.png", max_diff: 0.03}
+
+  - name: mock the signup API
+    mock: {url: "**/api/signup", method: POST, json: {ok: true}}
+
+  - name: fill the signup form like a user
+    fill: {target: "#name", text: "Ada"}
+
+  - name: fill the email field
+    fill: {target: "#email", text: "ada@example.com"}
+
+  - name: submit and see the mocked confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, Ada!"}
+
+teardown: []
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
