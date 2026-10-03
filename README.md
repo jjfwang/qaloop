@@ -204,7 +204,8 @@ the summary. The ceiling and the stop are recorded in `perform.json`,
 `PERFORM.md`, and the ledger.
 
 Env knobs: `QALOOP_RUNS`, `QALOOP_DB`, `QALOOP_EXECUTABLE_PATH` (chromium
-binary override), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
+binary override), `QALOOP_LEDGER` (cost-ledger JSONL path override, default
+`runs/ledger.jsonl` under the qaloop checkout), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
 `QALOOP_MODEL_*` (base url, name, key, per-1M prices).
 
 ## Queue → worker → webhook
