@@ -80,7 +80,7 @@ and previously booted services are stopped.
 | `press` | `{target, key}` | e.g. `{target: "#q", key: "Enter"}` |
 | `check` / `uncheck` | selector | checkboxes |
 | `select` | `{target, value}` | `<select>` value |
-| `wait` | `{target?, state?, text?, timeout_ms?}` | state: visible\|hidden\|attached\|detached; `text` waits for the selector to contain the text |
+| `wait` | `{target?, state?, text?, timeout_ms?}` | two forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load) |
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
 | `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
