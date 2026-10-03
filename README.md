@@ -80,7 +80,7 @@ alongside the feature. Conventions:
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
 | `worker [--once] [--poll 5] [--flows DIR] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
 | `webhook [--port 8090] [--host 127.0.0.1]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
-| `investigate --run <dir> --flow <yaml> [--executable-path PATH]` | run the investigator on an existing run |
+| `investigate --run <dir> --flow <yaml> [--target URL] [--max-actions N] [--headed] [--executable-path PATH]` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
 | `ledger` | cost summary JSON |
 
@@ -97,6 +97,9 @@ alongside the feature. Conventions:
 - `--repo DIR` (on `evaluate`, default: the current directory) is the repo root
   qaloop runs `git diff <range>` in when `--diff` is a git range rather than a
   diff file.
+- `--max-actions N` (on `investigate`, default 20) caps the investigator's
+  ReAct-loop action budget — when the budget is exhausted the investigator is
+  told to finish with its best diagnosis.
 
 ## Demo: mock + UX in one flow
 
