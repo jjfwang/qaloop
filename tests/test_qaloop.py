@@ -187,6 +187,115 @@ def test_result_from_dict():
           and r.steps[0].assertions[0].passed)
 
 
+def test_mock_validation():
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    base = "name: t\ntarget: http://x\nsetup:\n  - mock: {url: '**/a', json: {x: 1}}\nsteps:\n  - {goto: /}\n"
+    s = load(base)
+    check("mock op parses", s.setup[0].op == "mock" and s.setup[0].params["url"] == "**/a")
+    for bad in [
+        "name: t\nsetup:\n  - mock: {json: {x: 1}}\n",                              # no url
+        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, body: 'z'}\n",  # two payloads
+        "name: t\nsetup:\n  - mock: {url: '**/a'}\n",                             # no payload
+        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, method: get}\n",   # lowercase
+        "name: t\nsetup:\n  - mock: {url: '**/a', json: {x: 1}, times: 0}\n",      # times<=0
+    ]:
+        try:
+            load(bad)
+            check(f"bad mock rejected: {bad.splitlines()[1].strip()}", False, "no error")
+        except SpecError:
+            check(f"bad mock rejected: {bad.splitlines()[1].strip()}", True)
+
+
+def test_visual_ax_assertion_validation():
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    ok = ("name: t\ntarget: http://x\nsteps:\n"
+          "  - expect:\n"
+          "      - screenshot_matches: {baseline: 'b.png', max_diff: 0.05}\n"
+          "      - ax: {role: button, name: Save}\n")
+    s = load(ok)
+    items = s.steps[0].expect_items
+    check("screenshot_matches parses",
+          items[0][0] == "screenshot_matches" and items[0][1]["max_diff"] == 0.05)
+    check("ax parses", items[1][0] == "ax" and items[1][1]["role"] == "button")
+    bad_cases = [
+        "      - screenshot_matches: {max_diff: 0.05}\n",          # no baseline
+        "      - screenshot_matches: {baseline: 'b.png', max_diff: 2}\n",  # > 1
+        "      - ax: {name: Save}\n",                              # no role
+        "      - ax: {role: button, state: bogus}\n",              # bad state
+    ]
+    for line in bad_cases:
+        body = "name: t\ntarget: http://x\nsteps:\n  - expect:\n" + line
+        try:
+            load(body)
+            check(f"bad assertion rejected: {line.strip()}", False, "no error")
+        except SpecError:
+            check(f"bad assertion rejected: {line.strip()}", True)
+
+
+def test_screenshot_rms_diff():
+    from qaloop.artifacts import screenshot_rms_diff
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.png"); b = os.path.join(d, "b.png")
+        Image.new("RGB", (50, 50), (200, 100, 50)).save(a)
+        Image.new("RGB", (50, 50), (200, 100, 50)).save(b)
+        check("identical images diff ~0", screenshot_rms_diff(a, b) == 0.0)
+        Image.new("RGB", (50, 50), (0, 0, 0)).save(b)
+        check("different images diff > 0", screenshot_rms_diff(a, b) > 0.5)
+
+
+
+
+def test_perform_guards():
+    from qaloop.perform import Performer
+    p = Performer.__new__(Performer)
+    p.allow_publish = False
+    blocked = []
+    allowed = []
+    for label in ["Pay now", "Delete account", "Publish", "Sign up", "Load greeting"]:
+        try:
+            Performer._guard(p, "click", {"name": label})
+            allowed.append(label)
+        except PermissionError:
+            blocked.append(label)
+    check("destructive/publish blocked", blocked == ["Pay now", "Delete account", "Publish"],
+          str(blocked))
+    check("benign actions allowed", allowed == ["Sign up", "Load greeting"], str(allowed))
+    p.allow_publish = True
+    try:
+        Performer._guard(p, "click", {"name": "Publish"})
+        check("publish allowed with flag", True)
+    except PermissionError:
+        check("publish allowed with flag", False)
+
+
+def test_perform_action_json_extraction():
+    from qaloop.perform import _extract_json
+    a = _extract_json('here you go: {"action": "click", "target": {"role": "button"}} done')
+    check("json extracted from prose", a["action"] == "click")
+    try:
+        _extract_json("no json here")
+        check("non-json rejected", False)
+    except ValueError:
+        check("non-json rejected", True)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

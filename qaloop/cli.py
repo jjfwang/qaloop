@@ -72,6 +72,61 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if result.status == "passed" else 1
 
 
+def cmd_baselines(args: argparse.Namespace) -> int:
+    """Run a flow in baseline-update mode: screenshot_matches assertions
+    save their baselines instead of comparing."""
+    try:
+        spec = load_spec(args.flow)
+    except SpecError as e:
+        print(f"INVALID SPEC: {e}")
+        return 2
+    runs_root = default_runs_root()
+    os.makedirs(runs_root, exist_ok=True)
+    run_dir = new_run_dir(runs_root, spec.name + "-baselines")
+    target = args.target or spec.target
+    print(f"run dir: {run_dir}")
+    print(f"target:  {target}")
+    print("baseline update mode — screenshots saved, not compared")
+    result = run_flow(spec, run_dir=run_dir, target=target,
+                      headless=not args.headed,
+                      executable_path=args.executable_path,
+                      baseline_update=True)
+    print_summary(result)
+    saved = [f"{a.name}: {a.detail}"
+             for s in result.steps for a in s.assertions
+             if a.name == "screenshot_matches"]
+    for line in saved:
+        print(" ", line)
+    return 0 if result.status == "passed" else 1
+
+
+def cmd_perform(args: argparse.Namespace) -> int:
+    from qaloop import ledger
+    from qaloop.perform import perform
+    try:
+        result = perform(
+            task=args.task, target=args.target,
+            max_actions=args.max_actions, headless=not args.headed,
+            executable_path=args.executable_path, cdp_url=args.cdp_url,
+            allow_publish=args.allow_publish)
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 2
+    print(f"status: {result['status']}")
+    print(f"summary: {result['summary']}")
+    print(f"actions: {result['action_count']}  "
+          f"tokens {result['tokens_in']}/{result['tokens_out']}  "
+          f"est ${result['cost_usd_est']:.4f}")
+    print(f"report: {os.path.join(result['run_dir'], 'PERFORM.md')}")
+    ledger.append({"kind": "perform", "run_dir": result["run_dir"],
+                   "task": args.task[:120], "status": result["status"],
+                   "actions": result["action_count"],
+                   "tokens_in": result["tokens_in"],
+                   "tokens_out": result["tokens_out"],
+                   "cost_usd_est": result["cost_usd_est"]})
+    return 0 if result["status"] == "completed" else 1
+
+
 def cmd_enqueue(args: argparse.Namespace) -> int:
     from qaloop import queue as q
     import json as _json
@@ -187,6 +242,28 @@ def build_parser() -> argparse.ArgumentParser:
     iv.add_argument("--headed", action="store_true")
     iv.add_argument("--executable-path", default=None)
     iv.set_defaults(fn=cmd_investigate)
+
+    bl = sub.add_parser("baselines",
+                        help="run a flow saving screenshot baselines (update mode)")
+    bl.add_argument("flow", help="flow YAML")
+    bl.add_argument("--target", default=None)
+    bl.add_argument("--headed", action="store_true")
+    bl.add_argument("--executable-path", default=None)
+    bl.set_defaults(fn=cmd_baselines)
+
+    pf = sub.add_parser("perform",
+                        help="natural-language browser task agent")
+    pf.add_argument("--task", required=True, help="what the agent should do")
+    pf.add_argument("--target", default=None,
+                    help="starting URL (omit when attaching to a live browser)")
+    pf.add_argument("--max-actions", type=int, default=30)
+    pf.add_argument("--headed", action="store_true")
+    pf.add_argument("--cdp-url", default=None,
+                    help="take over a live browser, e.g. http://127.0.0.1:9222")
+    pf.add_argument("--allow-publish", action="store_true",
+                    help="permit external publish/post actions")
+    pf.add_argument("--executable-path", default=None)
+    pf.set_defaults(fn=cmd_perform)
     return p
 
 

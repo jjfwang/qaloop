@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop mock + UX demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  #out { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  label { display: block; margin: .75rem 0 .25rem; }
+  input { padding: .4rem; width: 100%; box-sizing: border-box; }
+  button { margin-top: 1rem; padding: .5rem 1.25rem; }
+  #done { color: #137333; font-weight: bold; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>Mock &amp; UX demo</h1>
+<button id="load">Load greeting</button>
+<div id="out" role="status" aria-live="polite"></div>
+
+<h2>Signup form</h2>
+<form id="signup">
+  <label for="name">Name</label>
+  <input id="name" name="name" type="text" autocomplete="off">
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="off">
+  <button type="submit" id="submit">Sign up</button>
+</form>
+<div id="done" hidden></div>
+
+<script>
+document.getElementById('load').addEventListener('click', async () => {
+  const r = await fetch('/api/greeting');
+  const j = await r.json();
+  document.getElementById('out').textContent = j.greeting;
+});
+document.getElementById('signup').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = document.getElementById('name').value;
+  const email = document.getElementById('email').value;
+  const r = await fetch('/api/signup', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({name, email}),
+  });
+  const j = await r.json();
+  const done = document.getElementById('done');
+  done.textContent = j.ok ? `Welcome, ${name}!` : 'Signup failed';
+  done.hidden = false;
+});
+</script>
+</body>
+</html>

@@ -144,6 +144,42 @@ def _do_seed(page, params: dict, timeout_ms: int, target: str) -> None:
         resp.read()
 
 
+def _do_mock(page, params: dict) -> None:
+    """Register a Playwright network route returning a canned response.
+
+    Register in setup before the goto that triggers the requests — routes
+    only affect requests made after registration.
+    """
+    import json as _json
+
+    url = params["url"]
+    method = params.get("method")
+    status = params.get("status", 200)
+    headers = dict(params.get("headers", {}))
+    if "json" in params:
+        body = _json.dumps(params["json"]).encode()
+        headers.setdefault("content-type", "application/json")
+    elif "body" in params:
+        body = params["body"].encode() if isinstance(params["body"], str) else params["body"]
+    else:  # path: serve a fixture file
+        with open(params["path"], "rb") as f:
+            body = f.read()
+    times = params.get("times")
+    seen = {"n": 0}
+
+    def handler(route, request):
+        if method and request.method != method:
+            route.fallback()
+            return
+        seen["n"] += 1
+        if times is not None and seen["n"] > times:
+            route.fallback()
+            return
+        route.fulfill(status=status, headers=headers, body=body)
+
+    page.route(url, handler)
+
+
 def _do_action(page, step: Step, target: str) -> None:
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
@@ -188,11 +224,15 @@ def _do_action(page, step: Step, target: str) -> None:
     elif op == "script":
         _ensure_origin(page, target)
         page.evaluate(p["js"])
+    elif op == "mock":
+        _do_mock(page, p)
     else:
         raise ValueError(f"unknown op {op}")
 
 
-def _check_assertions(page, step: Step, collectors: Collectors) -> list[AssertionResult]:
+def _check_assertions(page, step: Step, collectors: Collectors,
+                      baseline_dir: str = "", baseline_update: bool = False,
+                      run_dir: str = "") -> list[AssertionResult]:
     out: list[AssertionResult] = []
     t = min(step.timeout_ms or 15000, 8000)
     for key, val in step.expect_items:
@@ -247,6 +287,42 @@ def _check_assertions(page, step: Step, collectors: Collectors) -> list[Assertio
                 ok = val["contains"] in actual
                 out.append(AssertionResult(key, ok,
                                            f"want {val['contains']!r} in {actual[:160]!r}"))
+            elif key == "screenshot_matches":
+                from .artifacts import screenshot_rms_diff
+                baseline = val["baseline"]
+                if not os.path.isabs(baseline):
+                    baseline = os.path.join(baseline_dir, baseline)
+                max_diff = val.get("max_diff", 0.02)
+                shot = os.path.join(run_dir, "steps",
+                                    f"assert-{step.phase}-{step.index:02d}.png")
+                os.makedirs(os.path.dirname(shot), exist_ok=True)
+                page.screenshot(path=shot)
+                if baseline_update or not os.path.exists(baseline):
+                    if baseline_update:
+                        os.makedirs(os.path.dirname(baseline), exist_ok=True)
+                        import shutil
+                        shutil.copyfile(shot, baseline)
+                        out.append(AssertionResult(
+                            key, True, f"baseline saved to {baseline}"))
+                    else:
+                        out.append(AssertionResult(
+                            key, False,
+                            f"baseline missing: {baseline} "
+                            f"(run `qaloop baselines <flow>` to create it)"))
+                else:
+                    diff = screenshot_rms_diff(shot, baseline)
+                    ok = diff <= max_diff
+                    out.append(AssertionResult(
+                        key, ok,
+                        f"rms_diff={diff:.4f} max_diff={max_diff}"))
+            elif key == "ax":
+                role, name = val["role"], val.get("name")
+                state = val.get("state", "visible")
+                loc = page.get_by_role(role, name=name) if name else page.get_by_role(role)
+                loc.first.wait_for(state=state, timeout=t)
+                out.append(AssertionResult(
+                    key, True,
+                    f"role={role} name={name!r} state={state}"))
         except Exception as e:  # noqa: BLE001 — assertion failure, not a bug
             out.append(AssertionResult(key, False, f"{type(e).__name__}: {str(e)[:200]}"))
     return out
@@ -258,12 +334,18 @@ def _screenshot_policy(spec: FlowSpec) -> str:
 
 def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
              headless: bool = True, executable_path: str | None = None,
+             baseline_update: bool = False,
              ) -> RunResult:
-    """Execute the flow. Never raises for flow failures; raises only on harness errors."""
+    """Execute the flow. Never raises for flow failures; raises only on harness errors.
+
+    baseline_update: screenshot_matches assertions save baselines instead of
+    comparing (used by `qaloop baselines --update`).
+    """
     from playwright.sync_api import sync_playwright
 
     target = target or spec.target
     executable_path = executable_path or os.environ.get("QALOOP_EXECUTABLE_PATH")
+    baseline_dir = os.path.dirname(os.path.abspath(spec.source_path or ""))
     started = time.time()
     steps: list[StepResult] = []
     collectors = Collectors()
@@ -311,7 +393,11 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                     try:
                         if step.op:
                             _do_action(page, step, target)
-                        sr.assertions = _check_assertions(page, step, collectors)
+                        sr.assertions = _check_assertions(
+                            page, step, collectors,
+                            baseline_dir=baseline_dir,
+                            baseline_update=baseline_update,
+                            run_dir=run_dir)
                         failed_asserts = [a for a in sr.assertions if not a.passed]
                         if failed_asserts:
                             sr.status = "failed"

@@ -20,12 +20,14 @@ _ENV_VAR = re.compile(r"\$(\w+|\{[^}]+\})")
 ACTION_OPS = {
     "goto", "click", "dblclick", "fill", "press", "check", "uncheck",
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
+    "mock",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms"}
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
     "url_contains", "title_contains", "noop", "console_clean", "js",
+    "screenshot_matches", "ax",
 }
 
 
@@ -128,6 +130,29 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
     elif op == "script":
         if not isinstance(params, dict) or "js" not in params:
             raise SpecError(f"{where}: script needs {{js: ...}}")
+    elif op == "mock":
+        # Network interception: canned responses for matching requests.
+        # Register in setup before the goto that triggers the requests.
+        if not isinstance(params, dict) or "url" not in params:
+            raise SpecError(f"{where}: mock needs {{url, ...}}")
+        if not isinstance(params["url"], str) or not params["url"]:
+            raise SpecError(f"{where}: mock.url must be a non-empty string (glob ok)")
+        body_keys = [k for k in ("json", "body", "path") if k in params]
+        if len(body_keys) != 1:
+            raise SpecError(
+                f"{where}: mock needs exactly one of {{json, body, path}} "
+                f"(got {body_keys or 'none'})")
+        if "status" in params:
+            s = params["status"]
+            if not isinstance(s, int) or not 100 <= s <= 599:
+                raise SpecError(f"{where}: mock.status must be an HTTP status int")
+        if "method" in params and params["method"] not in {
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            raise SpecError(f"{where}: mock.method must be an HTTP method")
+        if "times" in params:
+            t = params["times"]
+            if not isinstance(t, int) or t < 1:
+                raise SpecError(f"{where}: mock.times must be a positive int")
 
 
 def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[str, Any]]:
@@ -176,6 +201,26 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     or "contains" not in val):
                 raise SpecError(
                     f"{where}: assertion js needs {{script, contains}}")
+        elif key == "screenshot_matches":
+            if not isinstance(val, dict) or "baseline" not in val:
+                raise SpecError(
+                    f"{where}: assertion screenshot_matches needs "
+                    f"{{baseline, max_diff?}}")
+            if not isinstance(val["baseline"], str) or not val["baseline"]:
+                raise SpecError(
+                    f"{where}: screenshot_matches.baseline must be a path string")
+            md = val.get("max_diff", 0.02)
+            if not isinstance(md, (int, float)) or not 0 <= md <= 1:
+                raise SpecError(
+                    f"{where}: screenshot_matches.max_diff must be 0..1")
+        elif key == "ax":
+            if not isinstance(val, dict) or "role" not in val:
+                raise SpecError(
+                    f"{where}: assertion ax needs {{role, name?, state?}}")
+            if not isinstance(val["role"], str) or not val["role"]:
+                raise SpecError(f"{where}: ax.role must be an ARIA role string")
+            if val.get("state", "visible") not in {"visible", "hidden", "attached"}:
+                raise SpecError(f"{where}: ax.state must be visible|hidden|attached")
     return items
 
 

@@ -60,6 +60,10 @@ alongside the feature. Conventions:
 - Prefer `wait` with a state over `wait_ms`.
 - Encode known limitations (`expect: {noop: true}`, OD references in step
   names) so the verifier doesn't file bugs about intentional behavior.
+- Mock the data, not the UI: use `mock` in `setup` to feed deterministic
+  API responses so flows exercise the real rendering path without a backend.
+- Pin the pixels that matter: `screenshot_matches` baselines for key
+  screens, `ax` assertions for the user's perceivable contract.
 
 ## CLI
 
@@ -67,6 +71,8 @@ alongside the feature. Conventions:
 |---|---|
 | `validate <flow>` | check spec structure (env vars not required) |
 | `verify <flow> [--target URL] [--investigate] [--headed]` | run once, print card, write `runs/<id>/REPORT.md` |
+| `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
+| `perform --task "..." --target URL` | natural-language browser agent: performs the task like a person (see below) |
 | `enqueue --kind verify-flow --flow F --target U` | queue a one-off verification |
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
 | `worker [--once] [--poll 5]` | claim jobs → boot env → run flows → report |
@@ -74,6 +80,57 @@ alongside the feature. Conventions:
 | `investigate --run <dir> --flow <yaml>` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
 | `ledger` | cost summary JSON |
+
+## Demo: mock + UX in one flow
+
+`demo/mock-demo.html` is a self-contained page (button fetches a mocked API,
+signup form posts to a mocked endpoint). `flows/demo-mock-ux.yaml` mocks
+both APIs, then proves the mocked data renders (`text_contains`), the button
+is perceivable (`ax: {role: button}`), the pixels match a checked-in baseline
+(`screenshot_matches`), and the signup confirmation appears. No backend:
+
+```bash
+cd ~/workspace/qaloop
+python3 -m http.server 8931 --bind 127.0.0.1 &   # serves /demo/mock-demo.html
+TARGET_URL=http://127.0.0.1:8931 python3 -m qaloop.cli baselines flows/demo-mock-ux.yaml
+TARGET_URL=http://127.0.0.1:8931 python3 -m qaloop.cli verify flows/demo-mock-ux.yaml
+```
+
+## Perform mode: the agent takes over a browser
+
+`qaloop perform` is a natural-language browser agent for *doing work*, not
+just checking it. Give it a task; it reads the page's accessibility tree,
+acts semantically (role/name/text — never CSS trivia), paces itself like a
+person (scroll-into-view, typed input, waits for state), and stops honestly
+when blocked.
+
+```bash
+python3 -m qaloop.cli perform \
+  --task "Open the profile editor, change the display name to Maya, and save" \
+  --target http://localhost:3000 --max-actions 30
+```
+
+Take over a browser that's already running (debugging port on) instead of
+launching a fresh one:
+
+```bash
+python3 -m qaloop.cli perform --task "..." --cdp-url http://127.0.0.1:9222
+```
+
+Safety is enforced in the harness, not just the prompt: payment submission,
+deletion/destruction, and external publishing are blocked (`--allow-publish`
+opts into publishing); a confirmation dialog for anything destructive is a
+stop sign. Every run writes `runs/<id>/PERFORM.md` (transcript + final
+state) and a `perform.json`, and logs tokens/cost to the ledger.
+
+Human-like means robust and legible — real clicks, paced typing, semantic
+targeting, state checks — not bot-evasion or fingerprint spoofing.
+
+Needs a model: any OpenAI-compatible `/chat/completions` endpoint via
+`QALOOP_MODEL_BASE_URL` / `QALOOP_MODEL_NAME` / `QALOOP_MODEL_API_KEY`
+(same knobs as the investigator). Proved against `demo/mock-demo.html`:
+the agent loaded the page, clicked through, typed a signup form, submitted,
+and verified the confirmation — in a fresh browser and via CDP attach.
 
 Env knobs: `QALOOP_RUNS`, `QALOOP_DB`, `QALOOP_EXECUTABLE_PATH` (chromium
 binary override), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
