@@ -227,15 +227,21 @@ def test_visual_ax_assertion_validation():
     ok = ("name: t\ntarget: http://x\nsteps:\n"
           "  - expect:\n"
           "      - screenshot_matches: {baseline: 'b.png', max_diff: 0.05}\n"
+          "      - screenshot_matches: {baseline: 'e.png', selector: '#out'}\n"
           "      - ax: {role: button, name: Save}\n")
     s = load(ok)
     items = s.steps[0].expect_items
     check("screenshot_matches parses",
           items[0][0] == "screenshot_matches" and items[0][1]["max_diff"] == 0.05)
-    check("ax parses", items[1][0] == "ax" and items[1][1]["role"] == "button")
+    check("screenshot_matches selector parses",
+          items[1][0] == "screenshot_matches" and items[1][1]["selector"] == "#out")
+    check("ax parses", items[2][0] == "ax" and items[2][1]["role"] == "button")
     bad_cases = [
         "      - screenshot_matches: {max_diff: 0.05}\n",          # no baseline
         "      - screenshot_matches: {baseline: 'b.png', max_diff: 2}\n",  # > 1
+        "      - screenshot_matches: {baseline: 'b.png', selector: ''}\n",  # empty selector
+        "      - screenshot_matches: {baseline: 'b.png', selector: 42}\n",  # non-string selector
+        "      - screenshot_matches: {baseline: 'b.png', selector: null}\n",  # null selector
         "      - ax: {name: Save}\n",                              # no role
         "      - ax: {role: button, state: bogus}\n",              # bad state
     ]
@@ -246,6 +252,84 @@ def test_visual_ax_assertion_validation():
             check(f"bad assertion rejected: {line.strip()}", False, "no error")
         except SpecError:
             check(f"bad assertion rejected: {line.strip()}", True)
+
+
+def test_screenshot_matches_selector_capture():
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+    from PIL import Image
+
+    def make_step(params):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[("screenshot_matches", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page, self.selector = page, selector
+
+        def screenshot(self, path):
+            self.page.calls.append(("locator-shot", self.selector, path))
+            Image.open(self.page.element_png).save(path)
+
+    class FakePage:
+        def __init__(self, element_png, full_png, wait_ok=True):
+            self.calls = []
+            self.wait_ok = wait_ok
+            self.element_png = element_png
+            self.full_png = full_png
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("wait", selector, state))
+            if not self.wait_ok:
+                raise TimeoutError("selector never attached")
+
+        def locator(self, selector):
+            self.calls.append(("locator", selector))
+            return FakeLocator(self, selector)
+
+        def screenshot(self, path):
+            self.calls.append(("page-shot", path))
+            Image.open(self.full_png).save(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        base_dir, run_dir = os.path.join(d, "base"), os.path.join(d, "run")
+        os.makedirs(base_dir)
+        element_png = os.path.join(d, "element.png")
+        full_png = os.path.join(d, "full.png")
+        Image.new("RGB", (60, 30), (10, 200, 60)).save(element_png)
+        Image.new("RGB", (60, 30), (200, 10, 60)).save(full_png)
+        # Case 1: selector present -> element shot compared against element baseline
+        Image.open(element_png).save(os.path.join(base_dir, "e.png"))
+        page = FakePage(element_png, full_png)
+        res = _check_assertions(
+            page, make_step({"baseline": "e.png", "selector": "#out"}),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        kinds = [c[0] for c in page.calls]
+        check("selector assertion passes", res[0].passed, res[0].detail)
+        check("wait_for_selector ran first", page.calls[0] == ("wait", "#out", "attached"),
+              str(page.calls))
+        check("locator screenshot used", ("locator-shot", "#out", os.path.join(
+            run_dir, "steps", "assert-steps-00.png")) in page.calls, str(kinds))
+        check("page screenshot not used", "page-shot" not in kinds, str(kinds))
+        # Case 2: no selector -> full-page shot, unchanged behavior
+        Image.open(full_png).save(os.path.join(base_dir, "f.png"))
+        page = FakePage(element_png, full_png)
+        res = _check_assertions(
+            page, make_step({"baseline": "f.png"}),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        kinds = [c[0] for c in page.calls]
+        check("no-selector assertion passes", res[0].passed, res[0].detail)
+        check("page screenshot used", "page-shot" in kinds, str(kinds))
+        check("locator not touched", "locator" not in kinds, str(kinds))
+        # Case 3: selector never attaches -> clean failed AssertionResult
+        page = FakePage(element_png, full_png, wait_ok=False)
+        res = _check_assertions(
+            page, make_step({"baseline": "e.png", "selector": "#gone"}),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        check("missing selector fails cleanly",
+              not res[0].passed and res[0].detail.startswith("TimeoutError:"),
+              res[0].detail)
 
 
 def test_screenshot_rms_diff():
