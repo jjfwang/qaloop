@@ -205,10 +205,15 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
             if not isinstance(val, dict) or "baseline" not in val:
                 raise SpecError(
                     f"{where}: assertion screenshot_matches needs "
-                    f"{{baseline, max_diff?}}")
+                    f"{{baseline, selector?, max_diff?}}")
             if not isinstance(val["baseline"], str) or not val["baseline"]:
                 raise SpecError(
                     f"{where}: screenshot_matches.baseline must be a path string")
+            if "selector" in val and (not isinstance(val["selector"], str)
+                                      or not val["selector"]):
+                raise SpecError(
+                    f"{where}: screenshot_matches.selector must be "
+                    f"a non-empty string")
             md = val.get("max_diff", 0.02)
             if not isinstance(md, (int, float)) or not 0 <= md <= 1:
                 raise SpecError(

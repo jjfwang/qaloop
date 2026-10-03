@@ -296,7 +296,12 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 shot = os.path.join(run_dir, "steps",
                                     f"assert-{step.phase}-{step.index:02d}.png")
                 os.makedirs(os.path.dirname(shot), exist_ok=True)
-                page.screenshot(path=shot)
+                selector = val.get("selector")
+                if selector:
+                    page.wait_for_selector(selector, state="attached", timeout=t)
+                    page.locator(selector).screenshot(path=shot)
+                else:
+                    page.screenshot(path=shot)
                 if baseline_update or not os.path.exists(baseline):
                     if baseline_update:
                         os.makedirs(os.path.dirname(baseline), exist_ok=True)
