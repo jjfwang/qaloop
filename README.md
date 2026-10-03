@@ -139,6 +139,16 @@ acts semantically (role/name/text — never CSS trivia), paces itself like a
 person (scroll-into-view, typed input, waits for state), and stops honestly
 when blocked.
 
+The agent's actions are `navigate`, `click`, `dblclick`, `fill`, `press`,
+`select`, `check`/`uncheck`, `hover`, `scroll`, `wait`, `screenshot`,
+`console`, and `upload`: `{"action": "upload", "target": {...},
+"path": "/abs/path/file"}` attaches a file through a file input (target the
+input itself, e.g. `{"css": "#resume"}`).
+
+Uploads are restricted to a declared upload dir: `--upload-dir` (default:
+the run dir) — only absolute paths under that directory are accepted,
+so a model can't reach elsewhere on disk.
+
 ```bash
 python3 -m qaloop.cli perform \
   --task "Open the profile editor, change the display name to Maya, and save" \

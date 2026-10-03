@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Upload demo</title></head>
+<body>
+  <h1>Upload demo</h1>
+  <label for="resume">Resume</label>
+  <input type="file" id="resume">
+  <div role="status" id="picked"></div>
+  <script>
+    document.getElementById("resume").addEventListener("change", (e) => {
+      const f = e.target.files[0];
+      document.getElementById("picked").textContent = f ? f.name : "";
+    });
+  </script>
+</body>
+</html>
