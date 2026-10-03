@@ -35,6 +35,7 @@ class StepResult:
     error: str = ""
     assertions: list[AssertionResult] = field(default_factory=list)
     artifacts: StepArtifacts = field(default_factory=StepArtifacts)
+    attempts: int = 1  # attempts actually used (1-indexed count)
 
 
 @dataclass
@@ -68,7 +69,8 @@ class RunResult:
                 assertions=[AssertionResult(a["name"], a["passed"], a.get("detail", ""))
                             for a in s.get("assertions", [])],
                 artifacts=StepArtifacts(
-                    screenshot=s.get("screenshot"), ax_snapshot=s.get("ax_snapshot"))))
+                    screenshot=s.get("screenshot"), ax_snapshot=s.get("ax_snapshot")),
+                attempts=s.get("attempts", 1)))
         return cls(flow_name=d["flow_name"], target=d.get("target", ""),
                    status=d["status"], started=d.get("started", 0),
                    ended=d.get("ended", 0), steps=steps,
@@ -94,6 +96,7 @@ class RunResult:
                     "index": s.index, "phase": s.phase, "name": s.name,
                     "op": s.op, "status": s.status,
                     "duration_ms": s.duration_ms, "error": s.error,
+                    "attempts": s.attempts,
                     "assertions": [
                         {"name": a.name, "passed": a.passed, "detail": a.detail}
                         for a in s.assertions
@@ -411,25 +414,41 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                                                 "skipped", 0))
                         continue
                     t0 = time.time()
+                    # checkpoint once per step (before the attempt loop) so
+                    # console_clean keeps its "since the step started" meaning.
                     collectors.checkpoint()
                     sr = StepResult(step.index, phase, step.name, step.op,
                                     "passed", 0)
-                    try:
-                        if step.op:
-                            _do_action(page, step, target)
-                        sr.assertions = _check_assertions(
-                            page, step, collectors,
-                            baseline_dir=baseline_dir,
-                            baseline_update=baseline_update,
-                            run_dir=run_dir)
-                        failed_asserts = [a for a in sr.assertions if not a.passed]
-                        if failed_asserts:
+                    # retry is a steps-phase feature only (spec rejects
+                    # retry > 0 in setup/teardown); setup keeps abort-on-first-
+                    # fail and teardown keeps best-effort semantics.
+                    max_attempts = step.retry + 1 if phase == "steps" else 1
+                    for attempt in range(max_attempts):
+                        sr.attempts = attempt + 1
+                        sr.status = "passed"
+                        sr.error = ""
+                        try:
+                            if step.op:
+                                _do_action(page, step, target)
+                            sr.assertions = _check_assertions(
+                                page, step, collectors,
+                                baseline_dir=baseline_dir,
+                                baseline_update=baseline_update,
+                                run_dir=run_dir)
+                            failed_asserts = [a for a in sr.assertions
+                                              if not a.passed]
+                            if failed_asserts:
+                                sr.status = "failed"
+                                sr.error = "; ".join(
+                                    f"{a.name}: {a.detail}"
+                                    for a in failed_asserts[:3])
+                            else:
+                                break  # first success wins
+                        except Exception as e:  # noqa: BLE001
                             sr.status = "failed"
-                            sr.error = "; ".join(
-                                f"{a.name}: {a.detail}" for a in failed_asserts[:3])
-                    except Exception as e:  # noqa: BLE001
-                        sr.status = "failed"
-                        sr.error = f"{type(e).__name__}: {str(e)[:400]}"
+                            sr.error = f"{type(e).__name__}: {str(e)[:400]}"
+                        # failed and attempts remain: loop back-to-back, no delay
+                    # final status/error/assertions come from the last attempt
                     sr.duration_ms = int((time.time() - t0) * 1000)
 
                     # artifacts

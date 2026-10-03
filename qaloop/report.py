@@ -38,8 +38,13 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
         "| # | phase | step | op | status | ms |",
         "|---|---|---|---|---|---|",
     ]
+    retry_of = {(s.phase, s.index): s.retry
+                for s in spec.setup + spec.steps + spec.teardown}
     for i, s in enumerate(result.steps):
         mark = {"passed": "ok", "failed": "FAIL", "skipped": "skip"}[s.status]
+        if s.attempts > 1:
+            mark = (f"{mark} · attempt {s.attempts}"
+                    f"/{retry_of.get((s.phase, s.index), 0) + 1}")
         lines.append(
             f"| {i} | {s.phase} | {s.name} | {s.op or '—'} | {mark} | {s.duration_ms} |")
     lines.append("")

@@ -22,7 +22,7 @@ ACTION_OPS = {
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
     "mock",
 }
-STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms"}
+STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry"}
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
@@ -70,6 +70,7 @@ class Step:
     continue_on_fail: bool
     timeout_ms: int | None
     raw: dict
+    retry: int = 0  # extra attempts after a failure (steps phase only)
 
 
 @dataclass
@@ -318,6 +319,15 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         raise SpecError(f"{where}: expect must be a mapping or list of assertions")
     continue_on_fail = bool(raw.get("continue_on_fail", False))
     timeout_ms = raw.get("timeout_ms", default_timeout_ms)
+    retry = raw.get("retry", 0)
+    if isinstance(retry, bool) or not isinstance(retry, int) or retry < 0:
+        raise SpecError(
+            f"{where}: retry must be an integer >= 0, got {retry!r}")
+    if retry > 0 and phase != "steps":
+        raise SpecError(
+            f"{where}: retry > 0 is only allowed in the steps phase "
+            f"(got phase '{phase}'; mocks register once, "
+            f"re-registration semantics are undefined)")
     op_keys = [k for k in raw if k in ACTION_OPS]
     unknown = [k for k in raw if k not in ACTION_OPS and k not in STEP_META_KEYS]
     if unknown:
@@ -335,7 +345,8 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         index=index, phase=phase,
         name=name or f"{op or 'expect'} #{index}",
         op=op, params=params, expect=expect, expect_items=expect_items,
-        continue_on_fail=continue_on_fail, timeout_ms=timeout_ms, raw=raw,
+        continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
+        retry=retry, raw=raw,
     )
 
 

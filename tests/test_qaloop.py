@@ -894,6 +894,140 @@ def test_investigate_manual_brief():
             os.environ["QALOOP_MODEL_API_KEY"] = old_key
 
 
+def test_step_retry_spec():
+    """retry: accepted in steps, defaults 0, rejects <0 / non-int / setup+teardown."""
+    from qaloop.spec import load_spec, SpecError
+
+    def write_flow(phase, extra):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("name: retry-spec\ntarget: http://x\n")
+            if phase == "steps":
+                f.write(f"steps:\n  - name: s\n    goto: /\n    {extra}\n")
+            else:
+                f.write(f"{phase}:\n  - name: s\n    goto: /\n    {extra}\n"
+                        "steps:\n  - name: t\n    expect: {noop: true}\n")
+            return f.name
+
+    p = write_flow("steps", "retry: 2")
+    try:
+        spec = load_spec(p)
+        check("retry accepted in steps", spec.steps[0].retry == 2)
+    finally:
+        os.unlink(p)
+
+    p = write_flow("steps", "")
+    try:
+        spec = load_spec(p)
+        check("retry defaults to 0", spec.steps[0].retry == 0)
+    finally:
+        os.unlink(p)
+
+    for bad, label in [("retry: -1", "negative"), ("retry: 1.5", "float"),
+                       ("retry: true", "bool")]:
+        p = write_flow("steps", bad)
+        try:
+            load_spec(p)
+            check(f"retry {label} rejected", False, "no error raised")
+        except SpecError:
+            check(f"retry {label} rejected", True)
+        finally:
+            os.unlink(p)
+
+    for phase in ("setup", "teardown"):
+        p = write_flow(phase, "retry: 1")
+        try:
+            load_spec(p)
+            check(f"retry in {phase} rejected", False, "no error raised")
+        except SpecError:
+            check(f"retry in {phase} rejected", True)
+        finally:
+            os.unlink(p)
+
+
+def test_step_retry_runner():
+    """Real browser proof: flaky action passes with retry:2; permanent
+    failure with retry:1 fails after exactly 2 attempts; retry:0 unchanged."""
+    import socket
+    import subprocess
+    import time
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        have_pw = True
+    except ImportError:
+        have_pw = False
+    if not have_pw or not os.path.exists(exe):
+        check("retry runner tests skipped (no browser)", True)
+        return
+    from qaloop.spec import load_spec
+    from qaloop.runner import run_flow, RunResult
+    from qaloop.report import write_report
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "index.html"), "w") as f:
+            f.write("<html><body><h1>retry demo</h1></body></html>")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            flow = (f"name: retry-demo\ntarget: http://127.0.0.1:{port}\n"
+                    "steps:\n"
+                    "  - name: flaky script succeeds on third try\n"
+                    "    retry: 2\n"
+                    "    script: {js: 'window.__n = (window.__n || 0) + 1; "
+                    "if (window.__n < 3) throw new Error(\"flaky \" + window.__n); \"ok\"'}\n"
+                    "    expect: {noop: true}\n"
+                    "  - name: plain step with retry 0\n"
+                    "    retry: 0\n"
+                    "    script: {js: '\"fine\"'}\n"
+                    "    expect: {noop: true}\n"
+                    "  - name: permanent failure\n"
+                    "    retry: 1\n"
+                    "    timeout_ms: 500\n"
+                    "    expect: {visible: \"#never-there\"}\n")
+            flow_path = os.path.join(d, "retry-flow.yaml")
+            with open(flow_path, "w") as f:
+                f.write(flow)
+            spec = load_spec(flow_path)
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(spec, run_dir=run_dir, executable_path=exe)
+                check("run fails (permanent failure)", result.status == "failed",
+                      result.status)
+                flaky, plain, perm = result.steps
+                check("flaky step passes with retry:2",
+                      flaky.status == "passed", flaky.status)
+                check("flaky step used 3 attempts", flaky.attempts == 3,
+                      str(flaky.attempts))
+                check("retry:0 keeps single attempt", plain.attempts == 1,
+                      str(plain.attempts))
+                check("permanent failure after 2 attempts",
+                      perm.status == "failed" and perm.attempts == 2,
+                      f"{perm.status} attempts={perm.attempts}")
+                # report rendering
+                paths = write_report(result, spec, run_dir)
+                md = open(paths["report_md"], encoding="utf-8").read()
+                check("report shows flaky attempts", "ok · attempt 3/3" in md)
+                check("report shows failed attempts", "FAIL · attempt 2/2" in md)
+                plain_line = [ln for ln in md.splitlines()
+                              if "plain step with retry 0" in ln][0]
+                check("report unchanged for retry:0",
+                      "attempt" not in plain_line, plain_line)
+                # serialization round trip
+                rt = RunResult.from_dict(result.to_dict())
+                check("attempts survives to_dict/from_dict",
+                      [s.attempts for s in rt.steps] == [3, 1, 2])
+        finally:
+            srv.terminate()
+            srv.wait()
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
