@@ -720,6 +720,180 @@ def test_evaluate_collect_and_write():
               json.load(open(js))["verdict"]["verdict"] == "MAKES_SENSE")
 
 
+def test_investigate_extract_json():
+    from qaloop.investigate import _extract_json
+    check("investigate: bare json parses",
+          _extract_json('{"thought": "t"}')["thought"] == "t")
+    check("investigate: json fenced in prose parses",
+          _extract_json('here:\n```json\n{"tool": "console", "args": {}}\n``` done')
+          ["tool"] == "console")
+    try:
+        _extract_json("no json here")
+        check("investigate: non-json rejected", False)
+    except ValueError:
+        check("investigate: non-json rejected", True)
+
+
+def test_investigate_tool_dispatch():
+    from qaloop.investigate import Investigator
+
+    class StubPage:
+        def on(self, event, handler):
+            pass
+
+    with tempfile.TemporaryDirectory() as run_dir:
+        inv = Investigator(StubPage(), run_dir, 20)
+        try:
+            inv.tool("frobnicate", {})
+            check("investigate: unknown tool rejected", False)
+        except ValueError:
+            check("investigate: unknown tool rejected", True)
+        check("investigate: actions counted before raise", inv.actions == 1,
+              str(inv.actions))
+        inv.console = [{"type": "error", "text": "boom: TypeError"}]
+        got = inv.tool("console", {})
+        check("investigate: console tool routes", json.loads(got) == inv.console, got)
+        inv.network = [{"kind": "bad", "method": "GET", "url": "http://x/missing",
+                        "status": 404}]
+        got = inv.tool("network", {})
+        check("investigate: network tool routes", json.loads(got) == inv.network, got)
+
+
+def _investigate_failed_result():
+    from qaloop.runner import RunResult
+    return RunResult.from_dict({
+        "flow_name": "f", "target": "t", "status": "failed",
+        "started": 1.0, "ended": 2.0,
+        "steps": [{"index": 0, "phase": "main", "name": "load page",
+                   "op": "goto", "status": "failed", "duration_ms": 10,
+                   "error": "timeout",
+                   "assertions": [{"name": "n", "passed": False, "detail": "x"}],
+                   "screenshot": None, "ax_snapshot": None}],
+        "failed_step": 0,
+        "console_errors": [{"text": "boom: TypeError"}],
+        "page_errors": [], "failed_requests": [], "bad_responses": [],
+        "run_dir": "r", "error": ""})
+
+
+def _investigate_minimal_spec():
+    from qaloop.spec import load_spec
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("name: inv-test\ntarget: http://x/\n"
+                "steps:\n  - name: load\n    goto: /\n")
+        path = f.name
+    try:
+        return load_spec(path)
+    finally:
+        os.unlink(path)
+
+
+def test_investigate_budget_enforcement():
+    import inspect
+    import playwright.sync_api as pw_sync
+    import qaloop.investigate as mod
+    from qaloop.investigate import investigate
+
+    class StubPage:
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.url = url
+
+    stub = StubPage()
+
+    class _PWCM:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def new_page(self):
+            return stub
+
+    class _FakeBrowser:
+        def new_context(self, **kw):
+            return _PWCM()
+
+        def close(self):
+            pass
+
+    class _FakeChromium:
+        def launch(self, **kw):
+            return _FakeBrowser()
+
+    class _FakePW:
+        chromium = _FakeChromium()
+
+    class _FakePWCM:
+        def __enter__(self):
+            return _FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_chat, old_ax, old_pw = mod._chat, mod.ax_snapshot, pw_sync.sync_playwright
+    old_key = os.environ.get("QALOOP_MODEL_API_KEY")
+    mod._chat = lambda cfg, messages, timeout_s=90: (
+        json.dumps({"thought": "t", "tool": "console", "args": {}}),
+        {"prompt_tokens": 1, "completion_tokens": 1})
+    mod.ax_snapshot = lambda page, **kw: "AX TREE"
+    pw_sync.sync_playwright = lambda: _FakePWCM()
+    os.environ["QALOOP_MODEL_API_KEY"] = "test"
+    try:
+        with tempfile.TemporaryDirectory() as run_dir:
+            diag = investigate(result=_investigate_failed_result(),
+                              spec=_investigate_minimal_spec(),
+                              target="http://x/", max_actions=3,
+                              run_dir=run_dir)
+            check("investigate: budget exhausted diagnosis",
+                  diag["diagnosis"] ==
+                  "Investigator exhausted its budget without a conclusion.",
+                  str(diag["diagnosis"]))
+            check("investigate: actions_taken >= budget", diag["actions_taken"] >= 3,
+                  str(diag["actions_taken"]))
+            check("investigate: mode is agent", diag["mode"] == "agent")
+            check("investigate: transcript written",
+                  os.path.exists(os.path.join(run_dir, "INVESTIGATION.md")))
+    finally:
+        mod._chat, mod.ax_snapshot = old_chat, old_ax
+        pw_sync.sync_playwright = old_pw
+        if old_key is None:
+            del os.environ["QALOOP_MODEL_API_KEY"]
+        else:
+            os.environ["QALOOP_MODEL_API_KEY"] = old_key
+    check("investigate: max_actions default 20",
+          inspect.signature(investigate).parameters["max_actions"].default == 20)
+
+
+def test_investigate_manual_brief():
+    from qaloop.investigate import investigate, write_manual_brief
+    old_key = os.environ.get("QALOOP_MODEL_API_KEY")
+    if "QALOOP_MODEL_API_KEY" in os.environ:
+        del os.environ["QALOOP_MODEL_API_KEY"]
+    try:
+        spec = _investigate_minimal_spec()
+        result = _investigate_failed_result()
+        with tempfile.TemporaryDirectory() as run_dir:
+            path = write_manual_brief(run_dir, spec, result, "http://x/")
+            md = open(path, encoding="utf-8").read()
+            check("manual brief written", os.path.basename(path) == "INVESTIGATION_BRIEF.md")
+            check("manual brief header", "Investigation brief (manual mode)" in md)
+            check("manual brief names failing step", "load page" in md)
+            check("manual brief lists evidence", "boom: TypeError" in md)
+        # through investigate() itself: no api key -> manual mode
+        with tempfile.TemporaryDirectory() as run_dir:
+            diag = investigate(result=result, spec=spec, target="http://x/",
+                               run_dir=run_dir)
+            check("investigate: manual mode without key", diag["mode"] == "manual")
+            check("investigate: manual brief written via investigate()",
+                  os.path.exists(diag["brief"]))
+    finally:
+        if old_key is not None:
+            os.environ["QALOOP_MODEL_API_KEY"] = old_key
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
