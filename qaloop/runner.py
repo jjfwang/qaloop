@@ -1,0 +1,373 @@
+"""Deterministic Playwright runner: executes a FlowSpec, returns a RunResult.
+
+Zero LLM cost by design — this is the cheap 80%. The agentic investigator
+(investigate.py) only runs when a step fails.
+"""
+from __future__ import annotations
+
+import os
+import re
+import time
+import traceback
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+
+from .artifacts import Collectors, StepArtifacts, ax_snapshot, save_json
+from .spec import FlowSpec, Step
+
+
+@dataclass
+class AssertionResult:
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclass
+class StepResult:
+    index: int
+    phase: str
+    name: str
+    op: str | None
+    status: str  # passed | failed | skipped
+    duration_ms: int
+    error: str = ""
+    assertions: list[AssertionResult] = field(default_factory=list)
+    artifacts: StepArtifacts = field(default_factory=StepArtifacts)
+
+
+@dataclass
+class RunResult:
+    flow_name: str
+    target: str
+    status: str  # passed | failed | error
+    started: float
+    ended: float
+    steps: list[StepResult]
+    failed_step: int | None
+    console_errors: list[dict]
+    page_errors: list[dict]
+    failed_requests: list[dict]
+    bad_responses: list[dict]
+    run_dir: str
+    error: str = ""
+
+    @property
+    def duration_ms(self) -> int:
+        return int((self.ended - self.started) * 1000)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RunResult":
+        steps = []
+        for s in d.get("steps", []):
+            steps.append(StepResult(
+                index=s["index"], phase=s["phase"], name=s["name"],
+                op=s.get("op"), status=s["status"],
+                duration_ms=s.get("duration_ms", 0), error=s.get("error", ""),
+                assertions=[AssertionResult(a["name"], a["passed"], a.get("detail", ""))
+                            for a in s.get("assertions", [])],
+                artifacts=StepArtifacts(
+                    screenshot=s.get("screenshot"), ax_snapshot=s.get("ax_snapshot"))))
+        return cls(flow_name=d["flow_name"], target=d.get("target", ""),
+                   status=d["status"], started=d.get("started", 0),
+                   ended=d.get("ended", 0), steps=steps,
+                   failed_step=d.get("failed_step"),
+                   console_errors=d.get("console_errors", []),
+                   page_errors=d.get("page_errors", []),
+                   failed_requests=d.get("failed_requests", []),
+                   bad_responses=d.get("bad_responses", []),
+                   run_dir=d.get("run_dir", ""), error=d.get("error", ""))
+
+    def to_dict(self) -> dict:
+        return {
+            "flow_name": self.flow_name,
+            "target": self.target,
+            "status": self.status,
+            "started": self.started,
+            "ended": self.ended,
+            "duration_ms": self.duration_ms,
+            "failed_step": self.failed_step,
+            "error": self.error,
+            "steps": [
+                {
+                    "index": s.index, "phase": s.phase, "name": s.name,
+                    "op": s.op, "status": s.status,
+                    "duration_ms": s.duration_ms, "error": s.error,
+                    "assertions": [
+                        {"name": a.name, "passed": a.passed, "detail": a.detail}
+                        for a in s.assertions
+                    ],
+                    "screenshot": s.artifacts.screenshot,
+                    "ax_snapshot": s.artifacts.ax_snapshot,
+                }
+                for s in self.steps
+            ],
+            "console_errors": self.console_errors,
+            "page_errors": self.page_errors,
+            "failed_requests": self.failed_requests,
+            "bad_responses": self.bad_responses,
+            "run_dir": self.run_dir,
+        }
+
+
+def _resolve_url(target: str, url: str) -> str:
+    if re.match(r"^https?://", url):
+        return url
+    return urljoin(target.rstrip("/") + "/", url.lstrip("/"))
+
+
+def _ensure_origin(page, target: str) -> None:
+    """Seed/script ops need a document from the target origin.
+
+    If no navigation has happened yet, load the target first so
+    localStorage / page JS run against the right origin.
+    """
+    if not page.url or page.url == "about:blank":
+        page.goto(target, wait_until="domcontentloaded")
+
+
+def _do_seed(page, params: dict, timeout_ms: int, target: str) -> None:
+    if "js" in params:
+        _ensure_origin(page, target)
+        page.evaluate(params["js"])
+        return
+    http = params["http"]
+    method = http.get("method", "POST").upper()
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if "json" in http:
+        import json as _json
+        data = _json.dumps(http["json"]).encode()
+    req = Request(http["url"], data=data, headers=headers, method=method)
+    with urlopen(req, timeout=timeout_ms / 1000) as resp:
+        resp.read()
+
+
+def _do_action(page, step: Step, target: str) -> None:
+    op, p = step.op, step.params
+    t = step.timeout_ms or 15000
+    if op == "goto":
+        page.goto(_resolve_url(target, p), timeout=t, wait_until="domcontentloaded")
+    elif op == "click":
+        page.click(p, timeout=t)
+    elif op == "dblclick":
+        page.dblclick(p, timeout=t)
+    elif op == "fill":
+        page.fill(p["target"], p["text"], timeout=t)
+    elif op == "press":
+        page.press(p["target"], p["key"], timeout=t)
+    elif op == "check":
+        page.check(p, timeout=t)
+    elif op == "uncheck":
+        page.uncheck(p, timeout=t)
+    elif op == "select":
+        page.select_option(p["target"], p["value"], timeout=t)
+    elif op == "wait":
+        params = p or {}
+        sel = params.get("target")
+        state = params.get("state", "visible")
+        wt = params.get("timeout_ms", t)
+        text = params.get("text")
+        if sel:
+            if text:
+                page.locator(sel, has_text=text).wait_for(state=state, timeout=wt)
+            else:
+                page.wait_for_selector(sel, state=state, timeout=wt)
+        else:
+            page.wait_for_load_state(state if state in ("load", "domcontentloaded", "networkidle") else "load",
+                                     timeout=wt)
+    elif op == "wait_ms":
+        page.wait_for_timeout(p)
+    elif op == "reload":
+        page.reload(timeout=t, wait_until="domcontentloaded")
+    elif op == "back":
+        page.go_back(timeout=t, wait_until="domcontentloaded")
+    elif op == "seed":
+        _do_seed(page, p, t, target)
+    elif op == "script":
+        _ensure_origin(page, target)
+        page.evaluate(p["js"])
+    else:
+        raise ValueError(f"unknown op {op}")
+
+
+def _check_assertions(page, step: Step, collectors: Collectors) -> list[AssertionResult]:
+    out: list[AssertionResult] = []
+    t = min(step.timeout_ms or 15000, 8000)
+    for key, val in step.expect_items:
+        try:
+            if key == "visible":
+                page.wait_for_selector(val, state="visible", timeout=t)
+                out.append(AssertionResult(key, True, val))
+            elif key == "hidden":
+                page.wait_for_selector(val, state="hidden", timeout=t)
+                out.append(AssertionResult(key, True, val))
+            elif key == "text_contains":
+                sel, text = val["selector"], val["text"]
+                page.wait_for_selector(sel, state="attached", timeout=t)
+                actual = page.text_content(sel) or ""
+                ok = text in actual
+                out.append(AssertionResult(key, ok,
+                                           f"want {text!r} in {actual[:160]!r}"))
+            elif key == "text_matches":
+                sel, pattern = val["selector"], val["pattern"]
+                page.wait_for_selector(sel, state="attached", timeout=t)
+                actual = page.text_content(sel) or ""
+                ok = re.search(pattern, actual) is not None
+                out.append(AssertionResult(key, ok,
+                                           f"want /{pattern}/ in {actual[:160]!r}"))
+            elif key == "count":
+                sel = val["selector"]
+                n = page.locator(sel).count()
+                if "equals" in val:
+                    ok, detail = n == val["equals"], f"count={n} want ={val['equals']}"
+                elif "gte" in val:
+                    ok, detail = n >= val["gte"], f"count={n} want >={val['gte']}"
+                else:
+                    ok, detail = n <= val["lte"], f"count={n} want <={val['lte']}"
+                out.append(AssertionResult(key, ok, f"{sel}: {detail}"))
+            elif key == "url_contains":
+                ok = val in page.url
+                out.append(AssertionResult(key, ok, f"url={page.url[:160]!r}"))
+            elif key == "title_contains":
+                title = page.title()
+                ok = val in title
+                out.append(AssertionResult(key, ok, f"title={title[:120]!r}"))
+            elif key == "noop":
+                out.append(AssertionResult(key, True, "intentional no-op"))
+            elif key == "console_clean":
+                errs = collectors.errors_since_checkpoint()
+                ok = not errs
+                detail = "clean" if ok else f"{len(errs)} error(s): " + "; ".join(
+                    e.get("text", "")[:120] for e in errs[:3])
+                out.append(AssertionResult(key, ok, detail))
+            elif key == "js":
+                actual = str(page.evaluate(val["script"]))
+                ok = val["contains"] in actual
+                out.append(AssertionResult(key, ok,
+                                           f"want {val['contains']!r} in {actual[:160]!r}"))
+        except Exception as e:  # noqa: BLE001 — assertion failure, not a bug
+            out.append(AssertionResult(key, False, f"{type(e).__name__}: {str(e)[:200]}"))
+    return out
+
+
+def _screenshot_policy(spec: FlowSpec) -> str:
+    return spec.artifacts.get("screenshot", "per-step")
+
+
+def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
+             headless: bool = True, executable_path: str | None = None,
+             ) -> RunResult:
+    """Execute the flow. Never raises for flow failures; raises only on harness errors."""
+    from playwright.sync_api import sync_playwright
+
+    target = target or spec.target
+    executable_path = executable_path or os.environ.get("QALOOP_EXECUTABLE_PATH")
+    started = time.time()
+    steps: list[StepResult] = []
+    collectors = Collectors()
+    status, failed_step, run_error = "passed", None, ""
+    shot_policy = _screenshot_policy(spec)
+    ax_on_failure = spec.artifacts.get("ax_snapshot", "on-failure") == "on-failure"
+    deadline = started + spec.timeouts.get("run_ms", 300000) / 1000
+
+    def shot_path(phase: str, i: int) -> str:
+        return os.path.join(run_dir, "steps", f"{phase}-{i:02d}.png")
+
+    def ax_path(phase: str, i: int) -> str:
+        return os.path.join(run_dir, "steps", f"{phase}-{i:02d}-ax.txt")
+
+    with sync_playwright() as pw:
+        launch_kw: dict = {"headless": headless}
+        if executable_path:
+            launch_kw["executable_path"] = executable_path
+        browser = pw.chromium.launch(**launch_kw)
+        try:
+            ctx = browser.new_context(viewport=spec.viewport)
+            if spec.artifacts.get("trace"):
+                ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
+            page = ctx.new_page()
+            collectors.attach(page)
+
+            phases = [("setup", spec.setup, True), ("steps", spec.steps, False),
+                      ("teardown", spec.teardown, False)]
+            abort = False
+            for phase, steplist, is_setup in phases:
+                for step in steplist:
+                    if time.time() > deadline:
+                        run_error = "run timeout exceeded"
+                        status = "error"
+                        abort = True
+                        break
+                    if abort and phase != "teardown":
+                        steps.append(StepResult(step.index, phase, step.name, step.op,
+                                                "skipped", 0))
+                        continue
+                    t0 = time.time()
+                    collectors.checkpoint()
+                    sr = StepResult(step.index, phase, step.name, step.op,
+                                    "passed", 0)
+                    try:
+                        if step.op:
+                            _do_action(page, step, target)
+                        sr.assertions = _check_assertions(page, step, collectors)
+                        failed_asserts = [a for a in sr.assertions if not a.passed]
+                        if failed_asserts:
+                            sr.status = "failed"
+                            sr.error = "; ".join(
+                                f"{a.name}: {a.detail}" for a in failed_asserts[:3])
+                    except Exception as e:  # noqa: BLE001
+                        sr.status = "failed"
+                        sr.error = f"{type(e).__name__}: {str(e)[:400]}"
+                    sr.duration_ms = int((time.time() - t0) * 1000)
+
+                    # artifacts
+                    try:
+                        if shot_policy == "per-step" or (
+                                shot_policy == "on-failure" and sr.status == "failed"):
+                            sp = shot_path(phase, step.index)
+                            page.screenshot(path=sp)
+                            sr.artifacts.screenshot = sp
+                        if sr.status == "failed" and ax_on_failure:
+                            ap = ax_path(phase, step.index)
+                            with open(ap, "w", encoding="utf-8") as f:
+                                f.write(ax_snapshot(page))
+                            sr.artifacts.ax_snapshot = ap
+                    except Exception as e:  # noqa: BLE001
+                        sr.error += f" [artifact error: {e}]"
+
+                    steps.append(sr)
+                    if sr.status == "failed":
+                        if phase == "teardown":
+                            continue  # best-effort
+                        if is_setup or not step.continue_on_fail:
+                            status = "failed"
+                            failed_step = len(steps) - 1
+                            abort = True
+                if abort and phase != "teardown":
+                    continue
+            if spec.artifacts.get("trace"):
+                ctx.tracing.stop(path=os.path.join(run_dir, "trace.zip"))
+            ctx.close()
+        finally:
+            browser.close()
+
+    ended = time.time()
+    save_json(f"{run_dir}/run.json",
+              RunResult(flow_name=spec.name, target=target, status=status,
+                        started=started, ended=ended, steps=steps,
+                        failed_step=failed_step,
+                        console_errors=collectors.console_errors,
+                        page_errors=collectors.page_errors,
+                        failed_requests=collectors.failed_requests,
+                        bad_responses=collectors.bad_responses,
+                        run_dir=run_dir, error=run_error).to_dict())
+    return RunResult(flow_name=spec.name, target=target, status=status,
+                     started=started, ended=ended, steps=steps,
+                     failed_step=failed_step,
+                     console_errors=collectors.console_errors,
+                     page_errors=collectors.page_errors,
+                     failed_requests=collectors.failed_requests,
+                     bad_responses=collectors.bad_responses,
+                     run_dir=run_dir, error=run_error)

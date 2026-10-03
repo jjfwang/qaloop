@@ -1,0 +1,46 @@
+version: 1
+name: game-loading-frames
+description: >-
+  First-impression chrome without a server: the F-01 warm loading frame renders
+  its authored strings on boot, the F-02 error chrome appears when the socket
+  is unreachable, and f2 (返回加载) returns to the loading frame.
+target: ${TARGET_URL}
+
+setup:
+  - name: fresh profile so the one-time welcome line renders
+    seed: {js: "localStorage.clear()"}
+  - name: open the client
+    goto: /
+
+steps:
+  # NOTE: F-01 visibility itself is racy (the refused socket fails fast), so
+  # we assert the authored strings landed in the DOM — they persist even
+  # after the frame hides. Visibility of the *error* frame is asserted next.
+  - name: F-01 authored loading strings render on boot
+    expect:
+      - text_contains: {selector: "#loading-text", text: "正在点燃第一堆火"}
+      - text_contains: {selector: "#loading-welcome", text: "欢迎来到河谷营地"}
+
+  - name: F-02 error chrome appears when the server is unreachable
+    wait: {target: "#load-error", state: visible, timeout_ms: 20000}
+    expect:
+      - hidden: "#loading-frame"
+      - visible: "#load-error"
+      - text_contains: {selector: "#load-error", text: "系统消息"}
+      - visible: "#load-error-retry"
+
+  - name: f2 returns to the loading frame (no new socket attempt)
+    click: "#load-error-loading"
+    expect:
+      - visible: "#loading-frame"
+      - hidden: "#load-error"
+      - text_contains: {selector: "#loading-text", text: "正在点燃第一堆火"}
+
+teardown:
+  - name: clean profile state
+    seed: {js: "localStorage.clear()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: true
+max_investigation_actions: 20

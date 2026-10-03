@@ -1,0 +1,19 @@
+# Repo presets for `qaloop worker` (kind: verify-repo).
+# Each repo declares how to boot its target(s) and which flows to run.
+repos:
+  stoneage-reimagined:
+    workdir: /home/hatch/workspace/stoneage-reimagined
+    # default env: static client only (socket DOWN — for failure-path flows)
+    env:
+      - static: {dir: apps/game-client, port: 8901}
+    env_profiles:
+      # client + deterministic socket fixture (socket UP — for live-session flows)
+      with_socket:
+        - static: {dir: apps/game-client, port: 8901}
+        - command:
+            command: python3 /home/hatch/workspace/qaloop/fixtures/game_socket_fixture.py --port 3123
+            wait: {log_contains: "listening ws://127.0.0.1:3123"}
+            name: socket-fixture
+    flows:
+      - flows/game-loading-frames.yaml
+      - {flow: flows/game-live-session.yaml, env: with_socket}

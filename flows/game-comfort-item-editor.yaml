@@ -1,0 +1,65 @@
+version: 1
+name: game-comfort-item-editor
+description: >-
+  Camp editor with a placed comfort item (issue #680): from the connected World
+  HUD the player opens the camp editor and sees the shade mat named in the
+  rest slot as 遮阳垫 (words only — no counts, no rest meter, no numbers).
+  The reaction note line is idle-hidden: the fixture never sends an ACK, so
+  no ephemeral placement or settling-offer cue lands — the note documents the
+  calm placed state, not a trophy. Deterministic fixture: no timers, no counts
+  on the wire.
+target: ${TARGET_URL}
+
+setup:
+  - name: fresh profile so no overlay claims first-paint
+    seed: {js: "localStorage.clear()"}
+  - name: open the client (fixture socket must be up on :3123 with --snapshot camp-comfort-item — the SNAPSHOT is what carries the placed shade mat)
+    goto: /
+
+steps:
+  - name: S-01 handshake completes — World HUD is up
+    wait: {target: "#connection-state", state: visible, text: "Connected — a new game session started.", timeout_ms: 20000}
+    expect:
+      - text_contains: {selector: "#connection-state", text: "Connected — a new game session started."}
+      - hidden: "#camp-panel"
+
+  - name: S-02 guided first moment renders (fresh profile guarantees it)
+    wait: {target: "#guidance-overlay", state: visible, timeout_ms: 20000}
+    expect:
+      - visible: "#guidance-follow"
+
+  - name: S-03 f1 follow dismisses guidance (same as game-live-session.yaml S-03)
+    click: "#guidance-follow"
+    expect:
+      - hidden: "#guidance-overlay"
+
+  - name: S-04 open the camp editor from the player-panel entry
+    click: "#camp-open"
+    expect:
+      - visible: "#camp-panel"
+      - text_contains: {selector: "#camp-title", text: "营地布置"}
+      - count: {selector: ".camp-slot", equals: 5}
+
+  - name: S-05 the rest slot names the placed shade mat in words, never counts
+    expect:
+      - text_contains: {selector: "#camp-slots", text: "休息处"}
+      - text_contains: {selector: "#camp-slots", text: "遮阳垫"}
+      - text_matches: {selector: "#camp-slots", pattern: "^((?!comfort-item:shade-mat).)*$"}
+
+  - name: S-06 the reaction note line holds idle — no cue without a placement
+    expect:
+      - hidden: "#camp-note"
+
+  - name: S-07 Esc closes the editor back to the bare World HUD
+    press: {target: "#camp-back", key: "Escape"}
+    expect:
+      - hidden: "#camp-panel"
+      - visible: "#camp-open"
+
+teardown:
+  - name: clean profile state
+    seed: {js: "localStorage.clear()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 25000, run_ms: 180000}
+investigate_on_failure: true

@@ -1,0 +1,10 @@
+# qaloop operational junk — never commit
+runs/
+dashboard/
+qaloop.db
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.venv/

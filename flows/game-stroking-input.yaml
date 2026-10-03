@@ -1,0 +1,113 @@
+version: 1
+name: game-stroking-input
+description: >-
+  Stroking input layer (issue #684): the IA_CARE_TEND gesture recognizer
+  accepts wobbly and smooth strokes identically with no timing gate
+  (slow, paused, resumed drags all sustain), the hold-to-begin is
+  adjustable 200–2000ms with a 500ms default (OD-P56), IA_CARE_TEND
+  appears in the remap listing under the care group with its
+  plain-language name, and the settings range control persists. The
+  wire module is DOM-free and import-free, so the flow evaluates it
+  in-page with an injected advisory clock.
+target: ${TARGET_URL}
+
+setup:
+  - name: fresh profile so no overlay claims first-paint
+    seed: {js: "localStorage.clear()"}
+  - name: open the client (fixture socket must be up on :3123)
+    goto: /
+
+steps:
+  - name: S-01 handshake completes — World HUD is up
+    wait: {target: "#connection-state", state: visible, text: "Connected — a new game session started.", timeout_ms: 20000}
+    expect:
+      - text_contains: {selector: "#connection-state", text: "Connected — a new game session started."}
+
+  - name: S-02 wobbly and smooth strokes register identically (no precision gate)
+    expect:
+      - js:
+          script: >-
+            (async () => { const w = await import(new URL('./wire.mjs',
+            location.href).href); const run = (holds) => { let t = 0; const
+            ev = []; const r = w.createStrokeRecognizer({now: () => t,
+            holdDurationMs: 500, onEvent: (e) => ev.push(e.type)});
+            r.pointerDown(1); for (const h of holds) { t += h;
+            r.pointerMove(1); } r.pointerUp(1); return ev.join(','); };
+            const smooth = run([500, 100, 100, 100]); const wobbly =
+            run([600, 3000, 10, 50]); return smooth + ' | ' + wobbly; })()
+          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end | stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end"
+
+  - name: S-03 hold below threshold never starts; at threshold starts
+    expect:
+      - js:
+          script: >-
+            (async () => { const w = await import(new URL('./wire.mjs',
+            location.href).href); const run = (hold) => { let t = 0; const
+            ev = []; const r = w.createStrokeRecognizer({now: () => t,
+            holdDurationMs: 500, onEvent: (e) => ev.push(e.type)});
+            r.pointerDown(1); t += hold; r.update(); r.pointerUp(1);
+            return ev.join(',') || 'none'; }; return run(499) + ' / ' +
+            run(500); })()
+          contains: "none / stroke-start,stroke-end"
+
+  - name: S-04 no timing window gates the stroke — paused and resumed drags sustain
+    expect:
+      - js:
+          script: >-
+            (async () => { const w = await import(new URL('./wire.mjs',
+            location.href).href); let t = 0; const ev = []; const r =
+            w.createStrokeRecognizer({now: () => t, holdDurationMs: 500,
+            onEvent: (e) => ev.push(e.type)}); r.pointerDown(1); t += 500;
+            r.update(); r.pointerMove(1); t += 60000; r.pointerMove(1);
+            r.pointerUp(1); return ev.join(','); })()
+          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-end"
+
+  - name: S-05 remap listing carries IA_CARE_TEND under the care group with its plain-language name
+    expect:
+      - js:
+          script: >-
+            (async () => { const w = await import(new URL('./wire.mjs',
+            location.href).href); const listing = w.getRemapListing();
+            const g = listing.find((x) => x.actions.some((a) => a.id ===
+            'IA_CARE_TEND')); const a = g.actions.find((x) => x.id ===
+            'IA_CARE_TEND'); const raw = JSON.stringify(listing
+            .flatMap((x) => [x.name].concat(x.actions.map((y) =>
+            y.name)))); return g.id + ' :: ' + a.name + ' :: ' +
+            (/IA_[A-Z_]+/.test(raw) ? 'RAW_ID_LEAK' : 'no-raw-ids'); })()
+          contains: "request-care :: Tend / care :: no-raw-ids"
+
+  - name: S-06 settings hold-duration range exists with the adjustable bounds
+    expect:
+      - count: {selector: "#settings-hold-to-begin", equals: 1}
+      - js:
+          script: >-
+            (() => { const el =
+            document.querySelector('#settings-hold-to-begin'); return
+            [el.min, el.max, el.step, el.value].join('/'); })()
+          contains: "200/2000/50/500"
+
+  - name: S-07 changing the hold duration persists holdToBeginMs to the settings profile
+    script: {js: "(() => { const el = document.querySelector('#settings-hold-to-begin'); el.value = '1200'; el.dispatchEvent(new Event('change', {bubbles: true})); })()"}
+    expect:
+      - js:
+          script: >-
+            (() => JSON.parse(localStorage.getItem('stoneage.settings.v1') ||
+            '{}').holdToBeginMs)()
+          contains: "1200"
+
+  - name: S-08 pet-care surface opts out of browser touch gestures (scoped, never global)
+    expect:
+      - js:
+          script: >-
+            (() => getComputedStyle(document.querySelector('#pet-panel')).touchAction +
+            ' / ' + getComputedStyle(document.body).touchAction)()
+          contains: "none"
+
+teardown:
+  - name: clean profile state
+    seed: {js: "localStorage.clear()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 25000, run_ms: 180000}
+investigate_on_failure: true
+max_investigation_actions: 20
