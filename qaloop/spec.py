@@ -231,6 +231,11 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
             t = params["times"]
             if not isinstance(t, int) or t < 1:
                 raise SpecError(f"{where}: mock.times must be a positive int")
+        if "delay_ms" in params:
+            d = params["delay_ms"]
+            # bools are ints in Python; delay_ms: true is always a typo
+            if isinstance(d, bool) or not isinstance(d, int) or d < 0:
+                raise SpecError(f"{where}: mock.delay_ms must be an int >= 0")
 
 
 def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[str, Any]]:

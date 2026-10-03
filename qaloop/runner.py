@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+import greenlet as _greenlet
+
 from .artifacts import Collectors, StepArtifacts, ax_snapshot, save_json
 from .spec import FlowSpec, Step
 
@@ -147,6 +149,35 @@ def _do_seed(page, params: dict, timeout_ms: int, target: str) -> None:
         resp.read()
 
 
+def _route_delay(route, delay_s: float) -> None:
+    """Hold a mocked response for delay_s without freezing the automation.
+
+    Sync-API route handlers run in a greenlet while the driver event loop
+    awaits their completion, so a plain time.sleep here would block every
+    Playwright call for the whole delay — no mid-flight assertion (spinner,
+    skeleton) could ever observe the loading state. Instead, park this
+    greenlet on a loop timer: control returns to the event loop immediately,
+    and the greenlet resumes to fulfill once the delay elapses. route.fulfill
+    must run on this same greenlet (sync-API greenlet machinery), which is
+    why a background thread cannot do the sleeping.
+    """
+    import asyncio
+
+    g = _greenlet.getcurrent()
+    parent = g.parent
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = getattr(route, "_loop", None)
+    if loop is not None and parent is not None:
+        loop.call_later(delay_s, g.switch)
+        parent.switch()
+    else:
+        # No event loop to yield to (unexpected); degrade to a blocking
+        # sleep so the latency simulation still applies.
+        time.sleep(delay_s)
+
+
 def _do_mock(page, params: dict) -> None:
     """Register a Playwright network route returning a canned response.
 
@@ -168,6 +199,7 @@ def _do_mock(page, params: dict) -> None:
         with open(params["path"], "rb") as f:
             body = f.read()
     times = params.get("times")
+    delay_ms = params.get("delay_ms", 0)
     seen = {"n": 0}
 
     def handler(route, request):
@@ -178,6 +210,12 @@ def _do_mock(page, params: dict) -> None:
         if times is not None and seen["n"] > times:
             route.fallback()
             return
+        # Hold the mocked response without freezing the automation: the sleep
+        # must not block Playwright's event loop, or no mid-flight assertion
+        # could ever observe the loading state. No sleep on the times-exceeded
+        # fallback branch.
+        if delay_ms:
+            _route_delay(route, delay_ms / 1000)
         route.fulfill(status=status, headers=headers, body=body)
 
     page.route(url, handler)
