@@ -75,10 +75,10 @@ alongside the feature. Conventions:
 | `verify <flow> [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once, print card, write `runs/<id>/REPORT.md` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
 | `perform --task "..." --target URL [--executable-path PATH]` | natural-language browser agent: performs the task like a person (see below) |
-| `evaluate --claim "..." --run <dir> --diff <file\|range>` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
+| `evaluate --claim "..." --run <dir> --diff <file\|range> [--repo DIR]` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
 | `enqueue --kind verify-flow --flow F --target U` | queue a one-off verification |
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
-| `worker [--once] [--poll 5] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
+| `worker [--once] [--poll 5] [--flows DIR] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
 | `webhook [--port 8090] [--host 127.0.0.1]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
 | `investigate --run <dir> --flow <yaml> [--executable-path PATH]` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
@@ -91,6 +91,12 @@ alongside the feature. Conventions:
   actions; defaults to the flow spec's `max_investigation_actions` (default 20).
 - `--host` (on `webhook`, default `127.0.0.1`) is the bind host of the GitHub
   receiver — set it to `0.0.0.0` for containerized deploys.
+- `--flows DIR` (on `worker`, default the `flows/` directory inside the qaloop
+  checkout) is the directory the worker resolves bare flow names against when it
+  claims verify-flow jobs — point it elsewhere to serve flows from another copy.
+- `--repo DIR` (on `evaluate`, default: the current directory) is the repo root
+  qaloop runs `git diff <range>` in when `--diff` is a git range rather than a
+  diff file.
 
 ## Demo: mock + UX in one flow
 
