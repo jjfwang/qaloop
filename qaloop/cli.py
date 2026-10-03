@@ -155,12 +155,16 @@ def _cmd_baselines_run(args: argparse.Namespace, run_dir: str) -> int:
 def cmd_perform(args: argparse.Namespace) -> int:
     from qaloop import ledger
     from qaloop.perform import perform
+    if args.max_cost_usd < 0:
+        print("ERROR: --max-cost-usd cannot be negative")
+        return 2
     try:
         result = perform(
             task=args.task, target=args.target,
             max_actions=args.max_actions, headless=not args.headed,
             executable_path=args.executable_path, cdp_url=args.cdp_url,
-            allow_publish=args.allow_publish, upload_dir=args.upload_dir)
+            allow_publish=args.allow_publish, upload_dir=args.upload_dir,
+            max_cost_usd=args.max_cost_usd)
     except RuntimeError as e:
         print(f"ERROR: {e}")
         return 2
@@ -169,13 +173,17 @@ def cmd_perform(args: argparse.Namespace) -> int:
     print(f"actions: {result['action_count']}  "
           f"tokens {result['tokens_in']}/{result['tokens_out']}  "
           f"est ${result['cost_usd_est']:.4f}")
+    if args.max_cost_usd > 0:
+        print(f"cost ceiling: ${args.max_cost_usd:g}")
     print(f"report: {os.path.join(result['run_dir'], 'PERFORM.md')}")
     ledger.append({"kind": "perform", "run_dir": result["run_dir"],
                    "task": args.task[:120], "status": result["status"],
                    "actions": result["action_count"],
                    "tokens_in": result["tokens_in"],
                    "tokens_out": result["tokens_out"],
-                   "cost_usd_est": result["cost_usd_est"]})
+                   "cost_usd_est": result["cost_usd_est"],
+                   "max_cost_usd": args.max_cost_usd,
+                   "ceiling_reached": result.get("ceiling_hit", False)})
     return 0 if result["status"] == "completed" else 1
 
 
@@ -369,6 +377,9 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--upload-dir", default=None,
                     help="directory file uploads are restricted to "
                          "(default: the run dir)")
+    pf.add_argument("--max-cost-usd", type=float, default=0.0,
+                    help="stop before the next model call would exceed this "
+                         "estimated USD cost (default 0 = unlimited)")
     pf.add_argument("--executable-path", default=None)
     pf.set_defaults(fn=cmd_perform)
 

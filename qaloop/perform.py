@@ -114,17 +114,29 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+def _call_cost(usage: dict, cfg: dict) -> float:
+    """Estimated USD cost of one model call from its usage and cfg prices."""
+    return (usage.get("prompt_tokens", 0) / 1e6 * cfg["price_in"] +
+            usage.get("completion_tokens", 0) / 1e6 * cfg["price_out"])
+
+
+def _ceiling_summary(max_cost_usd: float) -> str:
+    return f"cost ceiling reached (max-cost-usd {max_cost_usd})"
+
+
 class Performer:
     """Executes one natural-language task in a browser page."""
 
     def __init__(self, page, run_dir: str, max_actions: int,
                  allow_publish: bool = False, seed: int = 0,
-                 upload_dir: str | None = None):
+                 upload_dir: str | None = None,
+                 max_cost_usd: float = 0.0):
         self.page = page
         self.run_dir = run_dir
         self.max_actions = max_actions
         self.allow_publish = allow_publish
         self.upload_dir = upload_dir
+        self.max_cost_usd = max_cost_usd
         self.rng = random.Random(seed)
         self.n = 0
         self.transcript: list[dict] = []
@@ -137,6 +149,17 @@ class Performer:
         page.on("pageerror", lambda e: self.console.append(
             {"type": "pageerror", "text": str(e)[:300]}))
         page.on("dialog", self._on_dialog)
+
+    def _ceiling_hit(self, cost_so_far: float, estimate_next: float) -> bool:
+        """True when issuing the next model call would breach the ceiling.
+
+        The first call is always allowed (estimate_next == 0 means no
+        estimate basis yet); afterwards the previous call's observed cost
+        is the estimate. max_cost_usd == 0 means unlimited.
+        """
+        if self.max_cost_usd <= 0 or estimate_next <= 0:
+            return False
+        return cost_so_far + estimate_next > self.max_cost_usd
 
     def _on_dialog(self, dialog):
         # Destructive confirmations are a stop sign: record, dismiss, tell the model.
@@ -305,7 +328,8 @@ class Performer:
 def perform(*, task: str, target: str | None, max_actions: int = 30,
             headless: bool = True, executable_path: str | None = None,
             cdp_url: str | None = None, allow_publish: bool = False,
-            runs_root: str | None = None, upload_dir: str | None = None) -> dict:
+            runs_root: str | None = None, upload_dir: str | None = None,
+            max_cost_usd: float = 0.0) -> dict:
     """Run one natural-language task. Returns the result dict (also saved)."""
     from playwright.sync_api import sync_playwright
 
@@ -352,11 +376,15 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
         try:
             agent = Performer(page, run_dir, max_actions,
                               allow_publish=allow_publish,
-                              upload_dir=upload_dir)
+                              upload_dir=upload_dir,
+                              max_cost_usd=max_cost_usd)
             if target:
                 page.goto(target, timeout=25000, wait_until="domcontentloaded")
             status, summary = "incomplete", ""
+            ceiling_hit = False
             shot_b64 = None
+            cost_so_far = 0.0
+            last_call_cost = 0.0  # no estimate basis until the first call lands
             for _ in range(max_actions):
                 obs = agent.observe()
                 user_msg: dict = {"role": "user", "content": obs}
@@ -367,6 +395,10 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
                             "url": "data:image/png;base64," + shot_b64}}]}
                 messages.append(user_msg)
                 shot_b64 = None
+                if agent._ceiling_hit(cost_so_far, last_call_cost):
+                    status, summary = "blocked", _ceiling_summary(max_cost_usd)
+                    ceiling_hit = True
+                    break
                 try:
                     reply, usage = _chat(cfg, messages)
                 except Exception as e:
@@ -374,9 +406,17 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
                     if "image" in str(e).lower() or "400" in str(e):
                         vision_ok = False
                         messages[-1] = {"role": "user", "content": obs}
+                        if agent._ceiling_hit(cost_so_far, last_call_cost):
+                            status, summary = "blocked", _ceiling_summary(
+                                max_cost_usd)
+                            ceiling_hit = True
+                            break
                         reply, usage = _chat(cfg, messages)
                     else:
                         raise
+                call_cost = _call_cost(usage, cfg)
+                cost_so_far += call_cost
+                last_call_cost = call_cost
                 agent.tokens_in += usage.get("prompt_tokens", 0)
                 agent.tokens_out += usage.get("completion_tokens", 0)
                 try:
@@ -423,6 +463,8 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
                 "cost_usd_est": round(
                     agent.tokens_in / 1e6 * cfg["price_in"] +
                     agent.tokens_out / 1e6 * cfg["price_out"], 4),
+                "max_cost_usd": max_cost_usd,
+                "ceiling_hit": ceiling_hit,
                 "final_url": page.url, "final_title": page.title(),
                 "attached": attached,
             })
@@ -431,11 +473,16 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
                 browser.close()
 
     save_json(os.path.join(run_dir, "perform.json"), result)
+    ceiling_desc = (f"${max_cost_usd:g}" if max_cost_usd > 0
+                    else "none (unlimited)")
+    if ceiling_hit:
+        ceiling_desc += " — stop reason: cost ceiling reached"
     lines = [f"# perform: {task}", "",
              f"status: **{result['status']}** — {result['summary']}", "",
              f"actions: {result['action_count']} · tokens in/out: "
              f"{result['tokens_in']}/{result['tokens_out']} · "
-             f"est cost ${result['cost_usd_est']:.4f}", "",
+             f"est cost ${result['cost_usd_est']:.4f} · "
+             f"cost ceiling: {ceiling_desc}", "",
              f"final: {result['final_title']} <{result['final_url']}>", "",
              "## transcript", ""]
     for r in agent.transcript:

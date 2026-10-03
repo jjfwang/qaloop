@@ -407,6 +407,36 @@ def test_perform_action_json_extraction():
         check("non-json rejected", True)
 
 
+def test_perform_cost_ceiling():
+    from qaloop.perform import Performer, _call_cost, _ceiling_summary
+    p = Performer.__new__(Performer)
+    p.max_cost_usd = 0.0001
+    check("first call allowed (no estimate)",
+          not p._ceiling_hit(0.0, 0.0))
+    check("call within ceiling allowed",
+          not p._ceiling_hit(0.0, 0.00005))
+    check("accumulated+estimate over ceiling blocks",
+          p._ceiling_hit(0.000156, 0.000156))
+    check("exactly-at-ceiling allowed",
+          not p._ceiling_hit(0.00005, 0.00005))
+    p.max_cost_usd = 0.0
+    check("max_cost_usd=0 means unlimited",
+          not p._ceiling_hit(100.0, 100.0))
+    cfg = {"price_in": 0.15, "price_out": 0.60}
+    cost = _call_cost({"prompt_tokens": 800, "completion_tokens": 60}, cfg)
+    check("call cost from usage and prices",
+          abs(cost - 0.000156) < 1e-9, str(cost))
+    check("blocked summary names the ceiling",
+          _ceiling_summary(0.0001) ==
+          "cost ceiling reached (max-cost-usd 0.0001)")
+    from qaloop.cli import build_parser
+    args = build_parser().parse_args(
+        ["perform", "--task", "x", "--max-cost-usd", "0.0001"])
+    check("cli flag parses", args.max_cost_usd == 0.0001)
+    args_default = build_parser().parse_args(["perform", "--task", "x"])
+    check("cli flag defaults to unlimited", args_default.max_cost_usd == 0.0)
+
+
 def test_services_validation():
     from qaloop.spec import _validate_services, SpecError
     good = _validate_services(
