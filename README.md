@@ -72,25 +72,17 @@ alongside the feature. Conventions:
 | command | what it does |
 |---|---|
 | `validate <flow>` | check spec structure (env vars not required) |
-| `verify <flow> [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once, print card, write `runs/<id>/REPORT.md` |
+| `verify <flow> [--target URL] [--investigate] [--headed]` | run once, print card, write `runs/<id>/REPORT.md` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
-| `perform --task "..." --target URL [--executable-path PATH]` | natural-language browser agent: performs the task like a person (see below) |
+| `perform --task "..." --target URL` | natural-language browser agent: performs the task like a person (see below) |
 | `evaluate --claim "..." --run <dir> --diff <file\|range>` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
 | `enqueue --kind verify-flow --flow F --target U` | queue a one-off verification |
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
-| `worker [--once] [--poll 5] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
-| `webhook [--port 8090] [--host 127.0.0.1]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
-| `investigate --run <dir> --flow <yaml> [--executable-path PATH]` | run the investigator on an existing run |
+| `worker [--once] [--poll 5]` | claim jobs → boot env → run flows → report |
+| `webhook [--port 8090]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
+| `investigate --run <dir> --flow <yaml>` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
 | `ledger` | cost summary JSON |
-
-- `--executable-path` is available on `verify`, `perform`, `investigate`, and
-  `worker`: chromium executable (default: Playwright's). The flag wins over the
-  `QALOOP_EXECUTABLE_PATH` env var — use it when the system browser is unusable.
-- `--max-investigation-actions N` (on `verify`) caps the failure investigator's
-  actions; defaults to the flow spec's `max_investigation_actions` (default 20).
-- `--host` (on `webhook`, default `127.0.0.1`) is the bind host of the GitHub
-  receiver — set it to `0.0.0.0` for containerized deploys.
 
 ## Demo: mock + UX in one flow
 
