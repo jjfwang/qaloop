@@ -73,6 +73,7 @@ alongside the feature. Conventions:
 | `verify <flow> [--target URL] [--investigate] [--headed]` | run once, print card, write `runs/<id>/REPORT.md` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
 | `perform --task "..." --target URL` | natural-language browser agent: performs the task like a person (see below) |
+| `evaluate --claim "..." --run <dir> --diff <file\|range>` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
 | `enqueue --kind verify-flow --flow F --target U` | queue a one-off verification |
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
 | `worker [--once] [--poll 5]` | claim jobs → boot env → run flows → report |
@@ -95,6 +96,40 @@ python3 -m http.server 8931 --bind 127.0.0.1 &   # serves /demo/mock-demo.html
 TARGET_URL=http://127.0.0.1:8931 python3 -m qaloop.cli baselines flows/demo-mock-ux.yaml
 TARGET_URL=http://127.0.0.1:8931 python3 -m qaloop.cli verify flows/demo-mock-ux.yaml
 ```
+
+## Real services: boot, run against, tear down
+
+A flow can declare `services:` (see [SPEC.md](SPEC.md)) — real commands
+qaloop boots before the run, waits for readiness (`port` / `http` /
+`log_contains`), exposes as `QALOOP_SERVICE_<NAME>_URL`, then tears down
+afterwards with logs captured under `<run_dir>/services/`:
+
+```bash
+python3 -m qaloop.cli verify flows/demo-services.yaml   # boots demo/proof_server.py, no manual server needed
+```
+
+`flows/demo-services.yaml` proves it against a real backend: the flow's
+`target: ${QALOOP_SERVICE_API_URL}` resolves only after the service is
+ready, and the run passes 5/5 against the live server.
+
+## Evaluate: the semantic judge
+
+`verify` tells you the flow passed; `evaluate` tells you whether the
+change *makes sense* — given the claimed behavior, the diff, and the
+flow's evidence (steps, assertions, AX snapshots, console/network errors,
+service logs). It writes `EVALUATION.md` + `evaluation.json` into the run
+dir and logs the model cost:
+
+```bash
+python3 -m qaloop.cli evaluate \
+  --claim "The profile editor now saves the display name" \
+  --run runs/<run-id> \
+  --diff HEAD~1..HEAD
+```
+
+Verdicts: `MAKES_SENSE` · `DOES_NOT_MAKE_SENSE` ·
+`INSUFFICIENT_EVIDENCE` · `BLOCKED`. Uses the same `QALOOP_MODEL_*`
+model config as `perform`/investigator.
 
 ## Perform mode: the agent takes over a browser
 

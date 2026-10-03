@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 QALOOP_HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,16 +32,49 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _flow_services_info(flow_path: str):
+    """Light-parse a flow: returns (flow_name, services) without env substitution."""
+    from qaloop.spec import load_services_light
+    return load_services_light(flow_path)
+
+
+def _service_ctx(flow_path: str, services: list, run_dir: str):
+    """Build the services context manager for a flow run."""
+    from qaloop.env import flow_services
+    base_dir = os.path.dirname(os.path.abspath(flow_path))
+    return flow_services(services, base_dir, run_dir)
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     from qaloop import ledger
+    runs_root = default_runs_root()
+    os.makedirs(runs_root, exist_ok=True)
+    try:
+        flow_name, services = _flow_services_info(args.flow)
+    except SpecError as e:
+        print(f"INVALID SPEC: {e}")
+        return 2
+    run_dir = new_run_dir(runs_root, flow_name)
+    # Enter the services context explicitly so boot failures (and only boot
+    # failures) are reported as such; the flow run itself manages its errors.
+    ctx = _service_ctx(args.flow, services, run_dir)
+    try:
+        ctx.__enter__()
+    except (TimeoutError, RuntimeError, ValueError) as e:
+        print(f"SERVICE BOOT FAILED: {type(e).__name__}: {e}")
+        return 3
+    try:
+        return _cmd_verify_run(args, run_dir, ledger)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger) -> int:
     try:
         spec = load_spec(args.flow)
     except SpecError as e:
         print(f"INVALID SPEC: {e}")
         return 2
-    runs_root = default_runs_root()
-    os.makedirs(runs_root, exist_ok=True)
-    run_dir = new_run_dir(runs_root, spec.name)
     target = args.target or spec.target
     print(f"run dir: {run_dir}")
     print(f"target:  {target}")
@@ -75,14 +109,32 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def cmd_baselines(args: argparse.Namespace) -> int:
     """Run a flow in baseline-update mode: screenshot_matches assertions
     save their baselines instead of comparing."""
+    runs_root = default_runs_root()
+    os.makedirs(runs_root, exist_ok=True)
+    try:
+        flow_name, services = _flow_services_info(args.flow)
+    except SpecError as e:
+        print(f"INVALID SPEC: {e}")
+        return 2
+    run_dir = new_run_dir(runs_root, flow_name + "-baselines")
+    ctx = _service_ctx(args.flow, services, run_dir)
+    try:
+        ctx.__enter__()
+    except (TimeoutError, RuntimeError, ValueError) as e:
+        print(f"SERVICE BOOT FAILED: {type(e).__name__}: {e}")
+        return 3
+    try:
+        return _cmd_baselines_run(args, run_dir)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def _cmd_baselines_run(args: argparse.Namespace, run_dir: str) -> int:
     try:
         spec = load_spec(args.flow)
     except SpecError as e:
         print(f"INVALID SPEC: {e}")
         return 2
-    runs_root = default_runs_root()
-    os.makedirs(runs_root, exist_ok=True)
-    run_dir = new_run_dir(runs_root, spec.name + "-baselines")
     target = args.target or spec.target
     print(f"run dir: {run_dir}")
     print(f"target:  {target}")
@@ -125,6 +177,58 @@ def cmd_perform(args: argparse.Namespace) -> int:
                    "tokens_out": result["tokens_out"],
                    "cost_usd_est": result["cost_usd_est"]})
     return 0 if result["status"] == "completed" else 1
+
+
+def _resolve_diff(diff_arg: str, repo: str | None) -> str:
+    """Accept a diff file path or a git range; return unified diff text."""
+    if os.path.isfile(diff_arg):
+        with open(diff_arg, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    if ".." in diff_arg or re.fullmatch(r"[0-9a-fA-F]{4,40}", diff_arg or ""):
+        import subprocess
+        out = subprocess.run(
+            ["git", "-C", repo or ".", "diff", diff_arg],
+            capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            raise RuntimeError(f"git diff {diff_arg}: {out.stderr.strip()[:200]}")
+        return out.stdout
+    raise RuntimeError(f"--diff must be a diff file or a git range, got {diff_arg!r}")
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    from qaloop import ledger
+    from qaloop.evaluate import evaluate, write_evaluation
+    run_dir = args.run
+    if not os.path.isdir(run_dir):
+        print(f"ERROR: run dir not found: {run_dir}")
+        return 2
+    try:
+        diff = _resolve_diff(args.diff, args.repo)
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 2
+    if not diff.strip():
+        print("ERROR: empty diff — nothing to evaluate")
+        return 2
+    try:
+        verdict = evaluate(args.claim, run_dir, diff)
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 2
+    md_path, json_path = write_evaluation(run_dir, args.claim, verdict)
+    cost = verdict.get("_cost", {})
+    ledger.append({"kind": "evaluate", "run_dir": os.path.abspath(run_dir),
+                   "claim": args.claim[:120],
+                   "verdict": verdict["verdict"],
+                   "tokens_in": cost.get("tokens_in", 0),
+                   "tokens_out": cost.get("tokens_out", 0),
+                   "cost_usd_est": cost.get("cost_usd_est", 0)})
+    print(f"verdict: {verdict['verdict']} (confidence: {verdict.get('confidence')})")
+    print(f"rationale: {verdict.get('rationale')}")
+    print(f"cost: tokens {cost.get('tokens_in')}/{cost.get('tokens_out')}  "
+          f"est ${cost.get('cost_usd_est', 0):.6f}")
+    print(f"report: {md_path}")
+    return 0
 
 
 def cmd_enqueue(args: argparse.Namespace) -> int:
@@ -264,6 +368,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="permit external publish/post actions")
     pf.add_argument("--executable-path", default=None)
     pf.set_defaults(fn=cmd_perform)
+
+    ev = sub.add_parser("evaluate",
+                        help="semantic judge: does the change make sense?")
+    ev.add_argument("--claim", required=True,
+                    help="what the change supposedly does")
+    ev.add_argument("--run", required=True,
+                    help="qaloop run dir with run.json evidence")
+    ev.add_argument("--diff", required=True,
+                    help="unified diff file, or a git range like HEAD~1..HEAD")
+    ev.add_argument("--repo", default=None,
+                    help="repo root for git ranges (default: auto-detect)")
+    ev.set_defaults(fn=cmd_evaluate)
     return p
 
 

@@ -1,0 +1,40 @@
+version: 1
+name: demo-services
+description: >-
+  qaloop spins up a real service (the demo API server), waits until it
+  answers, and verifies the UI against it — no mocks, no pre-started
+  servers. Service logs land in the run dir under services/.
+services:
+  - name: api
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/greeting"}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_API_URL}
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+  - name: fill the signup name
+    fill: {target: "#name", text: "Ada"}
+
+  - name: fill the signup email
+    fill: {target: "#email", text: "ada@example.com"}
+
+  - name: submit and see the real confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, Ada!"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

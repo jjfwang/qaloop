@@ -5,6 +5,7 @@ waits until it answers, so the runner never races a cold boot.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import socket
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 
@@ -142,3 +144,58 @@ def boot_command(cmd: str, cwd: str | None = None, env: dict | None = None,
             pass
         raise
     return ProcTarget(url=url, proc=proc, log_path=log_path, _log_file=logf)
+
+
+@contextlib.contextmanager
+def flow_services(specs: list[dict], base_dir: str, run_dir: str):
+    """Boot a flow's `services:` block, export their URLs, tear down after.
+
+    For each service, exports QALOOP_SERVICE_<NAME>_URL (and _PORT when the
+    wait spec names a port) into os.environ so the spec's ${VAR} substitution
+    can use them. Service logs are copied into <run_dir>/services/ on teardown.
+    Yields {name: ProcTarget}. Stops already-booted services if one fails.
+    """
+    targets: dict[str, ProcTarget] = {}
+    exported: list[str] = []
+    log_dir = os.path.join(run_dir, "services")
+    try:
+        for s in specs:
+            name, uname = s["name"], s["name"].upper()
+            cwd = s.get("cwd")
+            if cwd and not os.path.isabs(cwd):
+                cwd = os.path.join(base_dir, cwd)
+            wait = dict(s["wait"])
+            # Default wait URLs to 127.0.0.1 when only a port is given.
+            t = boot_command(s["command"], cwd=cwd, env=s.get("env") or None,
+                             wait=wait, timeout_s=s.get("timeout_s", 90),
+                             name=f"svc-{name}")
+            targets[name] = t
+            url = s.get("url") or t.url
+            if url and not s.get("url"):
+                # t.url may be an http-wait health URL with a path
+                # (e.g. http://127.0.0.1:8933/api/greeting); the service's
+                # public base is the origin, not the health endpoint.
+                parts = urlsplit(url)
+                if parts.path not in ("", "/"):
+                    url = f"{parts.scheme}://{parts.netloc}/"
+            url_key = f"QALOOP_SERVICE_{uname}_URL"
+            os.environ[url_key] = url
+            exported.append(url_key)
+            port = wait.get("port")
+            if port:
+                port_key = f"QALOOP_SERVICE_{uname}_PORT"
+                os.environ[port_key] = str(port)
+                exported.append(port_key)
+        yield targets
+    finally:
+        for t in reversed(list(targets.values())):
+            t.stop()
+        for var in exported:
+            os.environ.pop(var, None)
+        if targets:
+            os.makedirs(log_dir, exist_ok=True)
+            for name, t in targets.items():
+                if t.log_path and os.path.exists(t.log_path):
+                    with open(t.log_path, "rb") as fsrc:
+                        with open(os.path.join(log_dir, f"{name}.log"), "wb") as fdst:
+                            fdst.write(fsrc.read())
