@@ -332,6 +332,102 @@ def test_screenshot_matches_selector_capture():
               res[0].detail)
 
 
+def test_text_assertion_polling():
+    """text_contains/text_matches poll until async-rendered text appears."""
+    import time
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def make_step(items, timeout_ms=None):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=items,
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+
+    class FakePage:
+        def __init__(self, texts, wait_ok=True):
+            self.texts = texts  # successive text_content returns
+            self.calls = 0
+            self.wait_ok = wait_ok
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            if not self.wait_ok:
+                raise TimeoutError("selector never attached")
+
+        def text_content(self, selector):
+            i = min(self.calls, len(self.texts) - 1)
+            self.calls += 1
+            return self.texts[i]
+
+    # Case 1: text arrives after a delay (async render) -> both assertions pass
+    late = FakePage(["", "", "", "hello world"])
+    res = _check_assertions(
+        late, make_step([("text_contains", {"selector": "#out", "text": "world"})]),
+        None)
+    check("delayed text_contains passes", res[0].passed, res[0].detail)
+    check("poll re-read text_content", late.calls > 2, str(late.calls))
+
+    late = FakePage(["", "", "hello world"])
+    res = _check_assertions(
+        late, make_step([("text_matches",
+                           {"selector": "#out", "pattern": r"h.llo w.rld"})]),
+        None)
+    check("delayed text_matches passes", res[0].passed, res[0].detail)
+
+    # Case 2: text never appears -> fails with same detail format, bounded by step timeout
+    t0 = time.monotonic()
+    never = FakePage(["loading..."])
+    res = _check_assertions(
+        never, make_step([("text_contains", {"selector": "#out", "text": "done"})],
+                         timeout_ms=600),
+        None)
+    elapsed = time.monotonic() - t0
+    check("never-matching text fails", not res[0].passed, res[0].detail)
+    check("detail format unchanged", res[0].detail == "want 'done' in 'loading...'",
+          res[0].detail)
+    check("bounded by step timeout", elapsed < 3.0, f"elapsed={elapsed:.2f}s")
+
+    t0 = time.monotonic()
+    never = FakePage(["loading..."])
+    res = _check_assertions(
+        never, make_step([("text_matches", {"selector": "#out", "pattern": r"^done$"})],
+                         timeout_ms=600),
+        None)
+    elapsed = time.monotonic() - t0
+    check("never-matching regex fails", not res[0].passed, res[0].detail)
+    check("regex detail format unchanged",
+          res[0].detail == "want /^done$/ in 'loading...'", res[0].detail)
+    check("regex bounded by step timeout", elapsed < 3.0, f"elapsed={elapsed:.2f}s")
+
+    # Case 3 regression: immediate match passes without sleeping; missing selector unchanged
+    fast = FakePage(["done already"])
+    t0 = time.monotonic()
+    res = _check_assertions(
+        fast, make_step([("text_contains", {"selector": "#out", "text": "done"})],
+                        timeout_ms=600),
+        None)
+    elapsed = time.monotonic() - t0
+    check("immediate match passes", res[0].passed, res[0].detail)
+    check("immediate match single read", fast.calls == 1, str(fast.calls))
+    check("immediate match no sleep", elapsed < 0.5, f"elapsed={elapsed:.2f}s")
+
+    gone = FakePage(["x"], wait_ok=False)
+    res = _check_assertions(
+        gone, make_step([("text_contains", {"selector": "#gone", "text": "x"})]),
+        None)
+    check("missing selector fails cleanly",
+          not res[0].passed and res[0].detail.startswith("TimeoutError:"),
+          res[0].detail)
+    check("missing selector never reads text", gone.calls == 0, str(gone.calls))
+
+    # Case 4: bad pattern still routes to the same failed-assertion path
+    res = _check_assertions(
+        FakePage(["anything"]),
+        make_step([("text_matches", {"selector": "#out", "pattern": r"([bad"})]),
+        None)
+    check("bad pattern fails cleanly",
+          not res[0].passed and res[0].detail.startswith("error:"), res[0].detail)
+
+
 def test_screenshot_rms_diff():
     from qaloop.artifacts import screenshot_rms_diff
     from PIL import Image
