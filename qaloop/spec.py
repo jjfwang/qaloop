@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -86,6 +86,83 @@ class FlowSpec:
     investigate_on_failure: bool
     max_investigation_actions: int
     source_path: str
+    services: list[dict] = field(default_factory=list)
+
+
+_SERVICE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+
+
+def _validate_services(raw: Any, where: str) -> list[dict]:
+    """Validate the top-level `services:` block.
+
+    Each service boots a real process before the flow runs:
+      services:
+        - name: api
+          command: "python3 app.py --port 8000"
+          cwd: ../myapp              # optional, relative to the flow file
+          env: {PORT: "8000"}         # optional
+          wait: {http: "http://127.0.0.1:8000/health"}  # or {port: 8000} or {log_contains: "ready"}
+          timeout_s: 60               # optional, default 90
+    After boot, QALOOP_SERVICE_<NAME>_URL (and _PORT when a port is known)
+    are exported, so target/steps can use ${QALOOP_SERVICE_API_URL}.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise SpecError(f"{where}: `services` must be a list")
+    out = []
+    for i, s in enumerate(raw):
+        w = f"{where}: services[{i}]"
+        if not isinstance(s, dict):
+            raise SpecError(f"{w}: service must be a mapping")
+        name = s.get("name")
+        if not isinstance(name, str) or not _SERVICE_NAME.match(name):
+            raise SpecError(f"{w}: service `name` must be an identifier "
+                            f"[a-zA-Z][a-zA-Z0-9_]*")
+        if not isinstance(s.get("command"), str) or not s["command"]:
+            raise SpecError(f"{w}: service `command` is required (string)")
+        wait = s.get("wait")
+        if not isinstance(wait, dict) or len(wait) != 1 or \
+                next(iter(wait)) not in {"port", "http", "log_contains"}:
+            raise SpecError(f"{w}: service `wait` must be exactly one of "
+                            f"{{port, http, log_contains}}")
+        timeout_s = s.get("timeout_s", 90)
+        if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+            raise SpecError(f"{w}: service `timeout_s` must be positive")
+        url = s.get("url")
+        if url is not None and (not isinstance(url, str) or not url):
+            raise SpecError(f"{w}: service `url` must be a non-empty string")
+        out.append({
+            "name": name,
+            "command": s["command"],
+            "cwd": s.get("cwd"),
+            "env": dict(s.get("env") or {}),
+            "wait": wait,
+            "timeout_s": float(timeout_s),
+            "url": url,
+        })
+    names = [s["name"] for s in out]
+    if len(set(names)) != len(names):
+        raise SpecError(f"{where}: duplicate service names {names}")
+    return out
+
+
+def load_services_light(path: str) -> tuple[str, list[dict]]:
+    """Parse just the flow name + services block, without env substitution.
+
+    Used to boot services BEFORE the full spec load, so that service URLs
+    are available as ${QALOOP_SERVICE_<NAME>_URL} during env substitution.
+    Never boots anything itself.
+    """
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    where = f"spec {path}"
+    if not isinstance(raw, dict):
+        raise SpecError(f"{where}: top level must be a mapping")
+    name = raw.get("name")
+    if not name or not isinstance(name, str):
+        raise SpecError(f"{where}: `name` is required")
+    return name, _validate_services(raw.get("services"), where)
 
 
 def _validate_op_params(op: str | None, params: Any, where: str) -> None:
@@ -310,4 +387,5 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         investigate_on_failure=bool(raw.get("investigate_on_failure", True)),
         max_investigation_actions=int(raw.get("max_investigation_actions", 20)),
         source_path=path,
+        services=_validate_services(raw.get("services"), where),
     )

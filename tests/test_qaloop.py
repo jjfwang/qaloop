@@ -380,6 +380,193 @@ def test_perform_action_json_extraction():
         check("non-json rejected", True)
 
 
+def test_services_validation():
+    from qaloop.spec import _validate_services, SpecError
+    good = _validate_services(
+        [{"name": "api", "command": "python3 app.py",
+          "wait": {"http": "http://127.0.0.1:8000/health"}, "timeout_s": 30,
+          "env": {"PORT": "8000"}}], "spec x")
+    check("valid service parses", good[0]["name"] == "api"
+          and good[0]["env"] == {"PORT": "8000"} and good[0]["url"] is None)
+    check("no services -> []", _validate_services(None, "spec x") == [])
+    bad = [
+        ("bad name", [{"name": "9bad", "command": "x", "wait": {"port": 1}}]),
+        ("missing command", [{"name": "a", "wait": {"port": 1}}]),
+        ("empty command", [{"name": "a", "command": "", "wait": {"port": 1}}]),
+        ("two waits", [{"name": "a", "command": "x",
+                        "wait": {"port": 1, "http": "u"}}]),
+        ("unknown wait", [{"name": "a", "command": "x", "wait": {"ssh": 1}}]),
+        ("bad timeout", [{"name": "a", "command": "x", "wait": {"port": 1},
+                          "timeout_s": -1}]),
+        ("dup names", [{"name": "a", "command": "x", "wait": {"port": 1}},
+                       {"name": "a", "command": "y", "wait": {"port": 2}}]),
+        ("not a list", {"name": "a"}),
+        ("empty url", [{"name": "a", "command": "x", "wait": {"port": 1},
+                        "url": ""}]),
+    ]
+    for label, raw in bad:
+        try:
+            _validate_services(raw, "spec x")
+            check(f"services rejected: {label}", False)
+        except SpecError:
+            check(f"services rejected: {label}", True)
+
+
+def test_services_light_parse():
+    from qaloop.spec import load_services_light
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("name: svc-test\ntarget: http://x/\n"
+                "services:\n"
+                "  - name: api\n    command: python3 app.py\n"
+                "    wait: {port: 8123}\n"
+                "steps: []\n")
+        path = f.name
+    try:
+        name, services = load_services_light(path)
+        check("light parse name", name == "svc-test")
+        check("light parse services", len(services) == 1
+              and services[0]["wait"] == {"port": 8123})
+    finally:
+        os.unlink(path)
+
+
+def test_flow_services_boot_teardown():
+    import socket
+    from qaloop.env import flow_services
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    spec = [{"name": "web", "command": f"python3 -m http.server {port}",
+             "cwd": None, "env": {}, "wait": {"port": port},
+             "timeout_s": 15.0, "url": None}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        ctx.__enter__()
+        try:
+            check("service URL exported",
+                  os.environ.get("QALOOP_SERVICE_WEB_URL") ==
+                  f"http://127.0.0.1:{port}/")
+            check("service PORT exported",
+                  os.environ.get("QALOOP_SERVICE_WEB_PORT") == str(port))
+            r = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/", timeout=5)
+            check("service answers http", r.status == 200)
+            log = os.path.join(run_dir, "services", "web.log")
+        finally:
+            ctx.__exit__(None, None, None)
+        check("env cleaned up",
+              "QALOOP_SERVICE_WEB_URL" not in os.environ)
+        check("service log captured", os.path.exists(log))
+    import subprocess
+    left = subprocess.run(["pgrep", "-f", f"http.server {port}"],
+                          capture_output=True).returncode
+    check("service torn down", left != 0)
+
+
+def test_flow_services_http_url_origin():
+    import socket
+    from qaloop.env import flow_services
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    # wait on a health *path*; the exported URL must be the origin, not the
+    # health endpoint.
+    server = ("python3 -c \"from http.server import BaseHTTPRequestHandler,"
+              " HTTPServer\n"
+              "class H(BaseHTTPRequestHandler):\n"
+              "    def do_GET(self):\n"
+              "        self.send_response(200); self.end_headers();"
+              " self.wfile.write(b'ok')\n"
+              "    def log_message(self, *a): pass\n"
+              f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\"")
+    spec = [{"name": "api", "command": server,
+             "cwd": None, "env": {},
+             "wait": {"http": f"http://127.0.0.1:{port}/health"},
+             "timeout_s": 15.0, "url": None}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        try:
+            ctx.__enter__()
+            check("health-path wait derives origin URL",
+                  os.environ.get("QALOOP_SERVICE_API_URL") ==
+                  f"http://127.0.0.1:{port}/")
+        finally:
+            ctx.__exit__(None, None, None)
+
+
+def test_flow_services_boot_failure():
+    from qaloop.env import flow_services
+    spec = [{"name": "bad", "command": "python3 -c 'import sys; sys.exit(3)'",
+             "cwd": None, "env": {}, "wait": {"port": 59999},
+             "timeout_s": 2.0, "url": None}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        try:
+            ctx.__enter__()
+            check("boot failure raised", False)
+        except (TimeoutError, RuntimeError, ValueError):
+            check("boot failure raised", True)
+        finally:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        check("failed service env cleaned",
+              "QALOOP_SERVICE_BAD_URL" not in os.environ)
+
+
+def test_evaluate_verdict_extraction():
+    from qaloop.evaluate import _extract_verdict
+    v = _extract_verdict('note: {"verdict": "MAKES_SENSE", "confidence": "high",'
+                         ' "rationale": "ok", "evidence": [], "risks": []} end')
+    check("verdict extracted", v["verdict"] == "MAKES_SENSE"
+          and v["confidence"] == "high")
+    try:
+        _extract_verdict("no json here")
+        check("non-json verdict rejected", False)
+    except ValueError:
+        check("non-json verdict rejected", True)
+    try:
+        _extract_verdict('{"verdict": "MAYBE"}')
+        check("unknown verdict rejected", False)
+    except ValueError:
+        check("unknown verdict rejected", True)
+
+
+def test_evaluate_collect_and_write():
+    from qaloop.evaluate import collect_evidence, write_evaluation
+    with tempfile.TemporaryDirectory() as run_dir:
+        run = {"flow_name": "demo", "target": "http://x/", "status": "PASS",
+               "failed_step": None, "error": "",
+               "steps": [{"index": 0, "phase": "steps", "name": "load",
+                          "op": "goto", "status": "PASS", "duration_ms": 100,
+                          "error": "", "assertions": [],
+                          "screenshot": None, "ax_snapshot": None}],
+               "console_errors": [], "page_errors": [],
+               "failed_requests": [], "bad_responses": []}
+        with open(os.path.join(run_dir, "run.json"), "w") as f:
+            json.dump(run, f)
+        diff = "diff --git a/a.py b/a.py\n+x = 1\n"
+        ev = collect_evidence(run_dir, diff)
+        check("evidence assembled", ev["flow_name"] == "demo"
+              and ev["diff_stat"] == "1 files, +1/-0"
+              and len(ev["steps"]) == 1)
+        md, js = write_evaluation(run_dir, "x does y",
+                                  {"verdict": "MAKES_SENSE",
+                                   "confidence": "high",
+                                   "rationale": "r", "evidence": ["e1"],
+                                   "risks": [],
+                                   "_cost": {"tokens_in": 1, "tokens_out": 2,
+                                             "cost_usd_est": 0.0,
+                                             "model": "m"}})
+        check("EVALUATION.md written", os.path.exists(md)
+              and "MAKES_SENSE" in open(md).read())
+        check("evaluation.json written",
+              json.load(open(js))["verdict"]["verdict"] == "MAKES_SENSE")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

@@ -49,7 +49,26 @@ timeouts: {step_ms: 15000, run_ms: 300000}
 
 investigate_on_failure: true
 max_investigation_actions: 20
+
+services:                       # boot real services before the flow runs
+  - name: api
+    command: "python3 app.py --port 8000"
+    cwd: ../myapp               # optional; relative to the flow file
+    env: {PORT: "8000"}         # optional extra env for the command
+    wait: {http: "http://127.0.0.1:8000/health"}  # exactly one of:
+                                # {port: 8000} | {http: <url>} | {log_contains: "ready"}
+    timeout_s: 60               # optional, default 90
+    url: "http://127.0.0.1:8000/"  # optional; default is the wait URL's
+                                # origin (for http) or http://127.0.0.1:<port>/
 ```
+
+Services are booted before `verify`/`baselines` run, then torn down (in
+reverse order) even when the flow fails. Each service exports
+`QALOOP_SERVICE_<NAME>_URL` (and `QALOOP_SERVICE_<NAME>_PORT` when a port
+is known), so `target: ${QALOOP_SERVICE_API_URL}` resolves after boot.
+Service stdout/stderr are copied to `<run_dir>/services/<name>.log`.
+If a service fails to boot, the run aborts with `SERVICE BOOT FAILED`
+and previously booted services are stopped.
 
 ## Action ops (one per step; a step may also carry `expect`)
 
