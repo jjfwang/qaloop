@@ -189,9 +189,18 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
             params = {}
         if not isinstance(params, dict):
             raise SpecError(f"{where}: wait needs a mapping")
-        state = params.get("state", "visible")
-        if state not in {"visible", "hidden", "attached", "detached"}:
-            raise SpecError(f"{where}: wait state must be visible|hidden|attached|detached")
+        # Two forms, disjoint state sets (Playwright's wait_for_selector does
+        # not accept load states): target-ful waits watch a selector;
+        # targetless waits watch a page load state the runner already
+        # implements via wait_for_load_state.
+        if params.get("target"):
+            state = params.get("state", "visible")
+            if state not in {"visible", "hidden", "attached", "detached"}:
+                raise SpecError(f"{where}: wait with target: state must be visible|hidden|attached|detached")
+        else:
+            state = params.get("state", "load")
+            if state not in {"load", "domcontentloaded", "networkidle"}:
+                raise SpecError(f"{where}: wait without target: state must be load|domcontentloaded|networkidle")
     elif op == "wait_ms":
         if not isinstance(params, int) or params < 0:
             raise SpecError(f"{where}: wait_ms needs a non-negative integer")

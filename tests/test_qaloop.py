@@ -371,6 +371,88 @@ def test_mock_validation():
               s.setup[0].params.get("delay_ms") == val, s.setup[0].params)
 
 
+def test_wait_state_validation():
+    """wait has two disjoint forms: targetless waits accept only
+    load|domcontentloaded|networkidle; target-ful waits accept only
+    visible|hidden|attached|detached (issue #20)."""
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: w\n    wait: PARAMS\n")
+    def params(**kw):
+        inner = ", ".join(f"{k}: {v}" for k, v in kw.items())
+        return base.replace("PARAMS", "{" + inner + "}")
+    for state in ["load", "domcontentloaded", "networkidle"]:
+        s = load(params(state=state))
+        check(f"targetless wait accepted: {state}", s.steps[1].params.get("state") == state)
+    s = load(params())  # bare mapping: no state -> runner defaults to load
+    check("targetless bare wait accepted", s.steps[1].op == "wait")
+    for state in ["visible", "hidden", "attached", "detached"]:
+        s = load(params(target='"#x"', state=state))
+        check(f"target-ful wait accepted: {state}", s.steps[1].params.get("state") == state)
+    s = load(params(target='"#x"'))  # no state -> runner defaults to visible
+    check("target-ful bare wait accepted", s.steps[1].op == "wait")
+    for state in ["visible", "hidden", "attached", "detached"]:
+        try:
+            load(params(state=state))
+            check(f"targetless selector-state rejected: {state}", False, "no error")
+        except SpecError:
+            check(f"targetless selector-state rejected: {state}", True)
+    for state in ["load", "domcontentloaded", "networkidle"]:
+        try:
+            load(params(target='"#x"', state=state))
+            check(f"target-ful load-state rejected: {state}", False, "no error")
+        except SpecError:
+            check(f"target-ful load-state rejected: {state}", True)
+    try:
+        load(params(state='"bogus"'))
+        check("bogus targetless state rejected", False, "no error")
+    except SpecError:
+        check("bogus targetless state rejected", True)
+
+
+def test_wait_runner_defaults():
+    """Runner default state follows the wait form: targetless -> "load" via
+    wait_for_load_state; target-ful -> "visible" via wait_for_selector.
+    Explicit states pass through to the matching Playwright call (issue #20)."""
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("selector", selector, state))
+        def wait_for_load_state(self, state=None, timeout=None):
+            self.calls.append(("load_state", state))
+
+    def run(params):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="w", op="wait", params=params,
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=None, raw={})
+        _do_action(page, step, "http://x")
+        return page.calls
+
+    calls = run({})
+    check("targetless bare wait -> load state", calls == [("load_state", "load")], str(calls))
+    calls = run({"state": "networkidle"})
+    check("targetless networkidle passes through", calls == [("load_state", "networkidle")],
+          str(calls))
+    calls = run({"target": "#x"})
+    check("target-ful bare wait -> visible selector", calls == [("selector", "#x", "visible")],
+          str(calls))
+    calls = run({"target": "#x", "state": "hidden"})
+    check("target-ful hidden passes through", calls == [("selector", "#x", "hidden")], str(calls))
+
+
 def test_mock_delay_ms_runner():
     """Real browser proof: a mock with delay_ms=250 holds the response ~250ms;
     delay_ms absent still responds instantly (no timing regression)."""

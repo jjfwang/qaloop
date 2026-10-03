@@ -243,7 +243,12 @@ def _do_action(page, step: Step, target: str) -> None:
     elif op == "wait":
         params = p or {}
         sel = params.get("target")
-        state = params.get("state", "visible")
+        # Decision (#20): the default state follows the form — targetless
+        # waits watch the page, so default "load"; target-ful waits watch a
+        # selector, so default "visible". The in (...) guard below stays as a
+        # safety net for unvalidated flows (spec validation already rejects
+        # anything but load|domcontentloaded|networkidle here).
+        state = params.get("state", "load" if not sel else "visible")
         wt = params.get("timeout_ms", t)
         text = params.get("text")
         if sel:
