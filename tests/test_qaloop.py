@@ -245,6 +245,99 @@ def test_retry_migration_from_old_schema():
               f"{old['status']} max_retries={old['max_retries']} attempts={old['attempts']}")
 
 
+@contextlib.contextmanager
+def _stub_run_one_flow(result):
+    """Browser-free stub for worker._run_one_flow (plain attribute swap)."""
+    from qaloop import worker
+    real = worker._run_one_flow
+
+    def fake(flow_path, target, runs_root, headless, executable_path, do_investigate):
+        return result
+
+    worker._run_one_flow = fake
+    try:
+        yield
+    finally:
+        worker._run_one_flow = real
+
+
+def _handle_kwargs():
+    return dict(flows_dir="/tmp/flows", runs_root="/tmp/runs", headless=True,
+                executable_path=None, repos_config={"repos": {}})
+
+
+def test_worker_pass_claim_run_done():
+    from qaloop import queue, worker
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+        with _stub_run_one_flow(("passed", "/tmp/runs/demo")):
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("worker pass marks done", row["status"] == "done", row["status"])
+        check("worker pass records run_dir", row["run_dir"] == "/tmp/runs/demo",
+              str(row["run_dir"]))
+        check("worker pass leaves queue empty", queue.claim() is None)
+
+
+def test_worker_failure_requeues_within_retry_budget():
+    from qaloop import queue, worker
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"},
+                            max_retries=2)
+        with _stub_run_one_flow(("failed", "/tmp/runs/f1")):
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("worker failure requeues to pending", row["status"] == "pending",
+              row["status"])
+        check("worker failure counts one attempt", row["attempts"] == 1,
+              str(row["attempts"]))
+        check("requeued job claimable again",
+              (queue.claim() or {}).get("id") == jid)
+
+
+def test_worker_retry_exhausted_terminal_via_handle_job():
+    from qaloop import queue, worker
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"},
+                            max_retries=1)
+        with _stub_run_one_flow(("failed", "/tmp/runs/f")):
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("exhausted worker job is failed", row["status"] == "failed",
+              row["status"])
+        check("two attempts used for max_retries=1", row["attempts"] == 2,
+              str(row["attempts"]))
+        check("nothing left to claim", queue.claim() is None)
+
+
+def test_worker_stale_claim_released():
+    from qaloop import queue
+    with temp_db():
+        jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+        queue.claim()
+        n = queue.requeue_stale(stale_s=0)
+        check("stale claim released", n == 1, str(n))
+        row = _job_row(jid)
+        check("stale claim back to pending", row["status"] == "pending",
+              row["status"])
+        check("released claim is re-claimable",
+              (queue.claim() or {}).get("id") == jid)
+
+
+def test_worker_once_empty_queue_exits():
+    import io
+    from qaloop import worker
+    with temp_db():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                              once=True, poll_s=0.01, headless=True,
+                              executable_path=None)
+        out = buf.getvalue()
+        check("once-mode prints empty-queue message", "queue empty" in out, out.strip() or "(no output)")
+
+
 def test_cli_enqueue_max_retries_flag():
     from qaloop.cli import build_parser
     args = build_parser().parse_args(["enqueue", "--kind", "verify-flow", "--flow", "x.yaml",
