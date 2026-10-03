@@ -198,6 +198,11 @@ The worker claims jobs, boots the repo's env from `repos.yaml`, runs its
 flows, writes reports, appends to the ledger, and marks the job done/failed.
 `GET /health` shows pending depth. Stale claims (>1h) are requeued.
 
+`enqueue --max-retries N` gives a job up to N extra attempts after the first
+failure (default 0 = today's behavior: one failure and the job is terminal).
+A job with `--max-retries 2` that fails twice then passes finishes with
+3 claims; one that fails three times ends `failed` with attempts=3.
+
 ## Investigator
 
 `qaloop/investigate.py` — a ReAct loop with 8 tools
