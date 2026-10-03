@@ -369,6 +369,33 @@ def test_perform_guards():
         check("publish allowed with flag", False)
 
 
+def test_perform_upload_guard():
+    from qaloop.perform import Performer
+    p = Performer.__new__(Performer)
+    with tempfile.TemporaryDirectory() as d:
+        p.upload_dir = d
+        inside = os.path.join(d, "resume.txt")
+        try:
+            got = p._check_upload_path(inside)
+            check("absolute path inside dir passes",
+                  got == os.path.abspath(inside))
+        except ValueError:
+            check("absolute path inside dir passes", False)
+        cases = [
+            ("relative path rejected", "resume.txt"),
+            (".. escape rejected", os.path.join(d, "..", "escape.txt")),
+            ("absolute path outside rejected", "/etc/hostname"),
+            ("sibling dir via .. rejected",
+             os.path.join(d, "sub", "..", "..", "other")),
+        ]
+        for name, bad in cases:
+            try:
+                p._check_upload_path(bad)
+                check(name, False, bad)
+            except ValueError:
+                check(name, True)
+
+
 def test_perform_action_json_extraction():
     from qaloop.perform import _extract_json
     a = _extract_json('here you go: {"action": "click", "target": {"role": "button"}} done')

@@ -160,7 +160,7 @@ def cmd_perform(args: argparse.Namespace) -> int:
             task=args.task, target=args.target,
             max_actions=args.max_actions, headless=not args.headed,
             executable_path=args.executable_path, cdp_url=args.cdp_url,
-            allow_publish=args.allow_publish)
+            allow_publish=args.allow_publish, upload_dir=args.upload_dir)
     except RuntimeError as e:
         print(f"ERROR: {e}")
         return 2
@@ -366,6 +366,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="take over a live browser, e.g. http://127.0.0.1:9222")
     pf.add_argument("--allow-publish", action="store_true",
                     help="permit external publish/post actions")
+    pf.add_argument("--upload-dir", default=None,
+                    help="directory file uploads are restricted to "
+                         "(default: the run dir)")
     pf.add_argument("--executable-path", default=None)
     pf.set_defaults(fn=cmd_perform)
 

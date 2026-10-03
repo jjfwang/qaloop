@@ -34,6 +34,9 @@ Reply with exactly one JSON action per turn and nothing else:
 {"action": "fill", "target": {"role": "textbox", "name": "Email"}, "text": "a@b.c"}
 {"action": "press", "key": "Enter"}                      or with "target"
 {"action": "select", "target": {"role": "combobox", "name": "City"}, "value": "sg"}
+{"action": "upload", "target": {"css": "#resume"}, "path": "/abs/path/file"}
+    attach a local file to a file input (absolute path under the upload
+    dir only); target the <input type=file> itself
 {"action": "check", "target": {"role": "checkbox", "name": "Remember me"}}
 {"action": "uncheck", "target": {...}}
 {"action": "hover", "target": {"role": "menuitem", "name": "File"}}
@@ -54,6 +57,9 @@ Rules:
   observation; never assume a click worked.
 - Fill forms the way a person does: one field at a time, then submit, then
   check for confirmation.
+- File uploads are restricted to the declared upload dir: only absolute
+  paths under that directory are accepted. A rejected upload fails the
+  action, just like a misbehaving element would.
 - Never submit a payment, delete or destroy data, or publish/post externally.
   If the task (or a page along the way) asks for any of these, stop with
   "blocked" and say why. A confirmation dialog for something destructive is
@@ -112,11 +118,13 @@ class Performer:
     """Executes one natural-language task in a browser page."""
 
     def __init__(self, page, run_dir: str, max_actions: int,
-                 allow_publish: bool = False, seed: int = 0):
+                 allow_publish: bool = False, seed: int = 0,
+                 upload_dir: str | None = None):
         self.page = page
         self.run_dir = run_dir
         self.max_actions = max_actions
         self.allow_publish = allow_publish
+        self.upload_dir = upload_dir
         self.rng = random.Random(seed)
         self.n = 0
         self.transcript: list[dict] = []
@@ -172,6 +180,19 @@ class Performer:
                 raise PermissionError(
                     f"external publish blocked (re-run with --allow-publish "
                     f"to permit): {label!r}")
+
+    def _check_upload_path(self, path: str) -> str:
+        # Only absolute paths under the declared upload dir may be uploaded.
+        # Rejects relative paths and `..` escapes; raises ValueError so a
+        # rejected upload surfaces as a FAILED action observation.
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError("upload path must be an absolute path")
+        allowed = os.path.abspath(self.upload_dir or "")
+        want = os.path.abspath(path)
+        if os.path.commonpath([want, allowed]) != allowed:
+            raise ValueError(
+                f"upload path {path!r} is outside the upload dir {allowed!r}")
+        return want
 
     def act(self, action: dict) -> str:
         """Execute one model action; return the observation string."""
@@ -241,6 +262,12 @@ class Performer:
                 else:
                     time.sleep(action.get("ms", 1000) / 1000)
                 out = "wait satisfied"
+            elif name == "upload":
+                self._check_upload_path(action["path"])
+                loc = self._resolve(action["target"])
+                loc.scroll_into_view_if_needed(timeout=5000)
+                loc.set_input_files(action["path"], timeout=10000)
+                out = f"uploaded {os.path.basename(action['path'])}"
             elif name == "screenshot":
                 path = os.path.join(self.run_dir, "steps",
                                     f"perform-{self.n:02d}.png")
@@ -278,7 +305,7 @@ class Performer:
 def perform(*, task: str, target: str | None, max_actions: int = 30,
             headless: bool = True, executable_path: str | None = None,
             cdp_url: str | None = None, allow_publish: bool = False,
-            runs_root: str | None = None) -> dict:
+            runs_root: str | None = None, upload_dir: str | None = None) -> dict:
     """Run one natural-language task. Returns the result dict (also saved)."""
     from playwright.sync_api import sync_playwright
 
@@ -294,6 +321,7 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
     os.makedirs(runs_root, exist_ok=True)
     run_dir = new_run_dir(runs_root, "perform")
     os.makedirs(os.path.join(run_dir, "steps"), exist_ok=True)
+    upload_dir = upload_dir or run_dir
 
     messages = [
         {"role": "system",
@@ -323,7 +351,8 @@ def perform(*, task: str, target: str | None, max_actions: int = 30,
             attached = False
         try:
             agent = Performer(page, run_dir, max_actions,
-                              allow_publish=allow_publish)
+                              allow_publish=allow_publish,
+                              upload_dir=upload_dir)
             if target:
                 page.goto(target, timeout=25000, wait_until="domcontentloaded")
             status, summary = "incomplete", ""
