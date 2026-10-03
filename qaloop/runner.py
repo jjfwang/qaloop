@@ -230,6 +230,23 @@ def _do_action(page, step: Step, target: str) -> None:
         raise ValueError(f"unknown op {op}")
 
 
+def _poll_text_match(page, sel, match, deadline_s):
+    """Re-read text_content until match(actual) succeeds or the deadline passes.
+
+    Async-rendered text races the old one-shot read, so assertions poll here.
+    match(actual) may raise re.error for a bad pattern; that propagates to the
+    caller exactly as the one-shot read did.
+    """
+    actual = ""
+    while True:
+        actual = page.text_content(sel) or ""
+        if match(actual):
+            return True, actual
+        if time.monotonic() >= deadline_s:
+            return False, actual
+        time.sleep(0.15)
+
+
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
                       run_dir: str = "") -> list[AssertionResult]:
@@ -246,15 +263,17 @@ def _check_assertions(page, step: Step, collectors: Collectors,
             elif key == "text_contains":
                 sel, text = val["selector"], val["text"]
                 page.wait_for_selector(sel, state="attached", timeout=t)
-                actual = page.text_content(sel) or ""
-                ok = text in actual
+                ok, actual = _poll_text_match(
+                    page, sel, lambda a: text in a,
+                    time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want {text!r} in {actual[:160]!r}"))
             elif key == "text_matches":
                 sel, pattern = val["selector"], val["pattern"]
                 page.wait_for_selector(sel, state="attached", timeout=t)
-                actual = page.text_content(sel) or ""
-                ok = re.search(pattern, actual) is not None
+                ok, actual = _poll_text_match(
+                    page, sel, lambda a: re.search(pattern, a) is not None,
+                    time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want /{pattern}/ in {actual[:160]!r}"))
             elif key == "count":
