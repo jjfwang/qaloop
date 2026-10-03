@@ -54,6 +54,11 @@ def build(runs_root: str, out_dir: str) -> str:
         if r.get("diagnosis"):
             dg = r["diagnosis"]
             diag = f"<br><span class='muted'>dx: {(dg.get('likely_cause') or '')[:90]}</span>"
+        retried = [s for s in r.get("steps", []) if s.get("attempts", 1) > 1]
+        if retried:
+            labels = "; ".join(
+                f"{s.get('name', '?')}: {s['attempts']} attempts" for s in retried)
+            diag += f"<br><span class='muted'>retry — {labels[:140]}</span>"
         rows.append(
             f"<tr><td>{ts(r)}</td><td>{r.get('flow_name', '—')}</td>"
             f"<td class='{badge}'><b>{r.get('status', '?').upper()}</b></td>"

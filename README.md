@@ -64,6 +64,8 @@ alongside the feature. Conventions:
   API responses so flows exercise the real rendering path without a backend.
 - Pin the pixels that matter: `screenshot_matches` baselines for key
   screens, `ax` assertions for the user's perceivable contract.
+- Flaky UI: `retry: N` on a `steps`-phase step re-runs it up to N more times
+  on failure (first success wins, no delay between attempts).
 
 ## CLI
 

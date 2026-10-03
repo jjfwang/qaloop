@@ -88,7 +88,10 @@ and previously booted services are stopped.
 | `script` | `{js: "..."}` | `page.evaluate`; result ignored |
 
 Step meta keys: `name`, `expect`, `continue_on_fail` (default false —
-a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`).
+a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`),
+`retry` (default 0 — run once; integer ≥ 0; when a step fails it is re-run
+up to `retry` more times, first success wins; attempts run back-to-back
+with no delay; out of scope: cross-step retry, retrying setup-phase mocks).
 
 ### `mock` — deterministic data without a backend
 
