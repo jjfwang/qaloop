@@ -359,15 +359,25 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 out.append(AssertionResult(key, ok,
                                            f"want /{pattern}/ in {actual[:160]!r}"))
             elif key == "count":
+                # Poll locator count() until the comparator matches or the
+                # step deadline expires (issue #53); the failure detail names
+                # the final observed count, not a re-read after the poll.
+                # Comparator precedence is equals > gte > lte, unchanged.
                 sel = val["selector"]
-                n = page.locator(sel).count()
                 if "equals" in val:
-                    ok, detail = n == val["equals"], f"count={n} want ={val['equals']}"
+                    match, want = (lambda a: a == val["equals"],
+                                   f"={val['equals']}")
                 elif "gte" in val:
-                    ok, detail = n >= val["gte"], f"count={n} want >={val['gte']}"
+                    match, want = (lambda a: a >= val["gte"],
+                                   f">={val['gte']}")
                 else:
-                    ok, detail = n <= val["lte"], f"count={n} want <={val['lte']}"
-                out.append(AssertionResult(key, ok, f"{sel}: {detail}"))
+                    match, want = (lambda a: a <= val["lte"],
+                                   f"<={val['lte']}")
+                ok, n = _poll_value_match(
+                    lambda: page.locator(sel).count(), match,
+                    time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"{sel}: count={n} want {want}"))
             elif key == "mock_calls":
                 # Assert how often a mocked route was served (issue #43).
                 # observed comes from the run's mock_hits dict, keyed by the

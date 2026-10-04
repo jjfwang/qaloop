@@ -2501,6 +2501,93 @@ def test_url_title_assertion_polling():
           res.passed and page.title_reads == 1, f"reads={page.title_reads}")
 
 
+def test_count_assertion_polling():
+    # Issue #53: count polls locator count() until the comparator matches
+    # (equals > gte > lte precedence, unchanged) or the step deadline
+    # expires; the failure detail names the final observed count.
+    import time
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def make_step(val, timeout_ms=None):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[("count", val)],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+
+    class FakeLocator:
+        """Serves a fixed sequence of counts, one per count() call."""
+
+        def __init__(self, counts):
+            self._counts = counts
+            self.reads = 0
+
+        def count(self):
+            self.reads += 1
+            return self._counts[min(self.reads - 1, len(self._counts) - 1)]
+
+    class FakePage:
+        def __init__(self, counts):
+            self._locator = FakeLocator(counts)
+
+        def locator(self, sel):
+            return self._locator
+
+    # (a) delayed-growth equals passes, re-reading the page more than once
+    page = FakePage([1, 2, 3])
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "equals": 3}), None)[0]
+    check("count delayed-growth equals passes", res.passed, res.detail)
+    check("count delayed-growth re-reads the locator", page._locator.reads == 3,
+          f"reads={page._locator.reads}")
+
+    # (b) never-reaching count fails naming the final observed count,
+    # bounded by the step timeout
+    page = FakePage([1])
+    t0 = time.monotonic()
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "equals": 3},
+                        timeout_ms=600), None)[0]
+    elapsed = time.monotonic() - t0
+    check("count timeout fails", not res.passed, res.detail)
+    check("count timeout names final observed count and wanted value",
+          res.detail == "ul.items: count=1 want =3", res.detail)
+    check("count timeout bounded by step timeout", elapsed < 3.0,
+          f"{elapsed:.2f}s")
+
+    # (c) immediate match passes on the first read
+    page = FakePage([2])
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "equals": 2}), None)[0]
+    check("count immediate match passes on first read",
+          res.passed and page._locator.reads == 1,
+          f"reads={page._locator.reads}")
+
+    # (d) gte polls with the same deadline formula
+    page = FakePage([1, 2])
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "gte": 2}), None)[0]
+    check("count gte polls to a delayed match",
+          res.passed and page._locator.reads == 2,
+          f"reads={page._locator.reads}")
+
+    # (e) lte polls with the same deadline formula
+    page = FakePage([3, 2])
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "lte": 2}), None)[0]
+    check("count lte polls to a delayed match",
+          res.passed and page._locator.reads == 2,
+          f"reads={page._locator.reads}")
+
+    # (f) equals beats gte when both are present (precedence unchanged)
+    page = FakePage([5])
+    res = _check_assertions(
+        page, make_step({"selector": "ul.items", "equals": 5, "gte": 9}),
+        None)[0]
+    check("count equals precedence preserved",
+          res.passed and res.detail == "ul.items: count=5 want =5",
+          res.detail)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
