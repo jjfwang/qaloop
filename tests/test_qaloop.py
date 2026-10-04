@@ -2082,6 +2082,140 @@ def test_mock_calls_runner():
             srv.terminate()
 
 
+def test_network_jsonl_artifact():
+    from qaloop.artifacts import Collectors
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+    from qaloop.report import write_report
+
+    class FakeRequest:
+        def __init__(self, method, url, timing=None, failure=None):
+            self.method = method
+            self.url = url
+            self.timing = timing if timing is not None else {}
+            self.failure = failure
+
+    class FakeResponse:
+        def __init__(self, status, request, url):
+            self.status = status
+            self.request = request
+            self.url = url
+
+    # 1. response with timing -> one line, status + ms (time-to-first-byte),
+    #    URL preserved
+    c = Collectors()
+    req = FakeRequest("GET", "http://x/api/pets",
+                      {"requestStart": 100.0, "responseStart": 147.5,
+                       "responseEnd": -1})
+    c._on_response(FakeResponse(200, req, "http://x/api/pets"))
+    check("response 200 appends one network_log line", len(c.network_log) == 1)
+    line = c.network_log[0]
+    check("network_log line keeps status, ms, url",
+          line["status"] == 200 and abs(line["ms"] - 47.5) < 0.01
+          and line["method"] == "GET" and line["url"] == "http://x/api/pets",
+          str(line))
+
+    # timing unavailable -> ms None, still logged
+    c2 = Collectors()
+    c2._on_response(FakeResponse(201, FakeRequest("POST", "http://x/a"),
+                                 "http://x/a"))
+    check("response without timing logs ms None",
+          len(c2.network_log) == 1 and c2.network_log[0]["ms"] is None)
+
+    # Playwright reports -1 for timing phases that never happened
+    # (e.g. responseStart for a route-fulfilled mock) -> ms None, not garbage
+    c2b = Collectors()
+    c2b._on_response(FakeResponse(200,
+                                  FakeRequest("GET", "http://x/c",
+                                              {"requestStart": 2.9,
+                                               "responseStart": -1,
+                                               "responseEnd": -1}),
+                                  "http://x/c"))
+    check("negative timing yields ms None, not garbage",
+          len(c2b.network_log) == 1 and c2b.network_log[0]["ms"] is None)
+
+    # 2. requestfailed -> network_log line with status None + failure,
+    #    AND failed_requests still appended (regression check)
+    c3 = Collectors()
+    c3._on_requestfailed(FakeRequest("GET", "http://x/broken",
+                                     failure="net::ERR_CONNECTION_REFUSED"))
+    check("requestfailed keeps failed_requests entry",
+          len(c3.failed_requests) == 1
+          and c3.failed_requests[0]["failure"] is not None)
+    nl = c3.network_log[0]
+    check("requestfailed appends network_log status None + failure",
+          nl["status"] is None and nl["ms"] is None
+          and "ERR_CONNECTION_REFUSED" in (nl["failure"] or ""), str(nl))
+
+    # 3. 404 -> in network_log AND still in bad_responses
+    c4 = Collectors()
+    c4._on_response(FakeResponse(404,
+                                 FakeRequest("GET", "http://x/missing",
+                                             {"requestStart": 1.0, "responseEnd": 5.0}),
+                                 "http://x/missing"))
+    check("404 lands in network_log",
+          len(c4.network_log) == 1 and c4.network_log[0]["status"] == 404)
+    check("404 still in bad_responses",
+          len(c4.bad_responses) == 1 and c4.bad_responses[0]["status"] == 404)
+
+    # 4. URL >500 chars -> capped at 500 in the log line
+    c5 = Collectors()
+    long_url = "http://x/" + "a" * 600
+    c5._on_response(FakeResponse(200,
+                                 FakeRequest("GET", long_url,
+                                             {"requestStart": 0.0, "responseEnd": 1.0}),
+                                 long_url))
+    check("log url capped at 500 chars",
+          len(c5.network_log[0]["url"]) == 500)
+
+    # 5. write_report writes network.jsonl: 2 lines, parseable, in order
+    spec = load_spec("flows/game-loading-frames.yaml", strict_env=False)
+    with tempfile.TemporaryDirectory() as d:
+        result = RunResult(
+            flow_name="net-flow", target="http://x", status="passed",
+            started=1700000000.0, ended=1700000005.0,
+            steps=[StepResult(index=0, phase="main", name="S-01", op="goto",
+                              status="passed", duration_ms=100)],
+            failed_step=None, console_errors=[], page_errors=[],
+            failed_requests=[], bad_responses=[],
+            network_log=[
+                {"ts": 1.0, "method": "GET", "url": "http://x/a",
+                 "status": 200, "ms": 10.5},
+                {"ts": 2.0, "method": "GET", "url": "http://x/b",
+                 "status": None, "failure": "boom", "ms": None},
+            ],
+            run_dir=d)
+        paths = write_report(result, spec, d)
+        check("network_jsonl path returned",
+              paths.get("network_jsonl") == os.path.join(d, "network.jsonl"))
+        raw_lines = open(paths["network_jsonl"], encoding="utf-8").read().splitlines()
+        parsed = [json.loads(line) for line in raw_lines]
+        check("network.jsonl has exactly 2 parseable lines", len(raw_lines) == 2)
+        check("network.jsonl lines keep event order",
+              parsed[0]["url"] == "http://x/a" and parsed[1]["url"] == "http://x/b")
+        check("network_log round-trips through run.json",
+              json.load(open(os.path.join(d, "run.json")))
+              ["network_log"][1]["status"] is None)
+
+    # write failure of network.jsonl is tolerated: run still completes.
+    # (block the file itself with a directory so only the jsonl write fails)
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "network.jsonl"))
+        block = RunResult(
+            flow_name="net-flow", target="http://x", status="passed",
+            started=1700000000.0, ended=1700000005.0,
+            steps=[], failed_step=None, console_errors=[], page_errors=[],
+            failed_requests=[], bad_responses=[],
+            network_log=[{"ts": 1.0, "method": "GET", "url": "http://x/a",
+                          "status": 200, "ms": 1.0}],
+            run_dir=d)
+        paths = write_report(block, spec, d)
+        check("network.jsonl write failure never fails the run",
+              paths.get("network_jsonl") is None
+              and os.path.exists(os.path.join(d, "REPORT.md"))
+              and os.path.exists(os.path.join(d, "run.json")))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

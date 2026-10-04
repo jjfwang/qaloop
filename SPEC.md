@@ -213,6 +213,11 @@ Every `verify`/`worker` run writes into `runs/<id>/`:
 - `junit.xml` — JUnit XML for CI ingestion (one `<testsuite>` per flow,
   one `<testcase>` per step; failed steps carry a `<failure>` element with
   the step error text, skipped steps a `<skipped/>` element).
+- `network.jsonl` — one JSON line per observed network response, in event
+  order. Line schema: `{ts, method, url, status, ms}`; failed requests
+  (no response event) get `status: null, ms: null, failure: <reason>` instead.
+  `url` is capped at 500 chars; response bodies are never recorded
+  (privacy by default).
 
 Retention: `verify` and `worker` accept `--keep-runs N` (or the
 `QALOOP_KEEP_RUNS` env var; the flag wins when both are set). After the
