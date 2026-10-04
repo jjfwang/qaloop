@@ -25,8 +25,10 @@ Verdicts:
 Confidence is coupled to the verdict before anything is written: low
 confidence (or anything unparseable, which defaults to low) downgrades
 MAKES_SENSE to INSUFFICIENT_EVIDENCE, and high-confidence MAKES_SENSE needs
-at least 2 non-empty evidence bullets. The raw confidence is kept as
-confidence_raw in evaluation.json for audit.
+at least 2 grounded evidence bullets (each bullet is checked
+deterministically against the steps, diff files, and quoted judge
+context). The raw confidence is kept as confidence_raw in evaluation.json
+for audit.
 
 Before calibration, the verdict is derived from rubric scores: the judge
 scores four fixed dimensions (claim_diff_fit, evidence_exercises_claim,
@@ -256,26 +258,41 @@ def _calibrate_verdict(verdict: dict) -> dict:
     """Couple confidence to the verdict before it ships.
 
     A low-confidence MAKES_SENSE is not credible, and neither is a
-    high-confidence MAKES_SENSE that cites no evidence; both downgrade to
-    INSUFFICIENT_EVIDENCE with the rationale appended. DOES_NOT_MAKE_SENSE
-    keeps its verdict at any confidence (a contradiction is a contradiction)
-    — low confidence there is surfaced prominently in EVALUATION.md instead.
+    high-confidence MAKES_SENSE that cites no grounded evidence; both
+    downgrade to INSUFFICIENT_EVIDENCE with the rationale appended. The
+    high-confidence downgrade names the cited bullets that could not be
+    grounded. DOES_NOT_MAKE_SENSE keeps its verdict at any confidence (a
+    contradiction is a contradiction) — low confidence there is surfaced
+    prominently in EVALUATION.md instead.
     INSUFFICIENT_EVIDENCE and BLOCKED are never reclassified.
     """
     if verdict.get("verdict") != "MAKES_SENSE":
         return verdict
     conf = verdict.get("confidence", "low")
-    bullets = [e for e in verdict.get("evidence", [])
-               if isinstance(e, str) and e.strip()]
+    grounding = verdict.get("evidence_grounding")
+    if grounding is None:
+        # Direct calls that skipped _ground_evidence: fall back to the
+        # old non-empty-bullet count.
+        grounded = sum(1 for e in verdict.get("evidence", [])
+                       if isinstance(e, str) and e.strip())
+        ungrounded = []
+    else:
+        grounded = sum(1 for g in grounding if g.get("grounded"))
+        ungrounded = [g["bullet"] for g in grounding
+                      if not g.get("grounded")]
     reason = None
     if conf == "low":
         reason = (" Downgrade: the judge returned MAKES_SENSE with low"
                   " confidence, so the evidence does not credibly support"
                   " the claim.")
-    elif conf == "high" and len(bullets) < 2:
+    elif conf == "high" and grounded < 2:
         reason = (" Downgrade: the judge returned MAKES_SENSE with high"
-                  " confidence but cited fewer than 2 non-empty evidence"
+                  " confidence but cited fewer than 2 grounded evidence"
                   " bullets, so the confident verdict is not credible.")
+        if ungrounded:
+            reason += (" The following cited evidence could not be grounded"
+                       " to steps, diff files, or quoted context: "
+                       + "; ".join(ungrounded) + ".")
     if reason is not None:
         verdict["verdict"] = "INSUFFICIENT_EVIDENCE"
         verdict["rationale"] = (verdict.get("rationale") or "") + reason
@@ -346,6 +363,61 @@ def _apply_rubric(verdict: dict) -> dict:
     return out
 
 
+def _ground_evidence(verdict: dict, ev: dict, claim: str) -> dict:
+    """Deterministically ground each evidence bullet against the judge's
+    own evidence, recording verdict["evidence_grounding"].
+
+    A non-empty bullet is grounded when it demonstrably refers to the
+    evidence: (a) it names a step index or step name present in
+    ev["steps"], (b) it names a file:line-style path whose file appears in
+    the diff headers, or (c) it contains a quoted substring of at least 8
+    characters occurring verbatim in the judge context built by
+    _user_message (so quoting the claim or a log line counts). Empty or
+    non-string bullets are skipped, not recorded. The recorded list holds
+    {bullet, grounded, reason} per bullet.
+    """
+    diff_files = set(re.findall(r"^diff --git a/(.*?) b/",
+                                ev.get("diff") or "", re.M))
+    steps = ev.get("steps") or []
+    indexes = {str(s.get("index")) for s in steps
+               if s.get("index") is not None}
+    names = [str(s.get("name")) for s in steps if s.get("name")]
+    context = _user_message(claim, ev)
+    grounding = []
+    for bullet in verdict.get("evidence") or []:
+        if not isinstance(bullet, str) or not bullet.strip():
+            continue
+        grounded, reason = False, ("cites no step, diff file, or quoted"
+                                   " context")
+        hit = next((i for i in indexes
+                    if re.search(r"\b%s\b" % re.escape(i), bullet)), None)
+        if hit is not None:
+            grounded, reason = True, f"names step index {hit}"
+        else:
+            lowered = bullet.lower()
+            name = next((n for n in names if n.lower() in lowered), None)
+            if name is not None:
+                grounded, reason = True, f"names step {name!r}"
+            else:
+                m = re.search(r"([\w./\-]+\.[\w]+):\d+", bullet)
+                if m and m.group(1) in diff_files:
+                    grounded, reason = True, \
+                        f"file {m.group(1)} appears in the diff"
+                else:
+                    quotes = re.findall(r'"([^"]+)"', bullet) \
+                        + re.findall(r"'([^']+)'", bullet)
+                    quote = next((q for q in quotes
+                                  if len(q) >= 8 and q in context), None)
+                    if quote is not None:
+                        grounded, reason = True, \
+                            "quoted text occurs verbatim in judge context"
+        grounding.append({"bullet": bullet, "grounded": grounded,
+                          "reason": reason})
+    out = dict(verdict)
+    out["evidence_grounding"] = grounding
+    return out
+
+
 def evaluate(claim: str, run_dir: str, diff: str,
              model_cfg: dict | None = None) -> dict:
     """Run the semantic judge. Returns the verdict dict + cost info."""
@@ -361,6 +433,7 @@ def evaluate(claim: str, run_dir: str, diff: str,
     ])
     verdict = _extract_verdict(text)
     verdict = _apply_rubric(verdict)
+    verdict = _ground_evidence(verdict, ev, claim)
     verdict = _calibrate_verdict(verdict)
     tin = int(usage.get("prompt_tokens") or 0)
     tout = int(usage.get("completion_tokens") or 0)
@@ -400,7 +473,15 @@ def write_evaluation(run_dir: str, claim: str, verdict: dict) -> tuple[str, str]
     lines += ["## Rationale", "", verdict.get("rationale", ""), ""]
     if verdict.get("evidence"):
         lines += ["## Evidence", ""]
-        lines += [f"- {e}" for e in verdict["evidence"]] + [""]
+        grounding = {g.get("bullet"): bool(g.get("grounded"))
+                     for g in verdict.get("evidence_grounding") or []}
+        for e in verdict["evidence"]:
+            if isinstance(e, str) and e.strip() \
+                    and grounding.get(e) is False:
+                lines += [f"- {e} — [UNGROUNDED CITATION]"]
+            else:
+                lines += [f"- {e}"]
+        lines += [""]
     if verdict.get("risks"):
         lines += ["## Risks / missing coverage", ""]
         lines += [f"- {r}" for r in verdict["risks"]] + [""]

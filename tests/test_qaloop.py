@@ -1247,10 +1247,10 @@ def test_evaluate_confidence_normalization():
 def test_evaluate_low_confidence_downgrade():
     v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
                              "rationale": "looks right",
-                             "evidence": ["a.py:1 -> saves",
-                                          "step load -> shows"],
+                             "evidence": ['"the widget saves" persists',
+                                          '"the widget saves" renders'],
                              "risks": []})
-    check("high-confidence MAKES_SENSE with evidence stays",
+    check("high-confidence MAKES_SENSE with grounded evidence stays",
           v["verdict"] == "MAKES_SENSE", v["verdict"])
     tmp.cleanup()
     v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "low",
@@ -1265,12 +1265,15 @@ def test_evaluate_low_confidence_downgrade():
 
 
 def test_evaluate_high_confidence_evidence_rule():
+    grounded_pair = ['"the widget saves" persists',
+                     '"the widget saves" renders']
     cases = [
         ([], False),
         (["only one bullet"], False),
         (["", "  ", None], False),
-        (["a.py:1 -> saves", ""], False),
-        (["a.py:1 -> saves", "step load -> shows"], True),
+        (['"the widget saves" persists'], False),  # one grounded bullet
+        (["mystery.py:9 -> vibes", "totally unlinked"], False),  # ungrounded
+        (grounded_pair, True),
     ]
     for evidence, stays in cases:
         v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE",
@@ -1278,16 +1281,127 @@ def test_evaluate_high_confidence_evidence_rule():
                                  "rationale": "r", "evidence": evidence,
                                  "risks": []})
         want = "MAKES_SENSE" if stays else "INSUFFICIENT_EVIDENCE"
-        non_empty = sum(1 for e in evidence
-                        if isinstance(e, str) and e.strip())
-        check(f"high-confidence rule: {non_empty} non-empty bullets -> {want}",
+        check(f"high-confidence rule: {len(evidence)} bullets -> {want}",
               v["verdict"] == want, v["verdict"])
         if not stays:
             check(f"downgrade rationale mentions evidence "
-                  f"({non_empty} bullets)",
+                  f"({len(evidence)} bullets)",
                   "Downgrade" in v["rationale"]
                   and "evidence" in v["rationale"], v["rationale"])
         tmp.cleanup()
+    # ungrounded citations are named in the downgrade rationale
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "r",
+                             "evidence": ["mystery.py:9 -> vibes",
+                                          "totally unlinked"], "risks": []})
+    check("downgrade rationale names the ungrounded citations",
+          v["verdict"] == "INSUFFICIENT_EVIDENCE"
+          and "mystery.py:9 -> vibes" in v["rationale"]
+          and "totally unlinked" in v["rationale"], v["rationale"])
+    check("evidence_grounding recorded per bullet",
+          len(v["evidence_grounding"]) == 2
+          and all(g["grounded"] is False for g in v["evidence_grounding"]),
+          repr(v["evidence_grounding"]))
+    tmp.cleanup()
+
+
+def test_calibrate_verdict_without_grounding_falls_back():
+    # Direct _calibrate_verdict calls that skipped _ground_evidence keep the
+    # old non-empty-bullet count.
+    from qaloop.evaluate import _calibrate_verdict
+    v = _calibrate_verdict({"verdict": "MAKES_SENSE", "confidence": "high",
+                            "rationale": "r", "evidence": ["a", "b"]})
+    check("no evidence_grounding -> falls back to non-empty count",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    v = _calibrate_verdict({"verdict": "MAKES_SENSE", "confidence": "high",
+                            "rationale": "r", "evidence": ["only one"]})
+    check("fallback downgrades on <2 non-empty bullets",
+          v["verdict"] == "INSUFFICIENT_EVIDENCE", v["verdict"])
+
+
+def _grounding_evidence(steps=(), diff=""):
+    """Build an evidence dict shaped like collect_evidence() output."""
+    return {
+        "flow_name": "f", "target": "t", "status": "passed",
+        "failed_step": None, "error": "",
+        "steps": [{"index": i, "phase": "main", "name": name, "op": "goto",
+                   "status": "passed", "duration_ms": 1, "error": "",
+                   "assertions": [], "ax_snapshot": ""}
+                  for i, name in steps],
+        "console_errors": [], "page_errors": [], "failed_requests": [],
+        "bad_responses": [], "services": {}, "report": "",
+        "diff_stat": "x", "diff": diff,
+    }
+
+
+def test_ground_evidence_rule_a_step_index_or_name():
+    from qaloop.evaluate import _ground_evidence
+    ev = _grounding_evidence(steps=[(0, "load page"), (1, "fill form")])
+    out = _ground_evidence({"evidence": [
+        "STEP 0 [main] load page (goto): passed -> shows form",
+        "fill form accepted the typed name",
+        "STEP 7 did something never observed",
+    ]}, ev, "the widget saves")
+    got = {r["bullet"]: r for r in out["evidence_grounding"]}
+    check("rule (a): step index grounds",
+          got["STEP 0 [main] load page (goto): passed -> shows form"]
+          ["grounded"] is True, repr(got))
+    check("rule (a): step name grounds",
+          got["fill form accepted the typed name"]["grounded"] is True
+          and "step" in got["fill form accepted the typed name"]["reason"],
+          repr(got))
+    check("rule (a): unknown step index stays ungrounded",
+          got["STEP 7 did something never observed"]["grounded"] is False,
+          repr(got))
+
+
+def test_ground_evidence_rule_b_file_in_diff():
+    from qaloop.evaluate import _ground_evidence
+    ev = _grounding_evidence(
+        diff="diff --git a/qaloop/flow.py b/qaloop/flow.py\n+retry\n")
+    out = _ground_evidence({"evidence": [
+        "qaloop/flow.py:42 -> retries the click",
+        "other/util.py:9 -> changed the timeout",
+    ]}, ev, "the flow retries")
+    got = {r["bullet"]: r for r in out["evidence_grounding"]}
+    check("rule (b): file:line with file in diff grounds",
+          got["qaloop/flow.py:42 -> retries the click"]["grounded"] is True
+          and "diff" in got["qaloop/flow.py:42 -> retries the click"]
+          ["reason"], repr(got))
+    check("rule (b): file:line with file absent from diff ungrounded",
+          got["other/util.py:9 -> changed the timeout"]["grounded"] is False,
+          repr(got))
+
+
+def test_ground_evidence_rule_c_quoted_context():
+    from qaloop.evaluate import _ground_evidence
+    ev = _grounding_evidence()
+    out = _ground_evidence({"evidence": [
+        '"the widget saves" confirmed in the ax tree',
+        "'target=t' confirmed the flow ran against the right target",
+        '"short" is too short to qualify',
+        "no quotes here at all",
+    ]}, ev, "the widget saves")
+    got = {r["bullet"]: r for r in out["evidence_grounding"]}
+    check("rule (c): quoted claim text grounds",
+          got['"the widget saves" confirmed in the ax tree']
+          ["grounded"] is True, repr(got))
+    check("rule (c): quoted flow line grounds",
+          got["'target=t' confirmed the flow ran against the right target"]
+          ["grounded"] is True, repr(got))
+    check("rule (c): quoted substring under 8 chars does not qualify",
+          got['"short" is too short to qualify']["grounded"] is False,
+          repr(got))
+    check("rule (c): unquoted bullet ungrounded",
+          got["no quotes here at all"]["grounded"] is False, repr(got))
+
+
+def test_ground_evidence_skips_empty_bullets():
+    from qaloop.evaluate import _ground_evidence
+    out = _ground_evidence({"evidence": ["", "   ", None, 42]},
+                           _grounding_evidence(), "c")
+    check("empty and non-string bullets are skipped, not recorded",
+          out["evidence_grounding"] == [], repr(out["evidence_grounding"]))
 
 
 def test_evaluate_does_not_make_sense_low_confidence_stays():
@@ -1416,8 +1530,8 @@ def test_evaluate_rubric_end_to_end():
             "no_contradictions": 2, "state_supports_claim": 2}
     v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
                              "rationale": "solid",
-                             "evidence": ["a.py:1 -> saves",
-                                          "step load -> shows"],
+                             "evidence": ['"the widget saves" persists',
+                                          '"the widget saves" renders'],
                              "risks": [], "scores": all2})
     check("end-to-end: all-2s keeps MAKES_SENSE",
           v["verdict"] == "MAKES_SENSE", v["verdict"])
@@ -1433,6 +1547,11 @@ def test_evaluate_rubric_end_to_end():
           body["verdict"]["scores"] == all2
           and body["verdict"]["verdict_raw"] == "MAKES_SENSE",
           repr(body["verdict"].get("scores")))
+    check("evaluation.json carries per-bullet evidence_grounding",
+          len(body["verdict"]["evidence_grounding"]) == 2
+          and all(g["grounded"] for g in
+                  body["verdict"]["evidence_grounding"]),
+          repr(body["verdict"].get("evidence_grounding")))
     text = open(md).read()
     check("EVALUATION.md has dimension score table",
           "| claim_diff_fit | 2 |" in text
@@ -1445,12 +1564,50 @@ def test_evaluate_rubric_end_to_end():
     s["evidence_exercises_claim"] = 0
     v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
                              "rationale": "shallow",
-                             "evidence": ["a.py:1 -> saves",
-                                          "step load -> shows"],
+                             "evidence": ['"the widget saves" persists',
+                                          '"the widget saves" renders'],
                              "risks": [], "scores": s})
     check("end-to-end: 0 evidence_exercises_claim -> INSUFFICIENT_EVIDENCE",
           v["verdict"] == "INSUFFICIENT_EVIDENCE"
           and v["verdict_raw"] == "MAKES_SENSE", v["verdict"])
+    tmp.cleanup()
+
+
+def test_evaluate_grounded_bullets_keep_makes_sense():
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "solid",
+                             "evidence": ['"the widget saves" persists',
+                                          '"the widget saves" renders'],
+                             "risks": []})
+    check("2 grounded bullets keep high-confidence MAKES_SENSE",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    check("grounded bullets not marked in rationale",
+          "could not be grounded" not in v["rationale"], v["rationale"])
+    tmp.cleanup()
+
+
+def test_write_evaluation_marks_ungrounded_citations():
+    from qaloop import evaluate as ev
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "solid",
+                             "evidence": ['"the widget saves" persists',
+                                          "mystery.py:9 -> vibes"],
+                             "risks": []})
+    check("mixed grounding downgrades on <2 grounded bullets",
+          v["verdict"] == "INSUFFICIENT_EVIDENCE", v["verdict"])
+    md, js = ev.write_evaluation(tmp.name, "the widget saves", v)
+    text = open(md).read()
+    check("EVALUATION.md marks the ungrounded bullet",
+          "- mystery.py:9 -> vibes — [UNGROUNDED CITATION]" in text,
+          text[text.find("## Evidence"):text.find("## Evidence") + 200])
+    check("EVALUATION.md renders the grounded bullet unchanged",
+          '- "the widget saves" persists\n' in text, text[:300])
+    body = json.load(open(js))
+    ground = {g["bullet"]: g["grounded"]
+              for g in body["verdict"]["evidence_grounding"]}
+    check("evaluation.json carries per-bullet grounding",
+          ground == {'"the widget saves" persists': True,
+                     "mystery.py:9 -> vibes": False}, repr(ground))
     tmp.cleanup()
 
 
