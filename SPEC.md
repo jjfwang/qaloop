@@ -144,15 +144,16 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `url_contains` / `title_contains` | string |
 | `noop` | `true` — documents an intentionally dead control |
 | `console_clean` | `true` — no new console/page errors since the step started |
-| `js` | `{script, contains}` — evaluate JS, output must contain text |
+| `js` | `{script, contains}` — evaluate JS, polls until output contains text |
 | `screenshot_matches` | `{baseline, selector?, max_diff?}` — visual pinning (see below) |
 | `ax` | `{role, name?, state?}` — accessibility-contract assertion (see below) |
 
-`text_contains`, `text_matches`, `url_contains`, `title_contains`, and `count`
+`text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, and `count`
 all poll until the value matches or the step deadline expires, because
 async-rendered state races a one-shot read: element text is re-read via
 `text_content` (after `wait_for_selector` attaches), `page.url` /
-`page.title()` are re-read directly, and locator `count()` is re-read
+`page.title()` are re-read directly, `page.evaluate(script)` output is
+re-read directly, and locator `count()` is re-read
 against the comparator (`equals` > `gte` > `lte`), every 0.15s against
 `min(step.timeout_ms or 15000, 8000)`. On timeout the failure detail names the
 final observed value, not the desired value alone.

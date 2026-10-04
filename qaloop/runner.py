@@ -446,8 +446,13 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     e.get("text", "")[:120] for e in errs[:3])
                 out.append(AssertionResult(key, ok, detail))
             elif key == "js":
-                actual = str(page.evaluate(val["script"]))
-                ok = val["contains"] in actual
+                # Poll page.evaluate until the substring appears or the step
+                # deadline expires (issue #55); detail names the final
+                # observed output, not a re-read after the poll.
+                ok, actual = _poll_value_match(
+                    lambda: str(page.evaluate(val["script"])),
+                    lambda a: val["contains"] in a,
+                    time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want {val['contains']!r} in {actual[:160]!r}"))
             elif key == "screenshot_matches":
