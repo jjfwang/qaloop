@@ -260,6 +260,40 @@ console/network errors, service logs). It writes `EVALUATION.md` +
 Verdicts: `MAKES_SENSE`, `DOES_NOT_MAKE_SENSE`, `INSUFFICIENT_EVIDENCE`,
 `BLOCKED`.
 
+### Rubric scoring
+
+The judge also scores four fixed rubric dimensions, each `0` (fails) /
+`1` (partial or unclear) / `2` (solid):
+
+- `claim_diff_fit` — the diff plausibly implements the claim.
+- `evidence_exercises_claim` — the flow evidence actually exercises the
+  claimed behavior, rather than passing vacuously.
+- `no_contradictions` — nothing in the evidence contradicts the claim.
+- `state_supports_claim` — the final browser state, logs, and service
+  output support the claim.
+
+Scores are normalized defensively: each dimension must be an integer
+`0`–`2` (booleans excluded); missing, out-of-range, or wrongly-typed
+values default to `0`.
+
+The scores drive the final verdict via `_apply_rubric`, which runs before
+confidence calibration:
+
+- `0` in `claim_diff_fit` or `no_contradictions` → `DOES_NOT_MAKE_SENSE`.
+- `0` in `evidence_exercises_claim` or `state_supports_claim` →
+  `INSUFFICIENT_EVIDENCE`.
+- Otherwise every dimension scored `1`–`2`: a total of at least `6` of `8`
+  → `MAKES_SENSE`, anything less → `INSUFFICIENT_EVIDENCE`.
+
+Carve-outs: a raw `BLOCKED` verdict is kept as-is — the run produced no
+evidence to score. When the model supplies no scores object at all there
+is nothing to derive from, so the raw verdict stands (the all-zero
+normalized scores are still recorded for audit). The model's raw verdict
+is otherwise advisory: it is kept as `verdict_raw` in `evaluation.json`
+for audit (like `confidence_raw`, it is not rendered in `EVALUATION.md`),
+which also carries the `scores` object. `EVALUATION.md` renders the
+dimension scores as a table directly under the verdict header.
+
 ### Confidence calibration
 
 The judge also returns a `confidence` of `high` | `medium` | `low` with
