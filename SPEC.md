@@ -148,13 +148,14 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `screenshot_matches` | `{baseline, selector?, max_diff?}` — visual pinning (see below) |
 | `ax` | `{role, name?, state?}` — accessibility-contract assertion (see below) |
 
-`text_contains`, `text_matches`, `url_contains`, and `title_contains` all poll
-until the substring appears or the step deadline expires, because
+`text_contains`, `text_matches`, `url_contains`, `title_contains`, and `count`
+all poll until the value matches or the step deadline expires, because
 async-rendered state races a one-shot read: element text is re-read via
-`text_content` (after `wait_for_selector` attaches), and `page.url` /
-`page.title()` are re-read directly, every 0.15s against
+`text_content` (after `wait_for_selector` attaches), `page.url` /
+`page.title()` are re-read directly, and locator `count()` is re-read
+against the comparator (`equals` > `gte` > `lte`), every 0.15s against
 `min(step.timeout_ms or 15000, 8000)`. On timeout the failure detail names the
-final observed value, not the desired substring alone.
+final observed value, not the desired value alone.
 
 ### `screenshot_matches` — visual UX pinning
 
