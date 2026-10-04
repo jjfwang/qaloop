@@ -150,8 +150,9 @@ def write_junit_xml(result: RunResult, spec: FlowSpec, path: str) -> str:
         out.append(f'  <testcase name="{_xml_attr(s.name)}" '
                    f'classname="{_xml_attr(classname)}" time="{tc_time:.3f}">')
         if s.status == "failed":
-            err = _xml_text(s.error)
-            out.append(f'    <failure message="{err}">{err}</failure>')
+            err_attr = _xml_attr(s.error)
+            err_text = _xml_text(s.error)
+            out.append(f'    <failure message="{err_attr}">{err_text}</failure>')
         elif s.status == "skipped":
             out.append("    <skipped/>")
         out.append("  </testcase>")

@@ -401,7 +401,7 @@ def test_report_junit_xml():
     from qaloop.spec import load_spec
     from qaloop.report import write_junit_xml, write_report
     spec = load_spec("flows/game-loading-frames.yaml", strict_env=False)
-    raw_error = "assertion failed: 2 < 3 & 4 > 1"
+    raw_error = 'assertion failed: got "2", expected "3" — 2 < 3 & 4 > 1'
     steps = [
         StepResult(index=0, phase="main", name="S-01 ok", op="goto",
                    status="passed", duration_ms=100),
@@ -431,6 +431,8 @@ def test_report_junit_xml():
         check("failed testcase carries failure element", failure is not None)
         check("failure element text equals raw error",
               failure.text == raw_error)
+        check("failure message attribute round-trips quotes",
+              failure.get("message") == raw_error)
         check("special chars survive round-trip in name",
               failed_case.get("name") == 'S-02 <bad> & "quoted"')
         check("classname falls back to phase when op is None",
