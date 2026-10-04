@@ -76,7 +76,9 @@ alongside the feature. Conventions:
   the page actually saw. To assert on that traffic directly, use
   `expect: {network_calls: {url: "/api/x", equals: 1}}` — it counts log
   entries whose url contains the given substring (mock-served responses and
-  failed requests count too).
+  failed requests count too). Add a `status: {equals: 200}` (or `gte`/`lte`)
+  sub-filter to count only entries with that response status; a status
+  filter never matches failed requests (`status: null`).
 - Pin the pixels that matter: `screenshot_matches` baselines for key
   screens, `ax` assertions for the user's perceivable contract.
 - Flaky UI: `retry: N` on a `steps`-phase step re-runs it up to N more times

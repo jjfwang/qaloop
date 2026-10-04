@@ -291,6 +291,19 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     or not any(k in val for k in ("equals", "gte", "lte"))):
                 raise SpecError(
                     f"{where}: assertion network_calls needs {{url, equals|gte|lte}}")
+            if "status" in val:
+                st = val["status"]
+                if (not isinstance(st, dict) or len(st) != 1
+                        or not any(k in st for k in ("equals", "gte", "lte"))):
+                    raise SpecError(
+                        f"{where}: network_calls status must be "
+                        f"{{equals|gte|lte: int}}")
+                sv = next(iter(st.values()))
+                # bools are ints in Python; status: true is always a typo
+                if isinstance(sv, bool) or not isinstance(sv, int) or sv < 0:
+                    raise SpecError(
+                        f"{where}: network_calls status must be "
+                        f"a non-negative int, got {sv!r}")
         elif key == "count":
             if (not isinstance(val, dict) or "selector" not in val
                     or not any(k in val for k in ("equals", "gte", "lte"))):

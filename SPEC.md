@@ -140,7 +140,7 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `text_matches` | `{selector, pattern}` (regex) |
 | `count` | `{selector, equals: n}` / `{selector, gte: n}` / `{selector, lte: n}` |
 | `mock_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` — how often a mocked route was served (see `mock`) |
-| `network_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` — how many entries in `network.jsonl` whose url contains the given substring (see `network.jsonl`) |
+| `network_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` / `{url, status: {equals: 200}, equals: n}` — how many entries in `network.jsonl` whose url contains the given substring, optionally filtered by response `status` (`equals`/`gte`/`lte`; never matches `status: null` failed requests) (see `network.jsonl`) |
 | `url_contains` / `title_contains` | string |
 | `noop` | `true` — documents an intentionally dead control |
 | `console_clean` | `true` — no new console/page errors since the step started |
@@ -223,10 +223,13 @@ Every `verify`/`worker` run writes into `runs/<id>/`:
   `network_calls` (assertion) counts entries in this log whose `url` contains
   the given url substring — including mock-served responses, which appear in
   the log as observed responses, and failed requests (`status: null`), which
-  count as calls. No-entry urls evaluate as 0, so
+  count as calls unless a `status` filter is given. An optional `status`
+  sub-filter `{equals: 200}` / `{gte: 200}` / `{lte: 399}` narrows the count
+  to entries whose response status satisfies it; it never matches
+  `status: null` entries. No-entry urls evaluate as 0, so
   `network_calls: {url: "/demo/", equals: 0}` asserts the page made no
-  matching request. Matching is a plain substring test on the url; filtering
-  by status code or matching on request bodies is out of scope.
+  matching request. Matching is a plain substring test on the url; matching
+  on request bodies is out of scope.
 
 Retention: `verify` and `worker` accept `--keep-runs N` (or the
 `QALOOP_KEEP_RUNS` env var; the flag wins when both are set). After the
