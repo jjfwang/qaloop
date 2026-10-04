@@ -1195,6 +1195,117 @@ def test_evaluate_collect_and_write():
               json.load(open(js))["verdict"]["verdict"] == "MAKES_SENSE")
 
 
+def _stub_evaluate(verdict_dict):
+    """Run evaluate() with _chat stubbed to return verdict_dict. Browser-free.
+
+    Returns (verdict, tmp) where tmp is the TemporaryDirectory (caller cleans
+    it up). Passes an explicit model_cfg so no env vars are needed.
+    """
+    from qaloop import evaluate as ev
+    stub = lambda cfg, messages, timeout_s=90: (  # noqa: E731
+        json.dumps(verdict_dict),
+        {"prompt_tokens": 1, "completion_tokens": 2})
+    old = ev._chat
+    ev._chat = stub
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        cfg = {"base_url": "http://localhost", "name": "stub",
+               "api_key": "test", "price_in": 0.0, "price_out": 0.0}
+        return ev.evaluate("the widget saves", tmp.name, "", model_cfg=cfg), tmp
+    finally:
+        ev._chat = old
+
+
+def test_evaluate_confidence_normalization():
+    from qaloop import evaluate as ev
+    cases = [("HIGH", "high"), ("Medium", "medium"), ("low", "low"),
+             ("very high", "low"), ("", "low"), (None, "low"), (5, "low")]
+    for raw, want in cases:
+        v, tmp = _stub_evaluate({"verdict": "INSUFFICIENT_EVIDENCE",
+                                 "confidence": raw, "rationale": "r",
+                                 "evidence": [], "risks": []})
+        check(f"confidence normalized {raw!r} -> {want}",
+              v["confidence"] == want, repr(v["confidence"]))
+        check(f"confidence_raw preserved for {raw!r}",
+              v["confidence_raw"] == raw, repr(v["confidence_raw"]))
+        tmp.cleanup()
+    v, tmp = _stub_evaluate({"verdict": "INSUFFICIENT_EVIDENCE",
+                             "rationale": "r"})
+    check("missing confidence defaults to low",
+          v["confidence"] == "low" and v["confidence_raw"] is None,
+          repr((v["confidence"], v["confidence_raw"])))
+    with tempfile.TemporaryDirectory() as run_dir:
+        ev.write_evaluation(run_dir, "c", v)
+        body = json.load(open(os.path.join(run_dir, "evaluation.json")))
+        check("confidence + confidence_raw in evaluation.json",
+              body["verdict"]["confidence"] == "low"
+              and body["verdict"]["confidence_raw"] is None,
+              repr(body["verdict"].get("confidence")))
+    tmp.cleanup()
+
+
+def test_evaluate_low_confidence_downgrade():
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "looks right",
+                             "evidence": ["a.py:1 -> saves",
+                                          "step load -> shows"],
+                             "risks": []})
+    check("high-confidence MAKES_SENSE with evidence stays",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    tmp.cleanup()
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "low",
+                             "rationale": "seems fine",
+                             "evidence": ["a.py:1 -> saves"], "risks": []})
+    check("low-confidence MAKES_SENSE downgraded",
+          v["verdict"] == "INSUFFICIENT_EVIDENCE", v["verdict"])
+    check("downgrade rationale notes why the judge was unsure",
+          "Downgrade" in v["rationale"] and "low confidence" in v["rationale"],
+          v["rationale"])
+    tmp.cleanup()
+
+
+def test_evaluate_high_confidence_evidence_rule():
+    cases = [
+        ([], False),
+        (["only one bullet"], False),
+        (["", "  ", None], False),
+        (["a.py:1 -> saves", ""], False),
+        (["a.py:1 -> saves", "step load -> shows"], True),
+    ]
+    for evidence, stays in cases:
+        v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE",
+                                 "confidence": "high",
+                                 "rationale": "r", "evidence": evidence,
+                                 "risks": []})
+        want = "MAKES_SENSE" if stays else "INSUFFICIENT_EVIDENCE"
+        non_empty = sum(1 for e in evidence
+                        if isinstance(e, str) and e.strip())
+        check(f"high-confidence rule: {non_empty} non-empty bullets -> {want}",
+              v["verdict"] == want, v["verdict"])
+        if not stays:
+            check(f"downgrade rationale mentions evidence "
+                  f"({non_empty} bullets)",
+                  "Downgrade" in v["rationale"]
+                  and "evidence" in v["rationale"], v["rationale"])
+        tmp.cleanup()
+
+
+def test_evaluate_does_not_make_sense_low_confidence_stays():
+    from qaloop import evaluate as ev
+    v, tmp = _stub_evaluate({"verdict": "DOES_NOT_MAKE_SENSE",
+                             "confidence": "low",
+                             "rationale": "contradicts claim",
+                             "evidence": [], "risks": []})
+    check("DOES_NOT_MAKE_SENSE/low keeps verdict",
+          v["verdict"] == "DOES_NOT_MAKE_SENSE", v["verdict"])
+    md, _ = ev.write_evaluation(tmp.name, "claim", v)
+    text = open(md).read()
+    check("low-confidence contradiction flagged prominently",
+          "[!WARNING]" in text and "Low-confidence verdict" in text,
+          text[:160])
+    tmp.cleanup()
+
+
 def test_investigate_extract_json():
     from qaloop.investigate import _extract_json
     check("investigate: bare json parses",

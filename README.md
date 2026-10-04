@@ -167,6 +167,17 @@ Verdicts: `MAKES_SENSE` · `DOES_NOT_MAKE_SENSE` ·
 `INSUFFICIENT_EVIDENCE` · `BLOCKED`. Uses the same `QALOOP_MODEL_*`
 model config as `perform`/investigator.
 
+The judge also returns a confidence — `high`, `medium`, or `low` — and
+confidence is coupled to the verdict before anything is written: a
+low-confidence `MAKES_SENSE` is downgraded to `INSUFFICIENT_EVIDENCE`
+(anything unparseable defaults to `low`, and the raw value is kept as
+`confidence_raw` in `evaluation.json`); a high-confidence `MAKES_SENSE`
+with fewer than 2 cited evidence bullets is downgraded too — a confident
+verdict with no cited evidence is not credible. `DOES_NOT_MAKE_SENSE`
+keeps its verdict at any confidence (a contradiction is a contradiction),
+but low confidence is flagged prominently in `EVALUATION.md`. See SPEC.md
+for the full calibration rules.
+
 ## Perform mode: the agent takes over a browser
 
 `qaloop perform` is a natural-language browser agent for *doing work*, not

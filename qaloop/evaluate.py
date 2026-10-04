@@ -21,6 +21,12 @@ Verdicts:
     INSUFFICIENT_EVIDENCE — the run doesn't prove the claim either way
     BLOCKED              — the run never produced usable evidence
                            (flow failed, service failed to boot, etc.)
+
+Confidence is coupled to the verdict before anything is written: low
+confidence (or anything unparseable, which defaults to low) downgrades
+MAKES_SENSE to INSUFFICIENT_EVIDENCE, and high-confidence MAKES_SENSE needs
+at least 2 non-empty evidence bullets. The raw confidence is kept as
+confidence_raw in evaluation.json for audit.
 """
 from __future__ import annotations
 
@@ -204,6 +210,42 @@ def _user_message(claim: str, ev: dict) -> str:
     return "\n".join(parts)
 
 
+def _normalize_confidence(raw) -> str:
+    """Accept only high|medium|low (case-insensitive); anything else -> low."""
+    text = str(raw or "").strip().lower()
+    return text if text in ("high", "medium", "low") else "low"
+
+
+def _calibrate_verdict(verdict: dict) -> dict:
+    """Couple confidence to the verdict before it ships.
+
+    A low-confidence MAKES_SENSE is not credible, and neither is a
+    high-confidence MAKES_SENSE that cites no evidence; both downgrade to
+    INSUFFICIENT_EVIDENCE with the rationale appended. DOES_NOT_MAKE_SENSE
+    keeps its verdict at any confidence (a contradiction is a contradiction)
+    — low confidence there is surfaced prominently in EVALUATION.md instead.
+    INSUFFICIENT_EVIDENCE and BLOCKED are never reclassified.
+    """
+    if verdict.get("verdict") != "MAKES_SENSE":
+        return verdict
+    conf = verdict.get("confidence", "low")
+    bullets = [e for e in verdict.get("evidence", [])
+               if isinstance(e, str) and e.strip()]
+    reason = None
+    if conf == "low":
+        reason = (" Downgrade: the judge returned MAKES_SENSE with low"
+                  " confidence, so the evidence does not credibly support"
+                  " the claim.")
+    elif conf == "high" and len(bullets) < 2:
+        reason = (" Downgrade: the judge returned MAKES_SENSE with high"
+                  " confidence but cited fewer than 2 non-empty evidence"
+                  " bullets, so the confident verdict is not credible.")
+    if reason is not None:
+        verdict["verdict"] = "INSUFFICIENT_EVIDENCE"
+        verdict["rationale"] = (verdict.get("rationale") or "") + reason
+    return verdict
+
+
 def _extract_verdict(text: str) -> dict:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
@@ -213,7 +255,8 @@ def _extract_verdict(text: str) -> dict:
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r}")
     obj["verdict"] = verdict
-    obj.setdefault("confidence", "low")
+    obj["confidence_raw"] = obj.get("confidence")
+    obj["confidence"] = _normalize_confidence(obj.get("confidence"))
     obj.setdefault("rationale", "")
     obj.setdefault("evidence", [])
     obj.setdefault("risks", [])
@@ -234,6 +277,7 @@ def evaluate(claim: str, run_dir: str, diff: str,
         {"role": "user", "content": _user_message(claim, ev)},
     ])
     verdict = _extract_verdict(text)
+    verdict = _calibrate_verdict(verdict)
     tin = int(usage.get("prompt_tokens") or 0)
     tout = int(usage.get("completion_tokens") or 0)
     cost = tin / 1e6 * cfg["price_in"] + tout / 1e6 * cfg["price_out"]
@@ -257,8 +301,13 @@ def write_evaluation(run_dir: str, claim: str, verdict: dict) -> tuple[str, str]
     lines = ["# Semantic evaluation", "",
              f"**Claim:** {claim}", "",
              f"**Verdict:** `{verdict['verdict']}` "
-             f"(confidence: {verdict.get('confidence', '?')})", "",
-             "## Rationale", "", verdict.get("rationale", ""), ""]
+             f"(confidence: {verdict.get('confidence', '?')})", ""]
+    if (verdict.get("verdict") == "DOES_NOT_MAKE_SENSE"
+            and verdict.get("confidence") == "low"):
+        lines += ["> [!WARNING] **Low-confidence verdict:** the judge was"
+                  " unsure; treat this result as provisional and re-verify"
+                  " before acting on it.", ""]
+    lines += ["## Rationale", "", verdict.get("rationale", ""), ""]
     if verdict.get("evidence"):
         lines += ["## Evidence", ""]
         lines += [f"- {e}" for e in verdict["evidence"]] + [""]
