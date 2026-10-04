@@ -5,6 +5,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 
@@ -16,6 +17,37 @@ def new_run_dir(runs_root: str, flow_name: str) -> str:
     path = os.path.join(runs_root, f"{stamp}-{slug}-{rand}")
     os.makedirs(os.path.join(path, "steps"), exist_ok=True)
     return path
+
+
+def prune_old_runs(runs_root: str, keep: int,
+                   current_run_dir: str | None = None) -> list[str]:
+    """Prune old run dirs so at most `keep` newest remain. Returns deleted dir names.
+
+    keep <= 0 disables pruning (keep everything). `current_run_dir` is never
+    pruned (defensive: the run that just wrote its report must survive even
+    if its name sorts out of the newest window). Only real directories are
+    pruned; deletions are best-effort — one undeletable dir does not fail
+    the run.
+    """
+    if keep <= 0 or not os.path.isdir(runs_root):
+        return []
+    current_base = (os.path.basename(os.path.abspath(current_run_dir))
+                    if current_run_dir else None)
+    dirs = sorted(d for d in os.listdir(runs_root)
+                  if os.path.isdir(os.path.join(runs_root, d)))
+    # Run ids are YYYYMMDDTHHMMSSZ-prefixed, so name order is chronological;
+    # the keepers are the N newest. The current run is additionally protected.
+    keepers = set(dirs[-keep:])
+    deleted: list[str] = []
+    for name in dirs:
+        if name == current_base or name in keepers:
+            continue
+        try:
+            shutil.rmtree(os.path.join(runs_root, name))
+        except Exception:  # noqa: BLE001 — best effort, never fail the run
+            continue
+        deleted.append(name)
+    return deleted
 
 
 class Collectors:

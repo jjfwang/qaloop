@@ -51,6 +51,30 @@ def wait_for_http(url: str, timeout_s: float = 60, expect: int = 200) -> None:
     raise TimeoutError(f"{url} not ready after {timeout_s}s (last: {last})")
 
 
+def resolve_keep_runs(flag_value: int | None = None) -> int:
+    """Resolve run-artifact retention: --keep-runs flag wins over QALOOP_KEEP_RUNS.
+
+    Default 0 = keep everything (opt-in pruning). Negative values and
+    non-integer env values raise ValueError — the CLI turns that into
+    "ERROR ..." + exit 2, following the --max-cost-usd pattern.
+    """
+    if flag_value is not None:
+        keep = flag_value
+    else:
+        raw = os.environ.get("QALOOP_KEEP_RUNS")
+        if raw is None or raw == "":
+            return 0
+        try:
+            keep = int(raw)
+        except ValueError:
+            raise ValueError(
+                f"QALOOP_KEEP_RUNS must be an integer, got {raw!r}") from None
+    if keep < 0:
+        raise ValueError("--keep-runs / QALOOP_KEEP_RUNS cannot be negative "
+                         f"(got {keep})")
+    return keep
+
+
 @dataclass
 class ProcTarget:
     """A booted target: static server or long-running command."""
