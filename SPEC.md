@@ -159,6 +159,20 @@ python3 -m qaloop.cli baselines flows/my-flow.yaml
 A missing baseline fails the assertion with a pointer to this command;
 `qaloop verify` never writes baselines.
 
+### Diff artifacts on mismatch
+
+A failing `screenshot_matches` comparison (baseline exists, RMS diff above
+`max_diff`) additionally writes a diff-highlight image next to the actual
+screenshot: `steps/assert-<phase>-<idx>-diff.png` in the run dir. It is the
+actual screenshot with every drifted pixel highlighted red, so you can see
+at a glance what changed. The assertion detail names the artifact, e.g.
+`rms_diff=0.0410 max_diff=0.0200 diff=steps/assert-steps-02-diff.png`.
+
+The artifact is written only on mismatch: green runs produce no diff files,
+and baseline-update mode never writes one (it saves the baseline instead).
+If the diff image cannot be written, the run continues and the detail says
+so — a diff-write failure never fails the run by itself.
+
 ### `ax` — user-centric accessibility assertions
 
 Asserts against the accessibility tree via Playwright role locators, i.e.

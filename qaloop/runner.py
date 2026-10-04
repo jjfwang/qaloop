@@ -353,7 +353,7 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 out.append(AssertionResult(key, ok,
                                            f"want {val['contains']!r} in {actual[:160]!r}"))
             elif key == "screenshot_matches":
-                from .artifacts import screenshot_rms_diff
+                from .artifacts import screenshot_rms_diff, write_diff_image
                 baseline = val["baseline"]
                 if not os.path.isabs(baseline):
                     baseline = os.path.join(baseline_dir, baseline)
@@ -382,9 +382,18 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 else:
                     diff = screenshot_rms_diff(shot, baseline)
                     ok = diff <= max_diff
-                    out.append(AssertionResult(
-                        key, ok,
-                        f"rms_diff={diff:.4f} max_diff={max_diff}"))
+                    detail = f"rms_diff={diff:.4f} max_diff={max_diff}"
+                    if not ok:
+                        diff_name = (f"assert-{step.phase}-{step.index:02d}"
+                                     f"-diff.png")
+                        diff_path = os.path.join(run_dir, "steps", diff_name)
+                        try:
+                            write_diff_image(shot, baseline, diff_path)
+                            detail += f" diff=steps/{diff_name}"
+                        except Exception as e:  # noqa: BLE001 — never fail the run
+                            detail += (" (diff image unavailable: "
+                                       f"{type(e).__name__})")
+                    out.append(AssertionResult(key, ok, detail))
             elif key == "ax":
                 role, name = val["role"], val.get("name")
                 state = val.get("state", "visible")

@@ -202,6 +202,32 @@ def screenshot_rms_diff(a_path: str, b_path: str) -> float:
     return math.sqrt(sq / n) / 255.0 if n else 0.0
 
 
+def write_diff_image(a_path: str, b_path: str, out_path: str) -> str:
+    """Write a readable diff-highlight PNG: a copy of `a` with every pixel
+    that differs from `b` repainted red.
+
+    Uses the same normalized comparison pipeline as screenshot_rms_diff
+    (RGB convert, ImageChops.difference). Deliberate contract difference:
+    screenshot_rms_diff silently resizes `b` on size mismatch, but a readable
+    highlight cannot be built from unequal frames, so this raises a clean
+    ValueError instead. Output has the same dimensions as the inputs.
+    Returns out_path.
+    """
+    from PIL import Image, ImageChops
+    a = Image.open(a_path).convert("RGB")
+    b = Image.open(b_path).convert("RGB")
+    if a.size != b.size:
+        raise ValueError(
+            f"cannot highlight a diff between unequal frames: {a.size} != {b.size}")
+    diff = ImageChops.difference(a, b)
+    mask = diff.convert("L").point(lambda v: 255 if v else 0)
+    red = Image.new("RGB", a.size, (255, 0, 0))
+    out = Image.composite(red, a, mask)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    out.save(out_path)
+    return out_path
+
+
 @dataclass
 class StepArtifacts:
     screenshot: str | None = None

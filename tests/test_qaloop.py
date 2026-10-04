@@ -1757,6 +1757,117 @@ def test_keep_runs_cli_plumbing():
           p.parse_args(["verify", "flows/x.yaml", "--keep-runs", "-1"]).keep_runs == -1)
 
 
+def test_write_diff_image():
+    """Diff-highlight image: readable PNG of the actual with drifted pixels
+    painted red; identical inputs produce no highlights; size mismatch raises."""
+    from qaloop.artifacts import write_diff_image
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.png")
+        b = os.path.join(d, "b.png")
+        out = os.path.join(d, "sub", "diff.png")  # missing dir: created
+        Image.new("RGB", (12, 10), (30, 60, 90)).save(a)
+        # (a) identical images -> output equals the actual, no red pixels
+        Image.open(a).save(b)
+        write_diff_image(a, b, out)
+        got = Image.open(out)
+        check("identical diff output matches input",
+              got.size == (12, 10)
+              and list(got.getdata()) == list(Image.open(a).getdata()),
+              str(got.size))
+        check("identical diff output has no red pixels",
+              all(px != (255, 0, 0) for px in got.getdata()))
+        # (b) drifted pixel -> marked red exactly at the drifted location
+        drifted = Image.open(a)
+        drifted.putpixel((3, 4), (7, 13, 200))
+        drifted.save(b)
+        write_diff_image(a, b, out)
+        got = Image.open(out)
+        actual = Image.open(a)
+        check("drifted pixel is painted red", got.getpixel((3, 4)) == (255, 0, 0),
+              str(got.getpixel((3, 4))))
+        check("highlight covers exactly the drifted locations",
+              all(got.getpixel((x, y)) == actual.getpixel((x, y))
+                  for y in range(10) for x in range(12)
+                  if (x, y) != (3, 4)))
+        # (c) size mismatch -> clean ValueError, not a silent resize
+        small = os.path.join(d, "small.png")
+        Image.new("RGB", (5, 5), (0, 0, 0)).save(small)
+        try:
+            write_diff_image(a, small, out)
+            check("size mismatch raises ValueError", False, "no error")
+        except ValueError:
+            check("size mismatch raises ValueError", True)
+
+
+def test_screenshot_matches_diff_artifact():
+    """Mismatch writes assert-<phase>-<idx>-diff.png and names it in the
+    assertion detail; green runs write no diff file; a diff-write failure
+    degrades to an extended detail instead of crashing."""
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+    from PIL import Image
+    import qaloop.artifacts as art
+
+    def make_step():
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[("screenshot_matches",
+                                             {"baseline": "base.png",
+                                              "max_diff": 0.0})],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+
+    class FakePage:
+        def __init__(self, png):
+            self.png = png
+
+        def screenshot(self, path):
+            Image.open(self.png).save(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        base_dir, run_dir = os.path.join(d, "base"), os.path.join(d, "run")
+        os.makedirs(base_dir)
+        shot_png = os.path.join(d, "shot.png")
+        Image.new("RGB", (8, 8), (200, 10, 10)).save(shot_png)
+        Image.new("RGB", (8, 8), (10, 200, 10)).save(
+            os.path.join(base_dir, "base.png"))
+        diff_rel = "steps/assert-steps-00-diff.png"
+        # Case 1: mismatch -> diff artifact written and named in detail
+        res = _check_assertions(FakePage(shot_png), make_step(), None,
+                                baseline_dir=base_dir, run_dir=run_dir)
+        check("mismatch still fails", not res[0].passed, res[0].detail)
+        check("mismatch names diff artifact in detail",
+              f"diff={diff_rel}" in res[0].detail, res[0].detail)
+        diff_abs = os.path.join(run_dir, diff_rel)
+        check("mismatch writes readable diff PNG",
+              os.path.isfile(diff_abs)
+              and Image.open(diff_abs).size == (8, 8),
+              str(os.path.exists(diff_abs)))
+        # Case 2: green run -> no diff file
+        green_png = os.path.join(d, "green.png")
+        Image.open(os.path.join(base_dir, "base.png")).save(green_png)
+        res = _check_assertions(FakePage(green_png), make_step(), None,
+                                baseline_dir=base_dir, run_dir=run_dir)
+        check("green assertion passes", res[0].passed, res[0].detail)
+        os.remove(diff_abs)  # isolate the green case from case 1's artifact
+        diffs = [f for f in os.listdir(os.path.join(run_dir, "steps"))
+                 if f.endswith("-diff.png")]
+        check("green run writes no diff artifact", diffs == [], str(diffs))
+        # Case 3: diff write fails -> extended detail, run survives
+        def boom(*args):
+            raise OSError("disk full")
+        real = art.write_diff_image
+        art.write_diff_image = boom
+        try:
+            res = _check_assertions(FakePage(shot_png), make_step(), None,
+                                    baseline_dir=base_dir, run_dir=run_dir)
+        finally:
+            art.write_diff_image = real
+        check("diff-write failure degrades to extended detail",
+              not res[0].passed
+              and "diff image unavailable: OSError" in res[0].detail,
+              res[0].detail)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
