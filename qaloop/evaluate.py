@@ -36,6 +36,12 @@ no_contradictions, state_supports_claim) 0/1/2, and _apply_rubric turns the
 scores into the verdict via fatal rules and a sum threshold — the model's
 raw verdict is advisory (except BLOCKED, which is kept as-is). The raw
 verdict is kept as verdict_raw in evaluation.json for audit.
+
+After evidence grounding and before calibration, a critic pass makes a
+second model call that tries to break the primary verdict; a grounded
+objection (naming a real step, diff file:line, or quoted context) downgrades
+high confidence to medium and is recorded as critic_objection, but the
+verdict and scores are never reclassified by the critic.
 """
 from __future__ import annotations
 
@@ -248,6 +254,102 @@ def _user_message(claim: str, ev: dict) -> str:
     return "\n".join(parts)
 
 
+_CRITIC_SYSTEM = """You are a hostile critic reviewing a semantic QA judge's
+verdict. Another judge examined a code diff and browser-flow evidence for a
+claimed behavior and returned a verdict with confidence. Your job is to
+stress-test it: find the strongest reason the verdict could be wrong.
+
+You are shown the same evidence the judge saw, plus the judge's verdict,
+rubric scores, rationale, and which evidence bullets were grounded.
+
+Rules:
+- Attack the verdict, not the claim. Point at concrete evidence: a step the
+  judge ignored or misread, a diff file it misunderstood, a quoted log line
+  or accessibility-tree fragment that contradicts the rationale, a rubric
+  dimension scored too generously.
+- Ground your objection: name the step index or step name, the file:line
+  from the diff, or quote a substring of at least 8 characters exactly as
+  it appears in the evidence.
+- If, and only if, you cannot find a concrete, evidence-backed reason the
+  verdict is wrong, the objection is NONE.
+
+Respond with a single JSON object, no prose outside it:
+{
+  "objection": "NONE" | "one paragraph: the strongest reason the verdict
+could be wrong"
+}"""
+
+
+def _critic_user_message(claim: str, ev: dict, verdict: dict) -> str:
+    """Build the critic's prompt: the judge's full context plus the
+    primary verdict under review."""
+    grounding = verdict.get("evidence_grounding") or []
+    summary = "; ".join(
+        ("grounded" if g.get("grounded") else "ungrounded")
+        + f": {g.get('bullet')}" for g in grounding)
+    return (_user_message(claim, ev)
+            + "\n\nJUDGE VERDICT UNDER REVIEW:\n"
+            + f"verdict={verdict.get('verdict')} "
+            + f"confidence={verdict.get('confidence')} "
+            + f"scores={json.dumps(verdict.get('scores'))}\n"
+            + f"rationale: {verdict.get('rationale')}\n"
+            + f"evidence grounding: {summary or 'no evidence bullets'}")
+
+
+def _parse_critic(text: str) -> str | None:
+    """Extract the critic's objection; None when the verdict stands.
+
+    Returns None for a NONE objection (bare or inside the JSON envelope)
+    and for anything unparseable — an unreadable critic does not move the
+    verdict.
+    """
+    text = (text or "").strip()
+    if text.upper() == "NONE":
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1:
+        try:
+            obj = json.loads(text[start:end + 1])
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            val = obj.get("objection")
+            if isinstance(val, str) and val.strip() \
+                    and val.strip().upper() != "NONE":
+                return val.strip()
+    return None
+
+
+def _ground_citation(bullet: str, indexes: set, names: list, diff_files: set,
+                     context: str) -> tuple[bool, str]:
+    """Ground one citation against the judge's evidence. Returns
+    (grounded, reason).
+
+    A citation is grounded when it: (a) names a step index or step name
+    present in the collected steps, (b) names a file:line-style path whose
+    file appears in the diff headers, or (c) contains a quoted substring of
+    at least 8 characters occurring verbatim in the judge context.
+    """
+    hit = next((i for i in indexes
+                if re.search(r"\b%s\b" % re.escape(i), bullet)), None)
+    if hit is not None:
+        return True, f"names step index {hit}"
+    lowered = bullet.lower()
+    name = next((n for n in names if n.lower() in lowered), None)
+    if name is not None:
+        return True, f"names step {name!r}"
+    m = re.search(r"([\w./\-]+\.[\w]+):\d+", bullet)
+    if m and m.group(1) in diff_files:
+        return True, f"file {m.group(1)} appears in the diff"
+    quotes = re.findall(r'"([^"]+)"', bullet) \
+        + re.findall(r"'([^']+)'", bullet)
+    quote = next((q for q in quotes
+                  if len(q) >= 8 and q in context), None)
+    if quote is not None:
+        return True, "quoted text occurs verbatim in judge context"
+    return False, "cites no step, diff file, or quoted context"
+
+
 def _normalize_confidence(raw) -> str:
     """Accept only high|medium|low (case-insensitive); anything else -> low."""
     text = str(raw or "").strip().lower()
@@ -387,34 +489,52 @@ def _ground_evidence(verdict: dict, ev: dict, claim: str) -> dict:
     for bullet in verdict.get("evidence") or []:
         if not isinstance(bullet, str) or not bullet.strip():
             continue
-        grounded, reason = False, ("cites no step, diff file, or quoted"
-                                   " context")
-        hit = next((i for i in indexes
-                    if re.search(r"\b%s\b" % re.escape(i), bullet)), None)
-        if hit is not None:
-            grounded, reason = True, f"names step index {hit}"
-        else:
-            lowered = bullet.lower()
-            name = next((n for n in names if n.lower() in lowered), None)
-            if name is not None:
-                grounded, reason = True, f"names step {name!r}"
-            else:
-                m = re.search(r"([\w./\-]+\.[\w]+):\d+", bullet)
-                if m and m.group(1) in diff_files:
-                    grounded, reason = True, \
-                        f"file {m.group(1)} appears in the diff"
-                else:
-                    quotes = re.findall(r'"([^"]+)"', bullet) \
-                        + re.findall(r"'([^']+)'", bullet)
-                    quote = next((q for q in quotes
-                                  if len(q) >= 8 and q in context), None)
-                    if quote is not None:
-                        grounded, reason = True, \
-                            "quoted text occurs verbatim in judge context"
+        grounded, reason = _ground_citation(bullet, indexes, names,
+                                            diff_files, context)
         grounding.append({"bullet": bullet, "grounded": grounded,
                           "reason": reason})
     out = dict(verdict)
     out["evidence_grounding"] = grounding
+    return out
+
+
+def _critic_coupling(verdict: dict, ev: dict, claim: str,
+                     critic_text: str) -> dict:
+    """Deterministically fold the critic's objection into the verdict.
+
+    Runs after _ground_evidence and before _calibrate_verdict. The
+    objection is parsed from the critic output (NONE vs an objection);
+    only a grounded objection — one naming a real step index/name, a
+    file:line whose file appears in the diff headers, or a >=8-char
+    quoted substring occurring verbatim in the judge context — moves the
+    verdict. On a grounded objection: confidence drops one level
+    (high->medium only), the objection is appended to the rationale and
+    recorded as critic_objection. The verdict is NEVER reclassified here
+    and scores are NEVER touched. Ungrounded objections, NONE, and
+    unparseable critic output leave the verdict untouched (critic_objection
+    recorded as None in every path).
+    """
+    objection = _parse_critic(critic_text)
+    grounded = False
+    if objection:
+        diff_files = set(re.findall(r"^diff --git a/(.*?) b/",
+                                    ev.get("diff") or "", re.M))
+        steps = ev.get("steps") or []
+        indexes = {str(s.get("index")) for s in steps
+                   if s.get("index") is not None}
+        names = [str(s.get("name")) for s in steps if s.get("name")]
+        context = _user_message(claim, ev)
+        grounded, _reason = _ground_citation(objection, indexes, names,
+                                             diff_files, context)
+    out = dict(verdict)
+    if not objection or not grounded:
+        out["critic_objection"] = None
+        return out
+    if out.get("confidence") == "high":
+        out["confidence"] = "medium"
+    out["rationale"] = (out.get("rationale") or "") + (
+        " Critic objection (verdict kept): " + objection)
+    out["critic_objection"] = objection
     return out
 
 
@@ -434,9 +554,21 @@ def evaluate(claim: str, run_dir: str, diff: str,
     verdict = _extract_verdict(text)
     verdict = _apply_rubric(verdict)
     verdict = _ground_evidence(verdict, ev, claim)
+    # Critic pass: a second model call stress-tests the primary verdict.
+    # It never reclassifies; it only downgrades high->medium confidence on
+    # a grounded objection. _calibrate_verdict runs after and only
+    # downgrades low-confidence (or ungrounded-high) MAKES_SENSE, so a
+    # medium confidence from the critic cannot trigger INSUFFICIENT_EVIDENCE.
+    critic_text, critic_usage = _chat(cfg, [
+        {"role": "system", "content": _CRITIC_SYSTEM},
+        {"role": "user", "content": _critic_user_message(claim, ev, verdict)},
+    ])
+    verdict = _critic_coupling(verdict, ev, claim, critic_text)
     verdict = _calibrate_verdict(verdict)
-    tin = int(usage.get("prompt_tokens") or 0)
-    tout = int(usage.get("completion_tokens") or 0)
+    tin = int(usage.get("prompt_tokens") or 0) \
+        + int(critic_usage.get("prompt_tokens") or 0)
+    tout = int(usage.get("completion_tokens") or 0) \
+        + int(critic_usage.get("completion_tokens") or 0)
     cost = tin / 1e6 * cfg["price_in"] + tout / 1e6 * cfg["price_out"]
     verdict["_cost"] = {"tokens_in": tin, "tokens_out": tout,
                        "cost_usd_est": round(cost, 6),
@@ -485,6 +617,18 @@ def write_evaluation(run_dir: str, claim: str, verdict: dict) -> tuple[str, str]
     if verdict.get("risks"):
         lines += ["## Risks / missing coverage", ""]
         lines += [f"- {r}" for r in verdict["risks"]] + [""]
+    critic = verdict.get("critic_objection")
+    lines += ["## Critic", "",
+              "A second model call stress-tested the verdict.",
+              "", ]
+    if critic:
+        lines += ["A grounded objection was raised: confidence was"
+                  f" downgraded to {verdict.get('confidence')} (the verdict"
+                  " and rubric scores were left unchanged).", "",
+                  f"- Objection: {critic}", ""]
+    else:
+        lines += ["No grounded objection — the verdict stands as the judge"
+                  " returned it.", ""]
     if cost:
         lines += [f"_Model: {cost.get('model')}, "
                   f"tokens {cost.get('tokens_in')}/{cost.get('tokens_out')}, "

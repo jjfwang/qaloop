@@ -339,3 +339,43 @@ stored as `evidence_grounding` — a list of
 `{bullet, grounded, reason}` — in `evaluation.json`, and ungrounded
 bullets are marked in `EVALUATION.md` as
 `- <bullet> — [UNGROUNDED CITATION]` (grounded bullets render unchanged).
+
+### Critic pass
+
+After evidence grounding and before calibration, the pipeline makes a
+second model call that tries to break the primary verdict. The critic
+sees the same judge context built by `_user_message`, plus the verdict
+under review — verdict, confidence, rubric scores, rationale, and a
+per-bullet grounding summary — assembled by `_critic_user_message`.
+
+Critic prompt contract: given the evidence and the judge's verdict,
+return the strongest evidence-backed reason the verdict could be wrong,
+or `NONE`. The response is a single JSON object,
+`{"objection": "NONE" | "<one paragraph: the strongest reason the verdict could be wrong>"}`.
+Bare `NONE` and unparseable output both mean "no objection"; an
+unreadable critic never moves the verdict.
+
+Deterministic coupling rule (`_critic_coupling`, no model discretion):
+the objection is parsed by `_parse_critic` and grounded with the same
+three rules as evidence-citation grounding — it must (a) name a real
+step index or step name from the collected steps, (b) name a `file:line`
+whose file appears in the diff headers (`diff --git a/<f> b/<f>`), or
+(c) contain a quoted substring of at least 8 characters occurring
+verbatim in the judge context. Only a *grounded* objection moves the
+verdict:
+
+- confidence downgrades one level (`high` -> `medium` only);
+- the objection is appended to the rationale;
+- it is recorded as `critic_objection` in `evaluation.json` and rendered
+  in `EVALUATION.md`'s "Critic" section (which always renders — either
+  the objection or "No grounded objection").
+
+The verdict is never reclassified and the rubric scores are never
+touched. A grounded objection on a non-`high` confidence verdict is
+recorded and appended but does not move confidence. Calibration runs
+after the critic; it only downgrades low-confidence (or
+ungrounded-high-confidence) `MAKES_SENSE`, so a `medium` confidence
+produced by the critic cannot trigger `INSUFFICIENT_EVIDENCE`.
+
+Cost: the critic call's tokens are summed into the existing `_cost`
+dict — `tokens_in`/`tokens_out` cover both calls.
