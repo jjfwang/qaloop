@@ -286,21 +286,33 @@ def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
         raise ValueError(f"unknown op {op}")
 
 
-def _poll_text_match(page, sel, match, deadline_s):
-    """Re-read text_content until match(actual) succeeds or the deadline passes.
+def _poll_value_match(read, match, deadline_s):
+    """Re-read a page value until match(actual) succeeds or the deadline passes.
 
-    Async-rendered text races the old one-shot read, so assertions poll here.
-    match(actual) may raise re.error for a bad pattern; that propagates to the
-    caller exactly as the one-shot read did.
+    Async-rendered state races the old one-shot read, so assertions poll here.
+    read() is called again on every iteration; match(actual) may raise re.error
+    for a bad pattern, which propagates to the caller exactly as the one-shot
+    read did. Returns (ok, final_actual) so callers can name the last observed
+    value in failure detail without re-reading after the deadline.
     """
     actual = ""
     while True:
-        actual = page.text_content(sel) or ""
+        actual = read()
         if match(actual):
             return True, actual
         if time.monotonic() >= deadline_s:
             return False, actual
         time.sleep(0.15)
+
+
+def _poll_text_match(page, sel, match, deadline_s):
+    """Re-read text_content until match(actual) succeeds or the deadline passes.
+
+    Thin wrapper over _poll_value_match, kept so the text-assertion call sites
+    and their behavior are unchanged.
+    """
+    return _poll_value_match(lambda: page.text_content(sel) or "",
+                             match, deadline_s)
 
 
 def _status_cmp(entry_status: int, filt: dict) -> bool:
@@ -400,12 +412,21 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     ok, detail = n <= val["lte"], f"network_calls={n} want <={val['lte']}{status_desc}"
                 out.append(AssertionResult(key, ok, f"{url}: {detail}"))
             elif key == "url_contains":
-                ok = val in page.url
-                out.append(AssertionResult(key, ok, f"url={page.url[:160]!r}"))
+                # Poll page.url until the substring appears or the step
+                # deadline expires (issue #51); detail names the final
+                # observed URL, not a re-read after the poll.
+                ok, actual = _poll_value_match(lambda: page.url,
+                                               lambda a: val in a,
+                                               time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok, f"url={actual[:160]!r}"))
             elif key == "title_contains":
-                title = page.title()
-                ok = val in title
-                out.append(AssertionResult(key, ok, f"title={title[:120]!r}"))
+                # Poll page.title() until the substring appears or the step
+                # deadline expires (issue #51); detail names the final
+                # observed title, not a re-read after the poll.
+                ok, actual = _poll_value_match(page.title,
+                                               lambda a: val in a,
+                                               time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok, f"title={actual[:120]!r}"))
             elif key == "noop":
                 out.append(AssertionResult(key, True, "intentional no-op"))
             elif key == "console_clean":
