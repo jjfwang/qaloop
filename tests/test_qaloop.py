@@ -3058,6 +3058,201 @@ def test_js_assertion_polling():
           f"calls={page.evaluate_calls}")
 
 
+def _stub_evaluate_critic(judge_dict, critic_text, steps=(), diff=""):
+    """Run evaluate() with _chat dispatching on the system prompt: the
+    judge (qaloop.evaluate._SYSTEM) vs the critic (_CRITIC_SYSTEM).
+
+    Builds a run.json with the given step names so grounding can find
+    real steps. Returns (verdict, tmp); the caller cleans up tmp.
+    """
+    from qaloop import evaluate as ev
+
+    def stub(cfg, messages, timeout_s=90):
+        system = (messages[0].get("content") if messages else "") or ""
+        if system is ev._CRITIC_SYSTEM:
+            return critic_text, {"prompt_tokens": 10,
+                                 "completion_tokens": 20}
+        return (json.dumps(judge_dict),
+                {"prompt_tokens": 1, "completion_tokens": 2})
+    old = ev._chat
+    ev._chat = stub
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        if steps:
+            run = {"flow_name": "demo", "target": "http://x/",
+                   "status": "PASS", "failed_step": None, "error": "",
+                   "steps": [{"index": i, "phase": "main", "name": name,
+                              "op": "goto", "status": "PASS",
+                              "duration_ms": 1, "error": "", "assertions": [],
+                              "ax_snapshot": ""}
+                             for i, name in enumerate(steps)],
+                   "console_errors": [], "page_errors": [],
+                   "failed_requests": [], "bad_responses": []}
+            with open(os.path.join(tmp.name, "run.json"), "w") as f:
+                json.dump(run, f)
+        cfg = {"base_url": "http://localhost", "name": "stub",
+               "api_key": "test", "price_in": 0.0, "price_out": 0.0}
+        return ev.evaluate("the widget saves", tmp.name, diff,
+                           model_cfg=cfg), tmp
+    finally:
+        ev._chat = old
+
+
+_JUDGE_SOLID = {"verdict": "MAKES_SENSE", "confidence": "high",
+                "rationale": "solid",
+                "evidence": ['"the widget saves" persists',
+                             '"the widget saves" renders'],
+                "risks": [],
+                "scores": {"claim_diff_fit": 2, "evidence_exercises_claim": 2,
+                           "no_contradictions": 2, "state_supports_claim": 2}}
+
+
+def test_critic_grounded_objection_downgrades_end_to_end():
+    # Scripted proof: stubbed judge + stubbed critic. The critic names a
+    # real step (index 0), so the objection is grounded.
+    from qaloop import evaluate as ev
+    objection = ("STEP 0 load page was cited, but the flow never reached"
+                 " the save screen, so the claim is untested.")
+    v, tmp = _stub_evaluate_critic(_JUDGE_SOLID,
+                                   json.dumps({"objection": objection}),
+                                   steps=("load page",))
+    check("critic: verdict kept on grounded objection",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    check("critic: high -> medium confidence on grounded objection",
+          v["confidence"] == "medium", v["confidence"])
+    check("critic: objection appended to rationale",
+          objection in v["rationale"], v["rationale"])
+    check("critic: scores untouched",
+          v["scores"] == _JUDGE_SOLID["scores"], repr(v["scores"]))
+    check("critic_objection recorded in the verdict",
+          v["critic_objection"] == objection,
+          repr(v["critic_objection"]))
+    check("critic: cost sums both calls' tokens",
+          v["_cost"]["tokens_in"] == 11 and v["_cost"]["tokens_out"] == 22,
+          repr(v["_cost"]))
+    check("critic medium confidence does not trigger INSUFFICIENT_EVIDENCE",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    md, js = ev.write_evaluation(tmp.name, "the widget saves", v)
+    text = open(md).read()
+    check("EVALUATION.md renders the Critic section",
+          "## Critic" in text and objection in text,
+          text[text.find("## Critic"):text.find("## Critic") + 160])
+    body = json.load(open(js))
+    check("evaluation.json carries critic_objection",
+          body["verdict"]["critic_objection"] == objection,
+          repr(body["verdict"].get("critic_objection")))
+    tmp.cleanup()
+
+
+def test_critic_none_leaves_verdict_untouched():
+    from qaloop import evaluate as ev
+    for critic_text in ("NONE", "  none\n",
+                        json.dumps({"objection": "NONE"}),
+                        json.dumps({"objection": ""}),
+                        '{"objection": broken}',
+                        "the verdict seems fine??"):
+        v, tmp = _stub_evaluate_critic(_JUDGE_SOLID, critic_text,
+                                       steps=("load page",))
+        tag = critic_text[:16].replace("\n", "\\n")
+        check(f"critic {tag!r}: verdict kept",
+              v["verdict"] == "MAKES_SENSE", v["verdict"])
+        check(f"critic {tag!r}: confidence stays high",
+              v["confidence"] == "high", v["confidence"])
+        check(f"critic {tag!r}: rationale untouched",
+              v["rationale"] == "solid", v["rationale"])
+        check(f"critic {tag!r}: critic_objection is None",
+              v["critic_objection"] is None, repr(v["critic_objection"]))
+        tmp.cleanup()
+
+
+def test_critic_coupling_grounding_rules():
+    from qaloop.evaluate import _critic_coupling
+    evd = _grounding_evidence(
+        steps=[(0, "load page")],
+        diff="diff --git a/qaloop/flow.py b/qaloop/flow.py\n+retry\n")
+    base = {"verdict": "MAKES_SENSE", "confidence": "high",
+            "rationale": "r", "evidence": [], "risks": []}
+    obj = lambda text: json.dumps({"objection": text})  # noqa: E731
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj("STEP 0 never clicked save"))
+    check("coupling (a): step index grounds the objection",
+          out["confidence"] == "medium"
+          and out["critic_objection"] == "STEP 0 never clicked save",
+          repr(out["confidence"]))
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj("the load page step never reached the form"))
+    check("coupling (a): step name grounds the objection",
+          out["confidence"] == "medium", repr(out["confidence"]))
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj("qaloop/flow.py:42 retries but never asserts"))
+    check("coupling (b): file:line in the diff grounds",
+          out["confidence"] == "medium", repr(out["confidence"]))
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj('the "widget saves" claim was never exercised'))
+    check("coupling (c): quoted context grounds",
+          out["confidence"] == "medium", repr(out["confidence"]))
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj("the moon is made of cheese"))
+    check("coupling: ungrounded objection leaves everything untouched",
+          out["verdict"] == "MAKES_SENSE" and out["confidence"] == "high"
+          and out["rationale"] == "r" and out["critic_objection"] is None,
+          repr(out))
+    mid = dict(base, confidence="medium")
+    out = _critic_coupling(mid, evd, "the widget saves",
+                           obj("STEP 0 never clicked save"))
+    check("coupling: medium stays medium, objection still appended",
+          out["confidence"] == "medium"
+          and "STEP 0 never clicked save" in out["rationale"]
+          and out["critic_objection"] == "STEP 0 never clicked save",
+          repr(out))
+    out = _critic_coupling(base, evd, "the widget saves",
+                           obj("STEP 0 never clicked save"))
+    check("coupling: verdict never reclassified",
+          out["verdict"] == "MAKES_SENSE", out["verdict"])
+
+
+def test_evaluate_no_api_key_raises_before_chat():
+    from qaloop import evaluate as ev
+    calls = []
+    old = ev._chat
+    ev._chat = lambda cfg, messages, timeout_s=90: \
+        calls.append(messages) or ("", {})  # noqa: E731
+    try:
+        try:
+            ev.evaluate("c", "/nonexistent", "")
+            check("no api key raises", False)
+        except RuntimeError:
+            check("no api key raises RuntimeError", True)
+    finally:
+        ev._chat = old
+    check("no _chat call happens before the key check",
+          calls == [], repr(calls))
+
+
+def test_write_evaluation_critic_section():
+    from qaloop import evaluate as ev
+    with tempfile.TemporaryDirectory() as run_dir:
+        v = {"verdict": "MAKES_SENSE", "confidence": "medium",
+             "rationale": "solid. Critic objection (verdict kept): STEP 0..",
+             "evidence": [], "risks": [],
+             "critic_objection": "STEP 0 was cited but never ran"}
+        md, js = ev.write_evaluation(run_dir, "the widget saves", v)
+        text = open(md).read()
+        check("EVALUATION.md renders the Critic section with the objection",
+              "## Critic" in text
+              and "STEP 0 was cited but never ran" in text,
+              text[text.find("## Critic"):text.find("## Critic") + 200])
+        check("evaluation.json carries critic_objection",
+              json.load(open(js))["verdict"]["critic_objection"]
+              == "STEP 0 was cited but never ran")
+        v2 = dict(v, critic_objection=None)
+        md2, _ = ev.write_evaluation(run_dir, "the widget saves", v2)
+        text2 = open(md2).read()
+        check("EVALUATION.md notes when no grounded objection was raised",
+              "## Critic" in text2 and "No grounded objection" in text2,
+              text2[text2.find("## Critic"):text2.find("## Critic") + 120])
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
