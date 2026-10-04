@@ -2038,6 +2038,15 @@ def test_network_calls_validation():
         check(f"valid network_calls accepted: {good}",
               s.steps[0].expect_items[0][0] == "network_calls",
               str(s.steps[0].expect_items))
+    # optional status sub-filter (issue #49): exactly one of equals|gte|lte,
+    # int (never bool), non-negative
+    for good in ["{url: '/demo/', status: {equals: 200}, equals: 1}",
+                 "{url: '/demo/', status: {gte: 200}, gte: 1}",
+                 "{url: '/demo/', status: {lte: 399}, lte: 2}"]:
+        s = load(base.replace("EXPECT", good))
+        check(f"valid network_calls status accepted: {good}",
+              s.steps[0].expect_items[0][0] == "network_calls",
+              str(s.steps[0].expect_items))
     for bad, label in [
         ("{equals: 1}", "missing url"),
         ("{url: '/demo/'}", "no comparator"),
@@ -2046,12 +2055,34 @@ def test_network_calls_validation():
         ("{url: '', equals: 1}", "empty url"),
         ("'/demo/'", "non-dict"),
         ("true", "non-dict bool"),
+        ("{url: '/demo/', status: 'ok', equals: 1}", "status non-dict string"),
+        ("{url: '/demo/', status: true, equals: 1}", "status bool"),
+        ("{url: '/demo/', status: 200, equals: 1}", "status int"),
+        ("{url: '/demo/', status: {equals: 200, gte: 200}, equals: 1}",
+         "status two comparators"),
+        ("{url: '/demo/', status: {noteq: 200}, equals: 1}",
+         "status unknown comparator key"),
+        ("{url: '/demo/', status: {equals: -1}, equals: 1}",
+         "status negative"),
+        ("{url: '/demo/', status: {equals: true}, equals: 1}",
+         "status bool comparator value"),
+        ("{url: '/demo/', status: {gte: 2.5}, equals: 1}",
+         "status float comparator value"),
     ]:
         try:
             load(base.replace("EXPECT", bad))
             check(f"bad network_calls rejected ({label})", False, "no error")
         except SpecError:
             check(f"bad network_calls rejected ({label})", True)
+    # acceptance: string/bool status errors name network_calls status
+    for bad in ["{url: '/demo/', status: 'ok', equals: 1}",
+                "{url: '/demo/', status: true, equals: 1}"]:
+        try:
+            load(base.replace("EXPECT", bad))
+            check("network_calls status error names the key", False, "no error")
+        except SpecError as e:
+            check("network_calls status error names the key",
+                  "network_calls status" in str(e), str(e))
 
 
 def test_network_calls_evaluation():
@@ -2110,6 +2141,81 @@ def test_network_calls_evaluation():
     # network_log None (defensive): also 0
     r = run({"url": "/demo/", "equals": 0}, None)
     check("None network_log evaluates as 0", r.passed, r.detail)
+
+
+def test_network_calls_status_evaluation():
+    """network_calls status filter evaluation: the status sub-filter narrows
+    counted entries BEFORE the count comparator; equals > gte > lte;
+    status:null entries never match a filter but still count without one;
+    failure details name the url, the status filter, and the count
+    (issue #49)."""
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    class FakePage:
+        pass
+
+    def run(params, log):
+        step = Step(index=0, phase="steps", name="s", op=None, params=None,
+                    expect={}, expect_items=[("network_calls", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+        return _check_assertions(FakePage(), step, None, network_log=log)[0]
+
+    def entry(url, status=200, ms=12.3):
+        return {"ts": 1.0, "method": "GET", "url": url,
+                "status": status, "ms": ms}
+
+    log = [entry("http://x/demo/a", 200), entry("http://x/demo/b", 500),
+           entry("http://x/demo/c", 404), entry("http://x/other", 200)]
+    # status equals: only matching entries count
+    r = run({"url": "/demo/", "status": {"equals": 200}, "equals": 1}, log)
+    check("status equals counts only matching entries", r.passed, r.detail)
+    r = run({"url": "/demo/", "status": {"equals": 200}, "equals": 2}, log)
+    check("status equals mismatch fails naming url, filter, and count",
+          not r.passed
+          and r.detail == "/demo/: network_calls=1 want =2 status=200",
+          r.detail)
+    # gte / lte comparators on the status filter
+    r = run({"url": "/demo/", "status": {"gte": 400}, "equals": 2}, log)
+    check("status gte counts entries at/above the bound",
+          r.passed, r.detail)
+    r = run({"url": "/demo/", "status": {"lte": 299}, "equals": 1}, log)
+    check("status lte counts entries at/below the bound",
+          r.passed, r.detail)
+    r = run({"url": "/demo/", "status": {"gte": 500}, "gte": 1}, log)
+    check("gte count comparator still applies to the filtered count",
+          r.passed, r.detail)
+    r = run({"url": "/demo/", "status": {"lte": 399}, "lte": 0}, log)
+    check("lte count comparator fails naming filter and count",
+          not r.passed
+          and r.detail == "/demo/: network_calls=1 want <=0 status<=399",
+          r.detail)
+    # precedence inside the status filter: equals wins, then gte, else lte
+    r = run({"url": "/demo/", "status": {"equals": 404, "gte": 200},
+             "equals": 1}, log)
+    check("status filter: equals takes precedence over gte",
+          r.passed, r.detail)
+    # null-status entries never match a filter, but count without one
+    fail_log = [entry("http://x/demo/c", status=None, ms=None)]
+    r = run({"url": "/demo/", "equals": 1}, fail_log)
+    check("null-status entry counted without a status filter",
+          r.passed, r.detail)
+    r = run({"url": "/demo/", "status": {"equals": 200}, "equals": 0},
+            fail_log)
+    check("null-status entry never matches a status filter",
+          r.passed and r.detail == "/demo/: network_calls=0 want =0 status=200",
+          r.detail)
+    # acceptance line 1: 500 entry fails a status: {equals: 200} filter
+    r = run({"url": "/demo/", "status": {"equals": 200}, "equals": 1},
+            [entry("http://x/demo/x", 500)])
+    check("status 500 fails {equals: 200} with url, filter, and count",
+          not r.passed
+          and r.detail == "/demo/: network_calls=0 want =1 status=200",
+          r.detail)
+    # acceptance line 2
+    r = run({"url": "/demo/", "status": {"equals": 200}, "equals": 1},
+            [entry("http://x/demo/x", 200)])
+    check("status 200 passes {equals: 200}", r.passed, r.detail)
 
 
 def test_mock_calls_runner():

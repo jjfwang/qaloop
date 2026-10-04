@@ -303,6 +303,18 @@ def _poll_text_match(page, sel, match, deadline_s):
         time.sleep(0.15)
 
 
+def _status_cmp(entry_status: int, filt: dict) -> bool:
+    """Apply a validated network_calls status filter to one entry's status.
+
+    filt holds exactly one of equals|gte|lte (spec.py enforces shape).
+    """
+    if "equals" in filt:
+        return entry_status == filt["equals"]
+    if "gte" in filt:
+        return entry_status >= filt["gte"]
+    return entry_status <= filt["lte"]
+
+
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
                       run_dir: str = "", mock_hits: dict | None = None,
@@ -358,17 +370,34 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     ok, detail = n <= val["lte"], f"mock_calls={n} want <={val['lte']}"
                 out.append(AssertionResult(key, ok, f"{url}: {detail}"))
             elif key == "network_calls":
-                # Assert how often the page made real network requests (issue #47).
-                # Counted against the run's network_log by substring match on the
-                # entry url; failed requests (status None) count as calls.
+                # Assert how often the page made real network requests (issues
+                # #47, #49). Counted against the run's network_log by substring
+                # match on the entry url; an optional status filter narrows the
+                # entries by response status BEFORE counting and never matches
+                # failed requests (status None); without one, failed requests
+                # count as calls.
                 url = val["url"]
-                n = sum(1 for e in (network_log or []) if url in e.get("url", ""))
-                if "equals" in val:
-                    ok, detail = n == val["equals"], f"network_calls={n} want ={val['equals']}"
-                elif "gte" in val:
-                    ok, detail = n >= val["gte"], f"network_calls={n} want >={val['gte']}"
+                filt = val.get("status")
+                status_desc = ""
+                if filt is not None:
+                    op, sv = next(iter(filt.items()))
+                    status_desc = (" status=" if op == "equals" else
+                                   " status>=" if op == "gte" else " status<=")
+                    status_desc += str(sv)
+                if filt is None:
+                    n = sum(1 for e in (network_log or [])
+                            if url in e.get("url", ""))
                 else:
-                    ok, detail = n <= val["lte"], f"network_calls={n} want <={val['lte']}"
+                    n = sum(1 for e in (network_log or [])
+                            if url in e.get("url", "")
+                            and e.get("status") is not None
+                            and _status_cmp(e["status"], filt))
+                if "equals" in val:
+                    ok, detail = n == val["equals"], f"network_calls={n} want ={val['equals']}{status_desc}"
+                elif "gte" in val:
+                    ok, detail = n >= val["gte"], f"network_calls={n} want >={val['gte']}{status_desc}"
+                else:
+                    ok, detail = n <= val["lte"], f"network_calls={n} want <={val['lte']}{status_desc}"
                 out.append(AssertionResult(key, ok, f"{url}: {detail}"))
             elif key == "url_contains":
                 ok = val in page.url
