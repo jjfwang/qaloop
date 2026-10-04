@@ -2417,6 +2417,90 @@ def test_network_jsonl_artifact():
               and os.path.exists(os.path.join(d, "run.json")))
 
 
+def test_url_title_assertion_polling():
+    # Issue #51: url_contains / title_contains poll page.url / page.title()
+    # until the substring appears or the step deadline expires.
+    import time
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def make_step(key, val, timeout_ms=None):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[(key, val)],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+
+    class FakePage:
+        """Serves a fixed sequence of values, one per read."""
+
+        def __init__(self, urls=None, titles=None):
+            self._urls = urls or [""]
+            self._titles = titles or [""]
+            self.url_reads = 0
+            self.title_reads = 0
+
+        @property
+        def url(self):
+            self.url_reads += 1
+            return self._urls[min(self.url_reads - 1, len(self._urls) - 1)]
+
+        def title(self):
+            self.title_reads += 1
+            return self._titles[min(self.title_reads - 1,
+                                    len(self._titles) - 1)]
+
+    # (a) delayed URL match passes and re-reads the page more than once
+    page = FakePage(urls=["http://x/home", "http://x/home", "http://x/about"])
+    res = _check_assertions(page, make_step("url_contains", "/about"), None)[0]
+    check("url_contains delayed match passes", res.passed, res.detail)
+    check("url_contains re-read the page", page.url_reads == 3,
+          f"reads={page.url_reads}")
+
+    # (b) delayed title match passes
+    page = FakePage(titles=["Loading", "Loading", "About us"])
+    res = _check_assertions(page, make_step("title_contains", "About"),
+                            None)[0]
+    check("title_contains delayed match passes", res.passed, res.detail)
+    check("title_contains re-read the page", page.title_reads == 3,
+          f"reads={page.title_reads}")
+
+    # (c) never-appearing URL fails, naming the final observed value,
+    # bounded by the step timeout
+    page = FakePage(urls=["http://x/never-here"])
+    t0 = time.monotonic()
+    res = _check_assertions(page,
+                            make_step("url_contains", "/about",
+                                      timeout_ms=600), None)[0]
+    elapsed = time.monotonic() - t0
+    check("url_contains timeout fails", not res.passed, res.detail)
+    check("url_contains timeout names final observed value",
+          res.detail == "url='http://x/never-here'", res.detail)
+    check("url_contains timeout bounded by step timeout", elapsed < 3.0,
+          f"{elapsed:.2f}s")
+
+    # (d) never-appearing title fails likewise
+    page = FakePage(titles=["Loading"])
+    t0 = time.monotonic()
+    res = _check_assertions(page,
+                            make_step("title_contains", "About",
+                                      timeout_ms=600), None)[0]
+    elapsed = time.monotonic() - t0
+    check("title_contains timeout fails", not res.passed, res.detail)
+    check("title_contains timeout names final observed value",
+          res.detail == "title='Loading'", res.detail)
+    check("title_contains timeout bounded by step timeout", elapsed < 3.0,
+          f"{elapsed:.2f}s")
+
+    # (e) immediate match passes on the first read
+    page = FakePage(urls=["http://x/home"], titles=["Home page"])
+    res = _check_assertions(page, make_step("url_contains", "/home"), None)[0]
+    check("url_contains immediate match passes on first read",
+          res.passed and page.url_reads == 1, f"reads={page.url_reads}")
+    res = _check_assertions(page, make_step("title_contains", "Home"),
+                            None)[0]
+    check("title_contains immediate match passes on first read",
+          res.passed and page.title_reads == 1, f"reads={page.title_reads}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
