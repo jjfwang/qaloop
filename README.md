@@ -73,7 +73,10 @@ alongside the feature. Conventions:
   For debugging failed mocks or `mock_calls` misses, every run also writes
   `network.jsonl` into the run dir: one line per observed response or failed
   request (status, ms timing, no bodies), so you can see exactly what traffic
-  the page actually saw.
+  the page actually saw. To assert on that traffic directly, use
+  `expect: {network_calls: {url: "/api/x", equals: 1}}` — it counts log
+  entries whose url contains the given substring (mock-served responses and
+  failed requests count too).
 - Pin the pixels that matter: `screenshot_matches` baselines for key
   screens, `ax` assertions for the user's perceivable contract.
 - Flaky UI: `retry: N` on a `steps`-phase step re-runs it up to N more times

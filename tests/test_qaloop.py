@@ -2017,6 +2017,101 @@ def test_mock_calls_evaluation():
     check("None mock_hits evaluates as 0", r.passed, r.detail)
 
 
+def test_network_calls_validation():
+    """network_calls assertion spec validation: {url, equals|gte|lte},
+    mirroring mock_calls (issue #47)."""
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    base = ("name: t\ntarget: http://x\nsteps:\n  - name: s\n"
+            "    expect: {network_calls: EXPECT}\n")
+    for good in ["{url: '/demo/', equals: 1}",
+                 "{url: '/demo/', gte: 2}",
+                 "{url: '/demo/', lte: 0}"]:
+        s = load(base.replace("EXPECT", good))
+        check(f"valid network_calls accepted: {good}",
+              s.steps[0].expect_items[0][0] == "network_calls",
+              str(s.steps[0].expect_items))
+    for bad, label in [
+        ("{equals: 1}", "missing url"),
+        ("{url: '/demo/'}", "no comparator"),
+        ("{url: '/demo/', noteq: 1}", "wrong comparator key"),
+        ("{url: 42, equals: 1}", "non-string url"),
+        ("{url: '', equals: 1}", "empty url"),
+        ("'/demo/'", "non-dict"),
+        ("true", "non-dict bool"),
+    ]:
+        try:
+            load(base.replace("EXPECT", bad))
+            check(f"bad network_calls rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad network_calls rejected ({label})", True)
+
+
+def test_network_calls_evaluation():
+    """network_calls evaluation: counts network_log entries by url substring;
+    equals wins, then gte, else lte; failed requests (status None) count;
+    no match is 0; fail details name the url and the observed count
+    (issue #47)."""
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    class FakePage:
+        pass
+
+    def run(params, log):
+        step = Step(index=0, phase="steps", name="s", op=None, params=None,
+                    expect={}, expect_items=[("network_calls", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+        return _check_assertions(FakePage(), step, None, network_log=log)[0]
+
+    def entry(url, status=200, ms=12.3):
+        return {"ts": 1.0, "method": "GET", "url": url,
+                "status": status, "ms": ms}
+
+    log = [entry("http://x/demo/a"), entry("http://x/demo/b"),
+           entry("http://x/other")]
+    r = run({"url": "/demo/", "equals": 2}, log)
+    check("equals boundary passes", r.passed, r.detail)
+    r = run({"url": "/demo/", "equals": 1}, log)
+    check("equals mismatch fails with url and observed count",
+          not r.passed and r.detail == "/demo/: network_calls=2 want =1", r.detail)
+    r = run({"url": "/demo/", "gte": 2}, log)
+    check("gte boundary passes", r.passed, r.detail)
+    r = run({"url": "/demo/", "gte": 3}, log)
+    check("gte shortfall fails with url and observed count",
+          not r.passed and r.detail == "/demo/: network_calls=2 want >=3", r.detail)
+    r = run({"url": "/demo/", "lte": 2}, log)
+    check("lte boundary passes", r.passed, r.detail)
+    r = run({"url": "/demo/", "lte": 1}, log)
+    check("lte excess fails with url and observed count",
+          not r.passed and r.detail == "/demo/: network_calls=2 want <=1", r.detail)
+    # precedence: equals wins over gte/lte
+    r = run({"url": "/demo/", "equals": 7, "gte": 0}, log)
+    check("equals takes precedence over gte", not r.passed
+          and "want =7" in r.detail, r.detail)
+    # failed request (status None) counts as a call
+    fail_log = [entry("http://x/demo/c", status=None, ms=None)]
+    r = run({"url": "/demo/", "equals": 1}, fail_log)
+    check("failed request (status None) counts as a call", r.passed, r.detail)
+    # no match is 0
+    r = run({"url": "/nope/", "equals": 0}, log)
+    check("unmatched url is 0 and passes equals 0",
+          r.passed and r.detail == "/nope/: network_calls=0 want =0", r.detail)
+    r = run({"url": "/nope/", "gte": 1}, log)
+    check("unmatched url fails gte 1 with clear detail",
+          not r.passed and r.detail == "/nope/: network_calls=0 want >=1", r.detail)
+    # network_log None (defensive): also 0
+    r = run({"url": "/demo/", "equals": 0}, None)
+    check("None network_log evaluates as 0", r.passed, r.detail)
+
+
 def test_mock_calls_runner():
     """Real-browser proof of acceptance line 1: a flow registering a mock,
     triggering the request, and asserting mock_calls {url, equals: N} passes;
