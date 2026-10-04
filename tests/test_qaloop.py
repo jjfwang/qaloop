@@ -2101,10 +2101,12 @@ def test_network_jsonl_artifact():
             self.request = request
             self.url = url
 
-    # 1. response with timing -> one line, status + ms, URL preserved
+    # 1. response with timing -> one line, status + ms (time-to-first-byte),
+    #    URL preserved
     c = Collectors()
     req = FakeRequest("GET", "http://x/api/pets",
-                      {"requestStart": 100.0, "responseEnd": 147.5})
+                      {"requestStart": 100.0, "responseStart": 147.5,
+                       "responseEnd": -1})
     c._on_response(FakeResponse(200, req, "http://x/api/pets"))
     check("response 200 appends one network_log line", len(c.network_log) == 1)
     line = c.network_log[0]
@@ -2121,10 +2123,12 @@ def test_network_jsonl_artifact():
           len(c2.network_log) == 1 and c2.network_log[0]["ms"] is None)
 
     # Playwright reports -1 for timing phases that never happened
+    # (e.g. responseStart for a route-fulfilled mock) -> ms None, not garbage
     c2b = Collectors()
     c2b._on_response(FakeResponse(200,
                                   FakeRequest("GET", "http://x/c",
                                               {"requestStart": 2.9,
+                                               "responseStart": -1,
                                                "responseEnd": -1}),
                                   "http://x/c"))
     check("negative timing yields ms None, not garbage",

@@ -112,9 +112,13 @@ class Collectors:
             return
         try:
             timing = response.request.timing
-            start, end = timing["requestStart"], timing["responseEnd"]
-            # Playwright uses -1 for timing phases that never happened.
-            ms = round(end - start, 1) if start >= 0 and end >= 0 else None
+            start, hdr = timing["requestStart"], timing["responseStart"]
+            # The "response" event fires when headers arrive, before the body
+            # streams, so responseEnd is -1 here; ms is time-to-first-byte
+            # (responseStart - requestStart). Route-fulfilled mocks report
+            # -1 for everything -> ms None. Playwright uses -1 for timing
+            # phases that never happened.
+            ms = round(hdr - start, 1) if start >= 0 and hdr >= 0 else None
         except Exception:
             ms = None
         self.network_log.append({
