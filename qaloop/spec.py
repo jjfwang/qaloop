@@ -26,6 +26,7 @@ STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry"}
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
+    "mock_calls",
     "url_contains", "title_contains", "noop", "console_clean", "js",
     "screenshot_matches", "ax",
 }
@@ -277,6 +278,12 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     or ("text" not in val and "pattern" not in val)):
                 raise SpecError(
                     f"{where}: assertion {key} needs {{selector, text|pattern}}")
+        elif key == "mock_calls":
+            if (not isinstance(val, dict) or not isinstance(val.get("url"), str)
+                    or not val["url"]
+                    or not any(k in val for k in ("equals", "gte", "lte"))):
+                raise SpecError(
+                    f"{where}: assertion mock_calls needs {{url, equals|gte|lte}}")
         elif key == "count":
             if (not isinstance(val, dict) or "selector" not in val
                     or not any(k in val for k in ("equals", "gte", "lte"))):

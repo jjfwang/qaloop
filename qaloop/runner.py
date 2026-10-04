@@ -178,11 +178,15 @@ def _route_delay(route, delay_s: float) -> None:
         time.sleep(delay_s)
 
 
-def _do_mock(page, params: dict) -> None:
+def _do_mock(page, params: dict, mock_hits: dict) -> None:
     """Register a Playwright network route returning a canned response.
 
     Register in setup before the goto that triggers the requests — routes
     only affect requests made after registration.
+
+    mock_hits records each *served* hit keyed by the route's url pattern
+    (delegated decision, issue #43: method-mismatch and times-exceeded
+    fallthroughs are not mock hits — those requests didn't hit the mock).
     """
     import json as _json
 
@@ -210,6 +214,9 @@ def _do_mock(page, params: dict) -> None:
         if times is not None and seen["n"] > times:
             route.fallback()
             return
+        # Count served hits for mock_calls assertions (issue #43): keyed by
+        # the route's url pattern, incremented only on the serving branch.
+        mock_hits[url] = mock_hits.get(url, 0) + 1
         # Hold the mocked response without freezing the automation: the sleep
         # must not block Playwright's event loop, or no mid-flight assertion
         # could ever observe the loading state. No sleep on the times-exceeded
@@ -221,7 +228,7 @@ def _do_mock(page, params: dict) -> None:
     page.route(url, handler)
 
 
-def _do_action(page, step: Step, target: str) -> None:
+def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
     if op == "goto":
@@ -271,7 +278,7 @@ def _do_action(page, step: Step, target: str) -> None:
         _ensure_origin(page, target)
         page.evaluate(p["js"])
     elif op == "mock":
-        _do_mock(page, p)
+        _do_mock(page, p, mock_hits)
     else:
         raise ValueError(f"unknown op {op}")
 
@@ -295,7 +302,8 @@ def _poll_text_match(page, sel, match, deadline_s):
 
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
-                      run_dir: str = "") -> list[AssertionResult]:
+                      run_dir: str = "", mock_hits: dict | None = None
+                      ) -> list[AssertionResult]:
     out: list[AssertionResult] = []
     t = min(step.timeout_ms or 15000, 8000)
     for key, val in step.expect_items:
@@ -332,6 +340,19 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 else:
                     ok, detail = n <= val["lte"], f"count={n} want <={val['lte']}"
                 out.append(AssertionResult(key, ok, f"{sel}: {detail}"))
+            elif key == "mock_calls":
+                # Assert how often a mocked route was served (issue #43).
+                # observed comes from the run's mock_hits dict, keyed by the
+                # mock's url pattern; an unregistered/never-hit url is 0.
+                url = val["url"]
+                n = (mock_hits or {}).get(url, 0)
+                if "equals" in val:
+                    ok, detail = n == val["equals"], f"mock_calls={n} want ={val['equals']}"
+                elif "gte" in val:
+                    ok, detail = n >= val["gte"], f"mock_calls={n} want >={val['gte']}"
+                else:
+                    ok, detail = n <= val["lte"], f"mock_calls={n} want <={val['lte']}"
+                out.append(AssertionResult(key, ok, f"{url}: {detail}"))
             elif key == "url_contains":
                 ok = val in page.url
                 out.append(AssertionResult(key, ok, f"url={page.url[:160]!r}"))
@@ -428,6 +449,10 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     started = time.time()
     steps: list[StepResult] = []
     collectors = Collectors()
+    # Per-run mock hit counts (issue #43): mock routes served since run
+    # start, keyed by url pattern. Reset each run; mocks registered in
+    # setup thread through here, and mock_calls assertions read it.
+    mock_hits: dict = {}
     status, failed_step, run_error = "passed", None, ""
     shot_policy = _screenshot_policy(spec)
     ax_on_failure = spec.artifacts.get("ax_snapshot", "on-failure") == "on-failure"
@@ -481,12 +506,13 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         sr.error = ""
                         try:
                             if step.op:
-                                _do_action(page, step, target)
+                                _do_action(page, step, target, mock_hits)
                             sr.assertions = _check_assertions(
                                 page, step, collectors,
                                 baseline_dir=baseline_dir,
                                 baseline_update=baseline_update,
-                                run_dir=run_dir)
+                                run_dir=run_dir,
+                                mock_hits=mock_hits)
                             failed_asserts = [a for a in sr.assertions
                                               if not a.passed]
                             if failed_asserts:

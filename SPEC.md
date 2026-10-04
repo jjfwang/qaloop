@@ -123,6 +123,14 @@ loading states: show the spinner or skeleton on click, assert the indicator
 `visible` while the delayed response is in flight, then `wait` for it to be
 hidden and assert the settled content with `text_contains`.
 
+`mock_calls` (assertion) counts how often each registered mock actually
+served a request, keyed by the mock's `url` pattern — e.g. after the flow
+above triggers one fetch, `expect: {mock_calls: {url: "**/api/companions", equals: 1}}`
+passes. Only *served* hits count: requests that fell through on a method
+mismatch, or that arrived after `times` was exceeded, do not count. A URL
+with no registered mock — or no hits yet — evaluates as 0, so
+`mock_calls: {url: "**/api/x", equals: 0}` asserts the request was never made.
+
 ## Assertions (`expect:` mapping)
 
 | assertion | params |
@@ -131,6 +139,7 @@ hidden and assert the settled content with `text_contains`.
 | `text_contains` | `{selector, text}` |
 | `text_matches` | `{selector, pattern}` (regex) |
 | `count` | `{selector, equals: n}` / `{selector, gte: n}` / `{selector, lte: n}` |
+| `mock_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` — how often a mocked route was served (see `mock`) |
 | `url_contains` / `title_contains` | string |
 | `noop` | `true` — documents an intentionally dead control |
 | `console_clean` | `true` — no new console/page errors since the step started |
