@@ -307,12 +307,35 @@ Calibration rules, applied to the verdict before anything is written:
 - Low-confidence `MAKES_SENSE` is downgraded to `INSUFFICIENT_EVIDENCE` —
   a verdict the judge is unsure of cannot stand. The rationale is appended
   noting the downgrade and that the judge reported low confidence.
-- High-confidence `MAKES_SENSE` requires at least 2 non-empty evidence
-  bullets; fewer downgrades to `INSUFFICIENT_EVIDENCE` — a confident verdict
-  with no cited evidence is not credible. The rationale is appended noting
-  the downgrade and the missing evidence.
+- High-confidence `MAKES_SENSE` requires at least 2 *grounded* evidence
+  bullets (see below); fewer downgrades to `INSUFFICIENT_EVIDENCE` — a
+  confident verdict with no cited evidence is not credible. The rationale is
+  appended noting the downgrade and the missing evidence. When this
+  downgrade fires, any cited bullets that could not be grounded are named
+  in the rationale.
 - `DOES_NOT_MAKE_SENSE` keeps its verdict at any confidence (a contradiction
   is a contradiction). Low confidence is instead surfaced prominently in
   `EVALUATION.md` with a warning callout directly under the verdict header.
 - `INSUFFICIENT_EVIDENCE` and `BLOCKED` are never reclassified by
   calibration.
+
+### Evidence-citation grounding
+
+Before calibration, every non-empty evidence bullet is checked
+deterministically against the judge's own evidence (`_ground_evidence`).
+A bullet is *grounded* when it:
+
+- (a) names a step index or step name present in the collected steps;
+- (b) names a `file:line`-style path whose file appears in the diff
+  headers (`diff --git a/<f> b/<f>`);
+- (c) contains a quoted substring of at least 8 characters occurring
+  verbatim in the judge context — the prompt message built from the claim,
+  diff, and evidence by `_user_message`, so a bullet quoting the claim
+  text, a log line, or an AX fragment counts. A quoted substring shorter
+  than 8 characters does not qualify.
+
+Empty bullets are skipped (not recorded). The per-bullet results are
+stored as `evidence_grounding` — a list of
+`{bullet, grounded, reason}` — in `evaluation.json`, and ungrounded
+bullets are marked in `EVALUATION.md` as
+`- <bullet> — [UNGROUNDED CITATION]` (grounded bullets render unchanged).
