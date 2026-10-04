@@ -598,7 +598,7 @@ def test_wait_runner_defaults():
         step = Step(index=0, phase="steps", name="w", op="wait", params=params,
                     expect={}, expect_items=[], continue_on_fail=False,
                     timeout_ms=None, raw={})
-        _do_action(page, step, "http://x")
+        _do_action(page, step, "http://x", {})
         return page.calls
 
     calls = run({})
@@ -1866,6 +1866,220 @@ def test_screenshot_matches_diff_artifact():
               not res[0].passed
               and "diff image unavailable: OSError" in res[0].detail,
               res[0].detail)
+
+
+def test_mock_calls_validation():
+    """mock_calls assertion spec validation: {url, equals|gte|lte} mirror of
+    count, keyed by the mock's url pattern (issue #43)."""
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    base = ("name: t\ntarget: http://x\nsteps:\n  - name: s\n"
+            "    expect: {mock_calls: EXPECT}\n")
+    for good in ["{url: '**/api/x', equals: 1}",
+                 "{url: '**/api/x', gte: 2}",
+                 "{url: '**/api/x', lte: 0}"]:
+        s = load(base.replace("EXPECT", good))
+        check(f"valid mock_calls accepted: {good}",
+              s.steps[0].expect_items[0][0] == "mock_calls",
+              str(s.steps[0].expect_items))
+    for bad, label in [
+        ("{equals: 1}", "missing url"),
+        ("{url: '**/api/x'}", "no comparator"),
+        ("{url: '**/api/x', noteq: 1}", "wrong comparator key"),
+        ("{url: 42, equals: 1}", "non-string url"),
+        ("{url: '', equals: 1}", "empty url"),
+        ("'**/api/x'", "non-dict"),
+        ("true", "non-dict bool"),
+    ]:
+        try:
+            load(base.replace("EXPECT", bad))
+            check(f"bad mock_calls rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad mock_calls rejected ({label})", True)
+
+
+def test_mock_calls_counter():
+    """_do_mock's handler increments the per-run counter keyed by url
+    pattern on served hits only; method-mismatch and times-exceeded
+    fallthroughs do not increment (issue #43)."""
+    from qaloop.runner import _do_mock
+
+    class FakeRoute:
+        def __init__(self):
+            self.fulfilled = 0
+            self.fell_back = 0
+        def fallback(self):
+            self.fell_back += 1
+        def fulfill(self, **kw):
+            self.fulfilled += 1
+
+    class FakeRequest:
+        def __init__(self, method):
+            self.method = method
+
+    class FakePage:
+        def __init__(self):
+            self.routes = []
+        def route(self, url, handler):
+            self.routes.append((url, handler))
+
+    # basic: served hits increment, keyed by the url pattern
+    page = FakePage()
+    hits = {}
+    _do_mock(page, {"url": "**/api/pets", "method": "GET", "json": {"ok": True}},
+             hits)
+    (url, handler), = page.routes
+    route = FakeRoute()
+    handler(route, FakeRequest("GET"))
+    check("served hit increments counter", hits == {"**/api/pets": 1}, str(hits))
+    check("served hit fulfills", route.fulfilled == 1 and route.fell_back == 0)
+    handler(FakeRoute(), FakeRequest("GET"))
+    check("second served hit counts too", hits == {"**/api/pets": 2}, str(hits))
+    # method mismatch: falls through, no increment
+    before = dict(hits)
+    route2 = FakeRoute()
+    handler(route2, FakeRequest("POST"))
+    check("method mismatch falls back without counting",
+          hits == before and route2.fell_back == 1 and route2.fulfilled == 0,
+          str(hits))
+    # times-exceeded: falls through, no increment
+    page2 = FakePage()
+    hits2 = {}
+    _do_mock(page2, {"url": "**/api/x", "json": {"ok": True}, "times": 1}, hits2)
+    handler2 = page2.routes[0][1]
+    handler2(FakeRoute(), FakeRequest("GET"))
+    check("first hit under times served and counted",
+          hits2 == {"**/api/x": 1}, str(hits2))
+    route3 = FakeRoute()
+    handler2(route3, FakeRequest("GET"))
+    check("times-exceeded fallthrough not counted",
+          hits2 == {"**/api/x": 1} and route3.fell_back == 1
+          and route3.fulfilled == 0, str(hits2))
+    # separate routes keep separate counters
+    page3 = FakePage()
+    _do_mock(page3, {"url": "**/api/other", "json": {"ok": True}}, hits)
+    handler3 = page3.routes[0][1]
+    handler3(FakeRoute(), FakeRequest("GET"))
+    check("counters keyed per url pattern",
+          hits == {"**/api/pets": 2, "**/api/other": 1}, str(hits))
+
+
+def test_mock_calls_evaluation():
+    """mock_calls evaluation: equals wins, then gte, else lte; unregistered
+    urls are 0; fail details name the url and the observed count (issue #43)."""
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    class FakePage:
+        pass
+
+    def run(params, hits):
+        step = Step(index=0, phase="steps", name="s", op=None, params=None,
+                    expect={}, expect_items=[("mock_calls", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+        return _check_assertions(FakePage(), step, None, mock_hits=hits)[0]
+
+    r = run({"url": "**/a", "equals": 2}, {"**/a": 2})
+    check("equals boundary passes", r.passed, r.detail)
+    r = run({"url": "**/a", "equals": 2}, {"**/a": 1})
+    check("equals mismatch fails with url and observed count",
+          not r.passed and r.detail == "**/a: mock_calls=1 want =2", r.detail)
+    r = run({"url": "**/a", "gte": 2}, {"**/a": 2})
+    check("gte boundary passes", r.passed, r.detail)
+    r = run({"url": "**/a", "gte": 3}, {"**/a": 2})
+    check("gte shortfall fails with url and observed count",
+          not r.passed and r.detail == "**/a: mock_calls=2 want >=3", r.detail)
+    r = run({"url": "**/a", "lte": 2}, {"**/a": 2})
+    check("lte boundary passes", r.passed, r.detail)
+    r = run({"url": "**/a", "lte": 1}, {"**/a": 2})
+    check("lte excess fails with url and observed count",
+          not r.passed and r.detail == "**/a: mock_calls=2 want <=1", r.detail)
+    # precedence: equals wins over gte/lte
+    r = run({"url": "**/a", "equals": 5, "gte": 0}, {"**/a": 1})
+    check("equals takes precedence over gte", not r.passed
+          and "want =5" in r.detail, r.detail)
+    # unknown url evaluates as 0
+    r = run({"url": "**/nope", "equals": 0}, {})
+    check("unregistered url is 0 and passes equals 0",
+          r.passed and r.detail == "**/nope: mock_calls=0 want =0", r.detail)
+    r = run({"url": "**/nope", "gte": 1}, {"**/a": 9})
+    check("unregistered url fails gte 1 with clear detail",
+          not r.passed and r.detail == "**/nope: mock_calls=0 want >=1", r.detail)
+    # mock_hits None (defensive): also 0
+    r = run({"url": "**/a", "equals": 0}, None)
+    check("None mock_hits evaluates as 0", r.passed, r.detail)
+
+
+def test_mock_calls_runner():
+    """Real-browser proof of acceptance line 1: a flow registering a mock,
+    triggering the request, and asserting mock_calls {url, equals: N} passes;
+    a wrong count fails with the url and observed count in the detail."""
+    import socket
+    import subprocess
+    import time
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        have_pw = True
+    except ImportError:
+        have_pw = False
+    if not have_pw or not os.path.exists(exe):
+        check("mock_calls runner tests skipped (no browser)", True)
+        return
+    from qaloop.spec import load_spec
+    from qaloop.runner import run_flow
+
+    flow_tpl = (
+        "name: mock-calls-demo\ntarget: http://127.0.0.1:PORT\n"
+        "setup:\n  - mock: {url: '**/api/pets', json: {pets: []}}\n"
+        "steps:\n"
+        "  - name: fetch twice\n"
+        "    script: {js: \"(async () => { await fetch('/api/pets'); "
+        "await fetch('/api/pets'); })()\"}\n"
+        "  - name: count the hits\n"
+        "    expect: {mock_calls: {url: '**/api/pets', equals: EXPECT}}\n")
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "index.html"), "w") as f:
+            f.write("<html><body>mock calls demo</body></html>")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            for expect, label in [(2, "equals 2 passes"),
+                                  (3, "equals 3 fails")]:
+                flow_path = os.path.join(d, f"mock-calls-{expect}.yaml")
+                with open(flow_path, "w") as f:
+                    f.write(flow_tpl.replace("PORT", str(port))
+                            .replace("EXPECT", str(expect)))
+                with tempfile.TemporaryDirectory() as run_dir:
+                    result = run_flow(load_spec(flow_path), run_dir=run_dir,
+                                      executable_path=exe)
+                    if expect == 2:
+                        check("mock_calls equals 2 end-to-end passes",
+                              result.status == "passed", result.status)
+                    else:
+                        err = result.steps[-1].error if result.steps else ""
+                        check("mock_calls equals 3 fails naming url and count",
+                              result.status == "failed"
+                              and "**/api/pets: mock_calls=2 want =3" in err,
+                              result.status + " " + err)
+        finally:
+            srv.terminate()
 
 
 if __name__ == "__main__":

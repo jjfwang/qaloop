@@ -67,6 +67,9 @@ alongside the feature. Conventions:
   names) so the verifier doesn't file bugs about intentional behavior.
 - Mock the data, not the UI: use `mock` in `setup` to feed deterministic
   API responses so flows exercise the real rendering path without a backend.
+  To prove the UI actually called the API, assert `expect: {mock_calls: {url: "**/api/x", equals: 1}}` —
+  it counts how often each registered mock served a request (method-mismatch
+  and `times`-exceeded fallthroughs don't count; an unhit URL is 0).
 - Pin the pixels that matter: `screenshot_matches` baselines for key
   screens, `ax` assertions for the user's perceivable contract.
 - Flaky UI: `retry: N` on a `steps`-phase step re-runs it up to N more times
