@@ -395,6 +395,72 @@ def test_report_generation():
               json.load(open(os.path.join(d, "run.json")))["status"] == "failed")
 
 
+def test_report_junit_xml():
+    import xml.etree.ElementTree as ET
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+    from qaloop.report import write_junit_xml, write_report
+    spec = load_spec("flows/game-loading-frames.yaml", strict_env=False)
+    raw_error = 'assertion failed: got "2", expected "3" — 2 < 3 & 4 > 1'
+    steps = [
+        StepResult(index=0, phase="main", name="S-01 ok", op="goto",
+                   status="passed", duration_ms=100),
+        StepResult(index=1, phase="main", name="S-02 <bad> & \"quoted\"",
+                   op=None, status="failed", duration_ms=200, error=raw_error),
+        StepResult(index=2, phase="main", name="S-03 skipped", op="wait",
+                   status="skipped", duration_ms=0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        result = RunResult(
+            flow_name="junit-flow", target="http://x", status="failed",
+            started=1700000000.0, ended=1700000005.0, steps=steps,
+            failed_step=1, console_errors=[], page_errors=[],
+            failed_requests=[], bad_responses=[], run_dir=d)
+        path = write_junit_xml(result, spec, os.path.join(d, "j.xml"))
+        check("write_junit_xml returns path", path == os.path.join(d, "j.xml"))
+        tree = ET.parse(path)
+        suite = tree.getroot()
+        check("junit parses as xml", suite.tag == "testsuite")
+        check("testsuite tests equals step count", suite.get("tests") == "3")
+        check("testsuite failures equals failed count", suite.get("failures") == "1")
+        check("testsuite skipped equals skipped count", suite.get("skipped") == "1")
+        cases = suite.findall("testcase")
+        check("one testcase per step", len(cases) == 3)
+        failed_case = cases[1]
+        failure = failed_case.find("failure")
+        check("failed testcase carries failure element", failure is not None)
+        check("failure element text equals raw error",
+              failure.text == raw_error)
+        check("failure message attribute round-trips quotes",
+              failure.get("message") == raw_error)
+        check("special chars survive round-trip in name",
+              failed_case.get("name") == 'S-02 <bad> & "quoted"')
+        check("classname falls back to phase when op is None",
+              failed_case.get("classname") == "main")
+        check("classname combines phase and op",
+              cases[0].get("classname") == "main.goto")
+        check("skipped testcase has skipped element",
+              cases[2].find("skipped") is not None)
+        check("passed testcase has no failure/skipped",
+              cases[0].find("failure") is None and cases[0].find("skipped") is None)
+        # run-level error case: errors attribute counts the run error
+        err_result = RunResult(
+            flow_name="err-flow", target="http://x", status="error",
+            started=1700000000.0, ended=1700000005.0, steps=steps[:1],
+            failed_step=None, console_errors=[], page_errors=[],
+            failed_requests=[], bad_responses=[], run_dir=d, error="boot blew up")
+        ET.parse(write_junit_xml(err_result, spec, os.path.join(d, "e.xml")))
+        check("errors attr matches run-level error",
+              ET.parse(os.path.join(d, "e.xml")).getroot().get("errors") == "1")
+        # write_report writes junit.xml into the run dir unconditionally
+        paths = write_report(result, spec, d)
+        check("write_report returns junit_xml path",
+              paths.get("junit_xml") == os.path.join(d, "junit.xml"))
+        check("junit.xml present in run dir after write_report",
+              os.path.exists(paths["junit_xml"]))
+        ET.parse(paths["junit_xml"])
+
+
 def test_env_static_boot():
     from qaloop import env
     with tempfile.TemporaryDirectory() as d:

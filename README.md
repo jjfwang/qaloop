@@ -72,7 +72,7 @@ alongside the feature. Conventions:
 | command | what it does |
 |---|---|
 | `validate <flow>` | check spec structure (env vars not required) |
-| `verify <flow> [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once, print card, write `runs/<id>/REPORT.md` |
+| `verify <flow> [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once, print card, write `runs/<id>/REPORT.md` + `junit.xml` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
 | `perform --task "..." --target URL [--executable-path PATH]` | natural-language browser agent: performs the task like a person (see below) |
 | `evaluate --claim "..." --run <dir> --diff <file\|range> [--repo DIR]` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
@@ -251,7 +251,7 @@ qaloop/            the framework
   runner.py        deterministic Playwright runner
   perform.py       natural-language browser task agent (reads the AX tree, acts semantically, stops honestly when blocked)
   artifacts.py     screenshots, AX snapshots (CDP), console/network collectors
-  report.py        REPORT.md + run.json + stdout card
+  report.py        REPORT.md + run.json + junit.xml + stdout card
   env.py           boot static/command targets, wait-for-ready
   queue.py         sqlite job queue
   worker.py        claim → boot → run → report
