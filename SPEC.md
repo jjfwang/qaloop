@@ -248,3 +248,37 @@ directories remain, deleting the oldest first (run ids are
 `YYYYMMDDTHHMMSSZ`-prefixed, so name order is chronological). The run that
 just finished is never pruned. The knob is opt-in: the default is 0, which
 keeps everything. Negative values are rejected with an error (exit 2).
+
+## Evaluate: the semantic judge
+
+`python3 -m qaloop.cli evaluate --claim ... --run <run-dir>
+--diff <file|range>` judges whether the claimed behavior actually makes
+sense given the diff and the run evidence (steps, assertions, AX snapshots,
+console/network errors, service logs). It writes `EVALUATION.md` +
+`evaluation.json` into the run dir and logs the model cost.
+
+Verdicts: `MAKES_SENSE`, `DOES_NOT_MAKE_SENSE`, `INSUFFICIENT_EVIDENCE`,
+`BLOCKED`.
+
+### Confidence calibration
+
+The judge also returns a `confidence` of `high` | `medium` | `low` with
+each verdict. The value is normalized case-insensitively; a missing or
+unparseable value defaults to `low`. The raw value is kept as
+`confidence_raw` in `evaluation.json` for audit (it is not rendered in
+`EVALUATION.md`).
+
+Calibration rules, applied to the verdict before anything is written:
+
+- Low-confidence `MAKES_SENSE` is downgraded to `INSUFFICIENT_EVIDENCE` —
+  a verdict the judge is unsure of cannot stand. The rationale is appended
+  noting the downgrade and that the judge reported low confidence.
+- High-confidence `MAKES_SENSE` requires at least 2 non-empty evidence
+  bullets; fewer downgrades to `INSUFFICIENT_EVIDENCE` — a confident verdict
+  with no cited evidence is not credible. The rationale is appended noting
+  the downgrade and the missing evidence.
+- `DOES_NOT_MAKE_SENSE` keeps its verdict at any confidence (a contradiction
+  is a contradiction). Low confidence is instead surfaced prominently in
+  `EVALUATION.md` with a warning callout directly under the verdict header.
+- `INSUFFICIENT_EVIDENCE` and `BLOCKED` are never reclassified by
+  calibration.
