@@ -203,7 +203,9 @@ would exceed the ceiling, with status `blocked` and the ceiling named in
 the summary. The ceiling and the stop are recorded in `perform.json`,
 `PERFORM.md`, and the ledger.
 
-Env knobs: `QALOOP_RUNS`, `QALOOP_DB`, `QALOOP_EXECUTABLE_PATH` (chromium
+Env knobs: `QALOOP_RUNS`, `QALOOP_KEEP_RUNS` (keep at most N newest run
+dirs after verify/worker writes its report; `--keep-runs` flag wins;
+default 0 = keep everything), `QALOOP_DB`, `QALOOP_EXECUTABLE_PATH` (chromium
 binary override), `QALOOP_LEDGER` (cost-ledger JSONL path override, default
 `runs/ledger.jsonl` under the qaloop checkout), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
 `QALOOP_MODEL_*` (base url, name, key, per-1M prices).

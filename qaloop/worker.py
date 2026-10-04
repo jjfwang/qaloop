@@ -7,7 +7,7 @@ import traceback
 
 import yaml
 
-from .artifacts import new_run_dir
+from .artifacts import new_run_dir, prune_old_runs
 from .env import ProcTarget, boot_command, boot_static
 from .report import print_summary, write_report
 from .runner import run_flow
@@ -79,7 +79,7 @@ def boot_repo_env(preset: dict, profile: str | None = None) -> tuple[list[ProcTa
 
 def _run_one_flow(flow_path: str, target: str, runs_root: str,
                   headless: bool, executable_path: str | None,
-                  do_investigate: bool) -> tuple[str, str]:
+                  do_investigate: bool, keep_runs: int = 0) -> tuple[str, str]:
     """Run a single flow. Returns (status, run_dir)."""
     os.environ["TARGET_URL"] = target  # must precede load_spec: specs use ${TARGET_URL}
     spec = load_spec(flow_path)
@@ -100,6 +100,7 @@ def _run_one_flow(flow_path: str, target: str, runs_root: str,
                            "tokens_out": diagnosis.get("tokens_out"),
                            "cost_usd_est": diagnosis.get("cost_usd_est")})
     write_report(result, spec, run_dir, diagnosis=diagnosis)
+    prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
     print_summary(result)
     ledger.append({"kind": "scripted", "run_dir": run_dir, "flow": spec.name,
                    "status": result.status, "duration_ms": result.duration_ms,
@@ -108,7 +109,8 @@ def _run_one_flow(flow_path: str, target: str, runs_root: str,
 
 
 def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
-               executable_path: str | None, repos_config: dict) -> None:
+               executable_path: str | None, repos_config: dict,
+               keep_runs: int = 0) -> None:
     payload = job["payload"]
     if isinstance(payload, str):
         import json as _json
@@ -123,7 +125,8 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
                 flow = os.path.join(flows_dir, flow)
             target = payload["target"]
             status, run_dir = _run_one_flow(flow, target, runs_root, headless,
-                                            executable_path, do_investigate)
+                                            executable_path, do_investigate,
+                                            keep_runs)
         elif kind == "verify-repo":
             repo = payload["repo"]
             preset = (repos_config.get("repos") or {}).get(repo)
@@ -145,7 +148,8 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
                 try:
                     target = payload.get("target") or primary_url
                     status, last_dir = _run_one_flow(flow, target, runs_root, headless,
-                                                    executable_path, do_investigate)
+                                                    executable_path, do_investigate,
+                                                    keep_runs)
                 finally:
                     for t in flow_targets:
                         t.stop()
@@ -172,7 +176,7 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
 def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
                poll_s: float = 5, headless: bool = True,
                executable_path: str | None = None,
-               repos_config_path: str | None = None) -> None:
+               repos_config_path: str | None = None, keep_runs: int = 0) -> None:
     repos_config = load_repos_config(repos_config_path)
     q.requeue_stale()
     print(f"worker up — flows={flows_dir} runs={runs_root}")
@@ -187,4 +191,4 @@ def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
         print(f"claimed job #{job['id']} ({job['kind']})")
         handle_job(job, flows_dir=flows_dir, runs_root=runs_root,
                    headless=headless, executable_path=executable_path,
-                   repos_config=repos_config)
+                   repos_config=repos_config, keep_runs=keep_runs)

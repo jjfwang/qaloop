@@ -190,3 +190,11 @@ Every `verify`/`worker` run writes into `runs/<id>/`:
 - `junit.xml` — JUnit XML for CI ingestion (one `<testsuite>` per flow,
   one `<testcase>` per step; failed steps carry a `<failure>` element with
   the step error text, skipped steps a `<skipped/>` element).
+
+Retention: `verify` and `worker` accept `--keep-runs N` (or the
+`QALOOP_KEEP_RUNS` env var; the flag wins when both are set). After the
+report is written, qaloop prunes the runs root so at most the N newest run
+directories remain, deleting the oldest first (run ids are
+`YYYYMMDDTHHMMSSZ`-prefixed, so name order is chronological). The run that
+just finished is never pruned. The knob is opt-in: the default is 0, which
+keeps everything. Negative values are rejected with an error (exit 2).

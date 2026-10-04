@@ -9,7 +9,7 @@ import sys
 QALOOP_HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, QALOOP_HOME)
 
-from qaloop.artifacts import new_run_dir  # noqa: E402
+from qaloop.artifacts import new_run_dir, prune_old_runs  # noqa: E402
 from qaloop.report import print_summary, write_report  # noqa: E402
 from qaloop.runner import run_flow  # noqa: E402
 from qaloop.spec import SpecError, load_spec  # noqa: E402
@@ -47,8 +47,14 @@ def _service_ctx(flow_path: str, services: list, run_dir: str):
 
 def cmd_verify(args: argparse.Namespace) -> int:
     from qaloop import ledger
+    from qaloop.env import resolve_keep_runs
     runs_root = default_runs_root()
     os.makedirs(runs_root, exist_ok=True)
+    try:
+        keep_runs = resolve_keep_runs(args.keep_runs)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 2
     try:
         flow_name, services = _flow_services_info(args.flow)
     except SpecError as e:
@@ -64,12 +70,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"SERVICE BOOT FAILED: {type(e).__name__}: {e}")
         return 3
     try:
-        return _cmd_verify_run(args, run_dir, ledger)
+        return _cmd_verify_run(args, run_dir, ledger, runs_root, keep_runs)
     finally:
         ctx.__exit__(None, None, None)
 
 
-def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger) -> int:
+def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
+                    runs_root: str, keep_runs: int) -> int:
     try:
         spec = load_spec(args.flow)
     except SpecError as e:
@@ -103,6 +110,9 @@ def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger) -> int:
     ledger.append({"kind": "scripted", "run_dir": run_dir, "flow": spec.name,
                    "status": result.status, "duration_ms": result.duration_ms,
                    "cost_usd_est": 0.0})
+    pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
+    if pruned:
+        print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
     return 0 if result.status == "passed" else 1
 
 
@@ -256,10 +266,16 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
+    from qaloop.env import resolve_keep_runs
     from qaloop.worker import run_worker
+    try:
+        keep_runs = resolve_keep_runs(args.keep_runs)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 2
     run_worker(flows_dir=args.flows, runs_root=default_runs_root(),
                once=args.once, poll_s=args.poll, headless=not args.headed,
-               executable_path=args.executable_path)
+               executable_path=args.executable_path, keep_runs=keep_runs)
     return 0
 
 
@@ -317,6 +333,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--investigate", action="store_true",
                    help="summon the agentic investigator on failure")
     r.add_argument("--max-investigation-actions", type=int, default=None)
+    r.add_argument("--keep-runs", type=int, default=None,
+                   help="keep at most N newest run dirs (env QALOOP_KEEP_RUNS; "
+                        "default 0 = keep everything)")
     r.set_defaults(fn=cmd_verify)
 
     e = sub.add_parser("enqueue", help="enqueue a verification job")
@@ -336,6 +355,9 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--poll", type=float, default=5)
     w.add_argument("--headed", action="store_true")
     w.add_argument("--executable-path", default=None)
+    w.add_argument("--keep-runs", type=int, default=None,
+                   help="keep at most N newest run dirs (env QALOOP_KEEP_RUNS; "
+                        "default 0 = keep everything)")
     w.set_defaults(fn=cmd_worker)
 
     h = sub.add_parser("webhook", help="run the GitHub webhook receiver")

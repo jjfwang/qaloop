@@ -251,7 +251,8 @@ def _stub_run_one_flow(result):
     from qaloop import worker
     real = worker._run_one_flow
 
-    def fake(flow_path, target, runs_root, headless, executable_path, do_investigate):
+    def fake(flow_path, target, runs_root, headless, executable_path,
+             do_investigate, keep_runs=0):
         return result
 
     worker._run_one_flow = fake
@@ -1638,6 +1639,122 @@ def test_dashboard_empty_runs():
               "no runs yet" in html)
         check("dashboard empty runs still writes index.html",
               os.path.exists(out))
+
+
+def test_keep_runs_prune():
+    from qaloop.artifacts import prune_old_runs
+    # (a) 7 fake run dirs, keep=3 → exactly the 3 newest remain; files untouched
+    with tempfile.TemporaryDirectory() as d:
+        names = [f"2026100{i}T120000Z-demo-mock-ux-{i:06x}" for i in range(1, 8)]
+        for n in names:
+            os.makedirs(os.path.join(d, n))
+        open(os.path.join(d, "ledger.jsonl"), "w").write("{}\n")
+        deleted = prune_old_runs(d, 3)
+        remaining = sorted(os.listdir(d))
+        check("prune keep=3 leaves 3 newest dirs + files",
+              remaining == sorted(names[-3:]) + ["ledger.jsonl"], str(remaining))
+        check("prune returns deleted dir names", deleted == names[:-3], str(deleted))
+        # (b) keep=0 is a no-op
+        deleted = prune_old_runs(d, 0)
+        check("prune keep=0 deletes nothing",
+              deleted == [] and sorted(os.listdir(d)) == remaining)
+        # (e) missing runs root is a no-op
+        check("prune on missing root returns []",
+              prune_old_runs(os.path.join(d, "nope"), 3) == [])
+        # keep larger than dir count: nothing pruned
+        check("prune keep > count deletes nothing",
+              prune_old_runs(d, 99) == [] and sorted(os.listdir(d)) == remaining)
+    # (c) current-run protection: current sorts oldest, still survives
+    with tempfile.TemporaryDirectory() as d:
+        names = ["20250101T000000Z-old-run-aaaaaa",
+                 "20261002T120000Z-demo-b1bbbb", "20261003T120000Z-demo-b2bbbb",
+                 "20261004T120000Z-demo-b3bbbb", "20261005T120000Z-demo-b4bbbb"]
+        for n in names:
+            os.makedirs(os.path.join(d, n))
+        deleted = prune_old_runs(d, 2, current_run_dir=os.path.join(d, names[0]))
+        remaining = sorted(os.listdir(d))
+        check("prune never deletes the current run", names[0] in remaining,
+              str(remaining))
+        check("prune keep=2 keeps current + 2 newest",
+              remaining == [names[0], names[3], names[4]], str(remaining))
+        check("prune deleted exactly the 2 oldest non-current",
+              deleted == [names[1], names[2]], str(deleted))
+    # best-effort: one undeletable dir does not fail the run
+    with tempfile.TemporaryDirectory() as d:
+        from qaloop import artifacts
+        names = [f"2026100{i}T120000Z-demo-{i:06x}" for i in range(1, 6)]
+        for n in names:
+            os.makedirs(os.path.join(d, n))
+        real_rmtree = artifacts.shutil.rmtree
+
+        def flaky_rmtree(path, *a, **k):
+            if path.endswith(names[0]):
+                raise PermissionError("denied")
+            return real_rmtree(path, *a, **k)
+
+        artifacts.shutil.rmtree = flaky_rmtree
+        try:
+            deleted = artifacts.prune_old_runs(d, 2)
+        finally:
+            artifacts.shutil.rmtree = real_rmtree
+        remaining = sorted(os.listdir(d))
+        check("prune tolerates one undeletable dir",
+              deleted == names[1:-2] and remaining == [names[0]] + names[-2:],
+              str(deleted) + " / " + str(remaining))
+
+
+def test_resolve_keep_runs():
+    from qaloop.env import resolve_keep_runs
+    old = os.environ.get("QALOOP_KEEP_RUNS")
+
+    def setenv(v):
+        if v is None:
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+        else:
+            os.environ["QALOOP_KEEP_RUNS"] = v
+
+    def raises(fn):
+        try:
+            fn()
+        except ValueError:
+            return True
+        return False
+
+    try:
+        setenv(None)
+        check("no flag, no env → 0", resolve_keep_runs(None) == 0)
+        check("no flag, empty env → 0", (setenv(""), resolve_keep_runs(None))[1] == 0)
+        setenv("3")
+        check("env=3 alone → 3", resolve_keep_runs(None) == 3)
+        check("flag=5 beats env=3", resolve_keep_runs(5) == 5)
+        check("flag=0 keeps everything", resolve_keep_runs(0) == 0)
+        check("negative flag raises", raises(lambda: resolve_keep_runs(-1)))
+        setenv("garbage")
+        check("garbage env raises", raises(lambda: resolve_keep_runs(None)))
+        setenv("-2")
+        check("negative env raises", raises(lambda: resolve_keep_runs(None)))
+        setenv(" 4 ")
+        check("env with whitespace parses", resolve_keep_runs(None) == 4)
+    finally:
+        if old is None:
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+        else:
+            os.environ["QALOOP_KEEP_RUNS"] = old
+
+
+def test_keep_runs_cli_plumbing():
+    from qaloop.cli import build_parser
+    p = build_parser()
+    a = p.parse_args(["verify", "flows/demo-mock-ux.yaml", "--keep-runs", "5"])
+    check("verify --keep-runs parses as int", a.keep_runs == 5)
+    check("verify --keep-runs defaults to None",
+          p.parse_args(["verify", "flows/x.yaml"]).keep_runs is None)
+    w = p.parse_args(["worker", "--once", "--keep-runs", "3"])
+    check("worker --keep-runs parses as int", w.keep_runs == 3)
+    check("worker --keep-runs defaults to None",
+          p.parse_args(["worker"]).keep_runs is None)
+    check("negative --keep-runs parses (rejected later)",
+          p.parse_args(["verify", "flows/x.yaml", "--keep-runs", "-1"]).keep_runs == -1)
 
 
 if __name__ == "__main__":
