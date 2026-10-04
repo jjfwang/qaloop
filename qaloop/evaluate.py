@@ -27,6 +27,13 @@ confidence (or anything unparseable, which defaults to low) downgrades
 MAKES_SENSE to INSUFFICIENT_EVIDENCE, and high-confidence MAKES_SENSE needs
 at least 2 non-empty evidence bullets. The raw confidence is kept as
 confidence_raw in evaluation.json for audit.
+
+Before calibration, the verdict is derived from rubric scores: the judge
+scores four fixed dimensions (claim_diff_fit, evidence_exercises_claim,
+no_contradictions, state_supports_claim) 0/1/2, and _apply_rubric turns the
+scores into the verdict via fatal rules and a sum threshold — the model's
+raw verdict is advisory (except BLOCKED, which is kept as-is). The raw
+verdict is kept as verdict_raw in evaluation.json for audit.
 """
 from __future__ import annotations
 
@@ -43,6 +50,18 @@ _MAX_DIFF = 12000
 _MAX_AX = 6000
 _MAX_REPORT = 4000
 _MAX_TEXT = 1500
+
+# Rubric dimensions the judge scores 0/1/2. Fixed order: 0 = fails,
+# 1 = partial/unclear, 2 = solid. The scores drive the final verdict via
+# _apply_rubric; the model's verdict field is advisory (except BLOCKED).
+RUBRIC = {
+    "claim_diff_fit": "the diff plausibly implements the claim",
+    "evidence_exercises_claim": "the flow evidence actually exercises the"
+                                " claimed behavior (not a vacuous pass)",
+    "no_contradictions": "nothing in the evidence contradicts the claim",
+    "state_supports_claim": "the final browser state, logs, and service"
+                             " output support the claim",
+}
 
 
 def _model_config() -> dict:
@@ -165,8 +184,25 @@ Respond with a single JSON object, no prose outside it:
   "confidence": "high" | "medium" | "low",
   "rationale": "2-4 sentences: what the evidence shows and why the verdict follows",
   "evidence": ["short bullet quotes: file:line or step name -> what it shows"],
-  "risks": ["what could still be wrong or uncovered"]
+  "risks": ["what could still be wrong or uncovered"],
+  "scores": {"claim_diff_fit": 0|1|2, "evidence_exercises_claim": 0|1|2,
+             "no_contradictions": 0|1|2, "state_supports_claim": 0|1|2}
 }
+
+Rubric — score each dimension 0/1/2 (0 = fails, 1 = partial/unclear,
+2 = solid):
+- claim_diff_fit: does the diff plausibly implement the claim?
+- evidence_exercises_claim: does the flow evidence actually exercise the
+  claimed behavior, or does it pass vacuously (wrong page, mocked data
+  hiding the real path, assertions that can't fail)?
+- no_contradictions: does anything in the evidence contradict the claim
+  (error toasts, failed requests, wrong final state, log errors)?
+- state_supports_claim: do the final browser state (accessibility tree),
+  console/network output, and service logs support the claim?
+
+Score honestly: a failing dimension scores 0 even when the verdict field
+above says otherwise — the scores, not the verdict, drive the final
+verdict.
 
 Verdict guidance:
 - MAKES_SENSE: the diff implements the claim AND the flow evidence shows the
@@ -255,12 +291,59 @@ def _extract_verdict(text: str) -> dict:
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r}")
     obj["verdict"] = verdict
+    obj["verdict_raw"] = verdict  # set before any reclassification
     obj["confidence_raw"] = obj.get("confidence")
     obj["confidence"] = _normalize_confidence(obj.get("confidence"))
+    raw_scores = obj.get("scores")
+    provided = isinstance(raw_scores, dict)
+    scores = {}
+    for dim in RUBRIC:
+        v = raw_scores.get(dim) if provided else None
+        # bool is an int subclass: exclude it so true/false normalize to 0
+        scores[dim] = v if isinstance(v, int) and not isinstance(v, bool) \
+            and v in (0, 1, 2) else 0
+    obj["scores"] = scores
+    obj["_scores_provided"] = provided  # internal; stripped by _apply_rubric
     obj.setdefault("rationale", "")
     obj.setdefault("evidence", [])
     obj.setdefault("risks", [])
     return obj
+
+
+def _apply_rubric(verdict: dict) -> dict:
+    """Derive the final verdict from the rubric scores (runs before
+    calibration, so calibration sees the rubric-derived verdict).
+
+    Fatal rules: a 0 in claim_diff_fit (the diff doesn't implement the
+    claim) or in no_contradictions (the evidence contradicts the claim)
+    yields DOES_NOT_MAKE_SENSE; a 0 in evidence_exercises_claim or
+    state_supports_claim yields INSUFFICIENT_EVIDENCE. Otherwise every
+    dimension scored 1-2: a total of at least 6 of 8 yields MAKES_SENSE,
+    anything less yields INSUFFICIENT_EVIDENCE.
+
+    A raw BLOCKED verdict is kept as-is — the run produced no evidence to
+    score. When the model supplied no scores object at all there is nothing
+    to derive from, so the raw verdict stands (the all-zero normalized
+    scores are still recorded for audit). The internal _scores_provided
+    flag is stripped in every path so it never reaches evaluation.json.
+    """
+    out = dict(verdict)
+    provided = out.pop("_scores_provided", False)
+    raw = out.get("verdict_raw", out.get("verdict"))
+    if raw == "BLOCKED" or not provided:
+        return out
+    scores = out.get("scores") or {}
+    if scores.get("claim_diff_fit") == 0 \
+            or scores.get("no_contradictions") == 0:
+        out["verdict"] = "DOES_NOT_MAKE_SENSE"
+    elif scores.get("evidence_exercises_claim") == 0 \
+            or scores.get("state_supports_claim") == 0:
+        out["verdict"] = "INSUFFICIENT_EVIDENCE"
+    elif sum(scores.get(dim, 0) for dim in RUBRIC) >= 6:
+        out["verdict"] = "MAKES_SENSE"
+    else:
+        out["verdict"] = "INSUFFICIENT_EVIDENCE"
+    return out
 
 
 def evaluate(claim: str, run_dir: str, diff: str,
@@ -277,6 +360,7 @@ def evaluate(claim: str, run_dir: str, diff: str,
         {"role": "user", "content": _user_message(claim, ev)},
     ])
     verdict = _extract_verdict(text)
+    verdict = _apply_rubric(verdict)
     verdict = _calibrate_verdict(verdict)
     tin = int(usage.get("prompt_tokens") or 0)
     tout = int(usage.get("completion_tokens") or 0)
@@ -302,6 +386,12 @@ def write_evaluation(run_dir: str, claim: str, verdict: dict) -> tuple[str, str]
              f"**Claim:** {claim}", "",
              f"**Verdict:** `{verdict['verdict']}` "
              f"(confidence: {verdict.get('confidence', '?')})", ""]
+    scores = verdict.get("scores")
+    if scores:
+        lines += ["| Dimension | Score |", "| --- | --- |"]
+        for dim in RUBRIC:
+            lines += [f"| {dim} | {scores.get(dim, 0)} |"]
+        lines += [""]
     if (verdict.get("verdict") == "DOES_NOT_MAKE_SENSE"
             and verdict.get("confidence") == "low"):
         lines += ["> [!WARNING] **Low-confidence verdict:** the judge was"

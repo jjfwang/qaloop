@@ -1306,6 +1306,154 @@ def test_evaluate_does_not_make_sense_low_confidence_stays():
     tmp.cleanup()
 
 
+def _rubric_input(raw_verdict, scores):
+    """Build a verdict dict shaped like _extract_verdict output."""
+    from qaloop.evaluate import RUBRIC
+    return {"verdict": raw_verdict, "verdict_raw": raw_verdict,
+            "confidence": "high", "rationale": "r",
+            "evidence": [], "risks": [],
+            "scores": {d: scores[d] for d in RUBRIC},
+            "_scores_provided": True}
+
+
+def test_apply_rubric_fatal_rules():
+    from qaloop.evaluate import _apply_rubric, RUBRIC
+    all2 = {d: 2 for d in RUBRIC}
+    cases = [
+        ("claim_diff_fit", "DOES_NOT_MAKE_SENSE"),
+        ("no_contradictions", "DOES_NOT_MAKE_SENSE"),
+        ("evidence_exercises_claim", "INSUFFICIENT_EVIDENCE"),
+        ("state_supports_claim", "INSUFFICIENT_EVIDENCE"),
+    ]
+    for dim, want in cases:
+        s = dict(all2)
+        s[dim] = 0
+        got = _apply_rubric(_rubric_input("MAKES_SENSE", s))["verdict"]
+        check(f"rubric: 0 in {dim} -> {want}", got == want, got)
+    # a fatal zero overrides an advisory raw verdict the other way too
+    s = dict(all2)
+    s["no_contradictions"] = 0
+    got = _apply_rubric(_rubric_input("INSUFFICIENT_EVIDENCE", s))["verdict"]
+    check("rubric: fatal zero overrides advisory raw verdict",
+          got == "DOES_NOT_MAKE_SENSE", got)
+
+
+def test_apply_rubric_sum_boundary():
+    from qaloop.evaluate import _apply_rubric
+    all2 = {"claim_diff_fit": 2, "evidence_exercises_claim": 2,
+            "no_contradictions": 2, "state_supports_claim": 2}
+    got = _apply_rubric(_rubric_input("MAKES_SENSE", all2))["verdict"]
+    check("rubric: all 2s -> MAKES_SENSE", got == "MAKES_SENSE", got)
+    s = dict(all2)
+    s["claim_diff_fit"] = 1
+    s["evidence_exercises_claim"] = 1  # sum = 6
+    got = _apply_rubric(_rubric_input("MAKES_SENSE", s))["verdict"]
+    check("rubric: sum 6 -> MAKES_SENSE", got == "MAKES_SENSE", got)
+    s = dict(all2)
+    s["claim_diff_fit"] = 1
+    s["evidence_exercises_claim"] = 1
+    s["state_supports_claim"] = 1  # sum = 5
+    got = _apply_rubric(_rubric_input("MAKES_SENSE", s))["verdict"]
+    check("rubric: sum 5 -> INSUFFICIENT_EVIDENCE",
+          got == "INSUFFICIENT_EVIDENCE", got)
+    # all-2s make even an advisory DOES_NOT_MAKE_SENSE MAKES_SENSE
+    got = _apply_rubric(_rubric_input("DOES_NOT_MAKE_SENSE", all2))["verdict"]
+    check("rubric: raw verdict is advisory, scores win",
+          got == "MAKES_SENSE", got)
+
+
+def test_apply_rubric_blocked_and_no_scores():
+    from qaloop.evaluate import _apply_rubric, RUBRIC
+    zero = {d: 0 for d in RUBRIC}
+    out = _apply_rubric(_rubric_input("BLOCKED", zero))
+    check("rubric: BLOCKED with all-zero scores stays BLOCKED",
+          out["verdict"] == "BLOCKED", out["verdict"])
+    # no scores supplied: raw verdict stands, flag is stripped
+    v = _rubric_input("MAKES_SENSE", {d: 0 for d in RUBRIC})
+    v["_scores_provided"] = False
+    out = _apply_rubric(v)
+    check("rubric: no scores -> raw verdict stands",
+          out["verdict"] == "MAKES_SENSE", out["verdict"])
+    check("rubric: internal flag stripped", "_scores_provided" not in out,
+          repr(out))
+    check("rubric: flag stripped on derive path too",
+          "_scores_provided" not in _apply_rubric(
+              _rubric_input("MAKES_SENSE", zero)), "flag leaked")
+
+
+def test_evaluate_score_normalization():
+    from qaloop.evaluate import _extract_verdict, RUBRIC
+    v = _extract_verdict(
+        '{"verdict": "MAKES_SENSE", "confidence": "high",'
+        ' "scores": {"claim_diff_fit": 2, "evidence_exercises_claim": 1,'
+        ' "no_contradictions": 2, "state_supports_claim": 2}}')
+    check("valid scores kept",
+          v["scores"] == {"claim_diff_fit": 2, "evidence_exercises_claim": 1,
+                          "no_contradictions": 2, "state_supports_claim": 2},
+          repr(v["scores"]))
+    check("verdict_raw set before reclassification",
+          v["verdict_raw"] == "MAKES_SENSE", repr(v["verdict_raw"]))
+    v = _extract_verdict('{"verdict": "MAKES_SENSE"}')
+    check("missing scores -> all 0",
+          v["scores"] == {d: 0 for d in RUBRIC}, repr(v["scores"]))
+    check("verdict_raw present without scores",
+          v["verdict_raw"] == "MAKES_SENSE", repr(v["verdict_raw"]))
+    v = _extract_verdict(
+        '{"verdict": "MAKES_SENSE",'
+        ' "scores": {"claim_diff_fit": 5, "evidence_exercises_claim": "high",'
+        ' "no_contradictions": null, "state_supports_claim": true}}')
+    check("malformed scores (5, 'high', null, true) default to 0",
+          v["scores"] == {d: 0 for d in RUBRIC}, repr(v["scores"]))
+    v = _extract_verdict('{"verdict": "MAKES_SENSE", "scores": "nonsense"}')
+    check("non-dict scores -> all 0, not provided",
+          v["scores"] == {d: 0 for d in RUBRIC}
+          and v["_scores_provided"] is False, repr(v["scores"]))
+
+
+def test_evaluate_rubric_end_to_end():
+    from qaloop import evaluate as ev
+    all2 = {"claim_diff_fit": 2, "evidence_exercises_claim": 2,
+            "no_contradictions": 2, "state_supports_claim": 2}
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "solid",
+                             "evidence": ["a.py:1 -> saves",
+                                          "step load -> shows"],
+                             "risks": [], "scores": all2})
+    check("end-to-end: all-2s keeps MAKES_SENSE",
+          v["verdict"] == "MAKES_SENSE", v["verdict"])
+    check("end-to-end: verdict_raw recorded",
+          v["verdict_raw"] == "MAKES_SENSE", repr(v["verdict_raw"]))
+    check("end-to-end: scores on verdict",
+          v["scores"] == all2, repr(v["scores"]))
+    check("end-to-end: internal flag not leaked",
+          "_scores_provided" not in v, repr(v))
+    md, js = ev.write_evaluation(tmp.name, "the widget saves", v)
+    body = json.load(open(js))
+    check("evaluation.json carries scores and verdict_raw",
+          body["verdict"]["scores"] == all2
+          and body["verdict"]["verdict_raw"] == "MAKES_SENSE",
+          repr(body["verdict"].get("scores")))
+    text = open(md).read()
+    check("EVALUATION.md has dimension score table",
+          "| claim_diff_fit | 2 |" in text
+          and "| state_supports_claim | 2 |" in text, text[:400])
+    check("EVALUATION.md keeps verdict_raw out of markdown",
+          "verdict_raw" not in text, text[:400])
+    tmp.cleanup()
+    # fatal zero reclassifies end-to-end
+    s = dict(all2)
+    s["evidence_exercises_claim"] = 0
+    v, tmp = _stub_evaluate({"verdict": "MAKES_SENSE", "confidence": "high",
+                             "rationale": "shallow",
+                             "evidence": ["a.py:1 -> saves",
+                                          "step load -> shows"],
+                             "risks": [], "scores": s})
+    check("end-to-end: 0 evidence_exercises_claim -> INSUFFICIENT_EVIDENCE",
+          v["verdict"] == "INSUFFICIENT_EVIDENCE"
+          and v["verdict_raw"] == "MAKES_SENSE", v["verdict"])
+    tmp.cleanup()
+
+
 def test_investigate_extract_json():
     from qaloop.investigate import _extract_json
     check("investigate: bare json parses",
