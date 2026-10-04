@@ -305,7 +305,8 @@ def _poll_text_match(page, sel, match, deadline_s):
 
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
-                      run_dir: str = "", mock_hits: dict | None = None
+                      run_dir: str = "", mock_hits: dict | None = None,
+                      network_log: list[dict] | None = None
                       ) -> list[AssertionResult]:
     out: list[AssertionResult] = []
     t = min(step.timeout_ms or 15000, 8000)
@@ -355,6 +356,19 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     ok, detail = n >= val["gte"], f"mock_calls={n} want >={val['gte']}"
                 else:
                     ok, detail = n <= val["lte"], f"mock_calls={n} want <={val['lte']}"
+                out.append(AssertionResult(key, ok, f"{url}: {detail}"))
+            elif key == "network_calls":
+                # Assert how often the page made real network requests (issue #47).
+                # Counted against the run's network_log by substring match on the
+                # entry url; failed requests (status None) count as calls.
+                url = val["url"]
+                n = sum(1 for e in (network_log or []) if url in e.get("url", ""))
+                if "equals" in val:
+                    ok, detail = n == val["equals"], f"network_calls={n} want ={val['equals']}"
+                elif "gte" in val:
+                    ok, detail = n >= val["gte"], f"network_calls={n} want >={val['gte']}"
+                else:
+                    ok, detail = n <= val["lte"], f"network_calls={n} want <={val['lte']}"
                 out.append(AssertionResult(key, ok, f"{url}: {detail}"))
             elif key == "url_contains":
                 ok = val in page.url
@@ -515,7 +529,8 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                                 baseline_dir=baseline_dir,
                                 baseline_update=baseline_update,
                                 run_dir=run_dir,
-                                mock_hits=mock_hits)
+                                mock_hits=mock_hits,
+                                network_log=collectors.network_log)
                             failed_asserts = [a for a in sr.assertions
                                               if not a.passed]
                             if failed_asserts:
