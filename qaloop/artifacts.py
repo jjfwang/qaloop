@@ -58,6 +58,7 @@ class Collectors:
         self.page_errors: list[dict] = []
         self.failed_requests: list[dict] = []
         self.bad_responses: list[dict] = []
+        self.network_log: list[dict] = []
         self._mark = 0  # index into console_errors+page_errors for console_clean
 
     def attach(self, page) -> None:
@@ -96,12 +97,30 @@ class Collectors:
             "ts": time.time(), "method": request.method, "url": request.url[:500],
             "failure": str(failure)[:300] if failure else None,
         })
+        # A failed request produces no response event, so it gets its own
+        # network_log line: no status, no timing, failure recorded.
+        self.network_log.append({
+            "ts": time.time(), "method": request.method,
+            "url": request.url[:500], "status": None,
+            "failure": str(failure)[:300] if failure else None, "ms": None,
+        })
 
     def _on_response(self, response) -> None:
         try:
             status = response.status
         except Exception:
             return
+        try:
+            timing = response.request.timing
+            start, end = timing["requestStart"], timing["responseEnd"]
+            # Playwright uses -1 for timing phases that never happened.
+            ms = round(end - start, 1) if start >= 0 and end >= 0 else None
+        except Exception:
+            ms = None
+        self.network_log.append({
+            "ts": time.time(), "method": response.request.method,
+            "url": response.url[:500], "status": status, "ms": ms,
+        })
         if status >= 400:
             self.bad_responses.append({
                 "ts": time.time(), "method": response.request.method,

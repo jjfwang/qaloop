@@ -55,6 +55,7 @@ class RunResult:
     bad_responses: list[dict]
     run_dir: str
     error: str = ""
+    network_log: list[dict] = field(default_factory=list)
 
     @property
     def duration_ms(self) -> int:
@@ -81,6 +82,7 @@ class RunResult:
                    page_errors=d.get("page_errors", []),
                    failed_requests=d.get("failed_requests", []),
                    bad_responses=d.get("bad_responses", []),
+                   network_log=d.get("network_log", []),
                    run_dir=d.get("run_dir", ""), error=d.get("error", ""))
 
     def to_dict(self) -> dict:
@@ -112,6 +114,7 @@ class RunResult:
             "page_errors": self.page_errors,
             "failed_requests": self.failed_requests,
             "bad_responses": self.bad_responses,
+            "network_log": self.network_log,
             "run_dir": self.run_dir,
         }
 
@@ -569,6 +572,7 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         page_errors=collectors.page_errors,
                         failed_requests=collectors.failed_requests,
                         bad_responses=collectors.bad_responses,
+                        network_log=collectors.network_log,
                         run_dir=run_dir, error=run_error).to_dict())
     return RunResult(flow_name=spec.name, target=target, status=status,
                      started=started, ended=ended, steps=steps,
@@ -577,4 +581,5 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                      page_errors=collectors.page_errors,
                      failed_requests=collectors.failed_requests,
                      bad_responses=collectors.bad_responses,
+                     network_log=collectors.network_log,
                      run_dir=run_dir, error=run_error)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from xml.sax.saxutils import escape
 
 from .artifacts import save_json
@@ -123,9 +124,17 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     junit_xml_path = write_junit_xml(result, spec, os.path.join(run_dir, "junit.xml"))
+    network_jsonl_path = os.path.join(run_dir, "network.jsonl")
+    try:
+        with open(network_jsonl_path, "w", encoding="utf-8") as f:
+            for entry in result.network_log:
+                f.write(json.dumps(entry) + "\n")
+    except Exception:
+        network_jsonl_path = None  # best effort: never fail the run
     return {"run_json": os.path.join(run_dir, "run.json"),
             "report_md": report_path,
-            "junit_xml": junit_xml_path}
+            "junit_xml": junit_xml_path,
+            "network_jsonl": network_jsonl_path}
 
 
 def write_junit_xml(result: RunResult, spec: FlowSpec, path: str) -> str:
