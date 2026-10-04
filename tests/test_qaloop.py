@@ -2588,6 +2588,60 @@ def test_count_assertion_polling():
           res.detail)
 
 
+def test_js_assertion_polling():
+    # Issue #55: js routes page.evaluate output through _poll_value_match
+    # until the substring appears or the step deadline expires.
+    import time
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def make_step(script, contains, timeout_ms=None):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={},
+                    expect_items=[("js", {"script": script,
+                                         "contains": contains})],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+
+    class FakePage:
+        """evaluate() serves a fixed sequence of outputs, one per call."""
+
+        def __init__(self, outputs):
+            self._outputs = outputs
+            self.evaluate_calls = 0
+
+        def evaluate(self, script):
+            self.evaluate_calls += 1
+            return self._outputs[min(self.evaluate_calls - 1,
+                                     len(self._outputs) - 1)]
+
+    # (a) delayed flip passes with more than one evaluate call
+    page = FakePage(["stale", "stale", "READY now"])
+    res = _check_assertions(page, make_step("getState()", "READY"), None)[0]
+    check("js delayed match passes", res.passed, res.detail)
+    check("js re-read the page", page.evaluate_calls == 3,
+          f"calls={page.evaluate_calls}")
+
+    # (b) never-appearing output fails naming the final observed value,
+    # bounded by the step timeout
+    page = FakePage(["still loading"])
+    t0 = time.monotonic()
+    res = _check_assertions(page, make_step("getState()", "READY",
+                                           timeout_ms=600), None)[0]
+    elapsed = time.monotonic() - t0
+    check("js timeout fails", not res.passed, res.detail)
+    check("js timeout names final observed value",
+          res.detail == "want 'READY' in 'still loading'", res.detail)
+    check("js timeout bounded by step timeout", elapsed < 3.0,
+          f"{elapsed:.2f}s")
+
+    # (c) immediate match passes on the first evaluate
+    page = FakePage(["READY already"])
+    res = _check_assertions(page, make_step("getState()", "READY"), None)[0]
+    check("js immediate match passes on first evaluate",
+          res.passed and page.evaluate_calls == 1,
+          f"calls={page.evaluate_calls}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
