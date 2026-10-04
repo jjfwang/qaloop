@@ -180,3 +180,13 @@ and operate this control", not "this class exists in the DOM".
   `name`) so the verifier doesn't file bugs about intentional behavior.
 - Prefer `wait` with a state over `wait_ms`.
 - Keep flows to one user goal each; 5–25 steps is the sweet spot.
+
+## Run artifacts
+
+Every `verify`/`worker` run writes into `runs/<id>/`:
+
+- `run.json` — the full `RunResult` (steps, assertions, console/network errors).
+- `REPORT.md` — human-readable report card.
+- `junit.xml` — JUnit XML for CI ingestion (one `<testsuite>` per flow,
+  one `<testcase>` per step; failed steps carry a `<failure>` element with
+  the step error text, skipped steps a `<skipped/>` element).

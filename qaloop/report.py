@@ -2,10 +2,25 @@
 from __future__ import annotations
 
 import os
+import re
+from xml.sax.saxutils import escape
 
 from .artifacts import save_json
 from .runner import RunResult
 from .spec import FlowSpec
+
+# Characters illegal in XML 1.0 (surrogates, control chars other than tab/LF/CR)
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
+def _xml_text(text: str | None) -> str:
+    """Escape text for XML and strip characters illegal in XML 1.0."""
+    return escape(_ILLEGAL_XML.sub("", text or ""))
+
+
+def _xml_attr(text: str | None) -> str:
+    """Escape text for an XML attribute value (quotes too)."""
+    return escape(_ILLEGAL_XML.sub("", text or ""), {'"': "&quot;"})
 
 
 def _rel(run_dir: str, path: str | None) -> str | None:
@@ -107,8 +122,43 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
     report_path = os.path.join(run_dir, "REPORT.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    junit_xml_path = write_junit_xml(result, spec, os.path.join(run_dir, "junit.xml"))
     return {"run_json": os.path.join(run_dir, "run.json"),
-            "report_md": report_path}
+            "report_md": report_path,
+            "junit_xml": junit_xml_path}
+
+
+def write_junit_xml(result: RunResult, spec: FlowSpec, path: str) -> str:
+    """Write a JUnit XML report: one testsuite per flow, one testcase per step.
+
+    Failed steps get a <failure> element with the step error text; skipped
+    steps get a <skipped/> element. Returns the path written.
+    """
+    n_failed = sum(1 for s in result.steps if s.status == "failed")
+    n_skipped = sum(1 for s in result.steps if s.status == "skipped")
+    n_errors = 1 if result.error else 0
+    total_s = result.duration_ms / 1000.0
+    out = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (f'<testsuite name="{_xml_attr(spec.name)}" tests="{len(result.steps)}" '
+         f'failures="{n_failed}" skipped="{n_skipped}" errors="{n_errors}" '
+         f'time="{total_s:.3f}">'),
+    ]
+    for s in result.steps:
+        classname = f"{s.phase}.{s.op}" if s.op is not None else s.phase
+        tc_time = s.duration_ms / 1000.0
+        out.append(f'  <testcase name="{_xml_attr(s.name)}" '
+                   f'classname="{_xml_attr(classname)}" time="{tc_time:.3f}">')
+        if s.status == "failed":
+            err = _xml_text(s.error)
+            out.append(f'    <failure message="{err}">{err}</failure>')
+        elif s.status == "skipped":
+            out.append("    <skipped/>")
+        out.append("  </testcase>")
+    out.append("</testsuite>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return path
 
 
 def print_summary(result: RunResult) -> None:
