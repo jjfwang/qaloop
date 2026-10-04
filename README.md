@@ -16,6 +16,11 @@ The design is a hybrid:
    requests, AX snapshot at the failure point — and becomes the next
    implementer task. Loop until green or N rounds, then escalate.
 
+   A failed `screenshot_matches` comparison also leaves a diff-highlight
+   PNG in the run's `steps/` dir (`assert-<phase>-<idx>-diff.png`): the
+   actual screenshot with drifted pixels painted red, named in the
+   assertion detail. Green runs produce no diff artifacts.
+
 ```
 implementer → reviewer → verifier (qaloop) → merge
                               ↳ fail → bug report → implementer (fix round)
