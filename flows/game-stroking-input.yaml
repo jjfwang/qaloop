@@ -23,6 +23,11 @@ steps:
     expect:
       - text_contains: {selector: "#connection-state", text: "Connected — a new game session started."}
 
+  # S-02 rationale: every pointerMove while stroking emits exactly one
+  # stroke-sustain, including the move that crosses the hold threshold (start
+  # and sustain fire in the same move), so 4 moves => 4 sustains. Smooth and
+  # wobbly emit byte-identical streams; that equality is the assertion that
+  # matters (INPUT_SCHEME_SPEC §9 — no timing/precision gate), not the count.
   - name: S-02 wobbly and smooth strokes register identically (no precision gate)
     expect:
       - js:
@@ -35,7 +40,7 @@ steps:
             r.pointerMove(1); } r.pointerUp(1); return ev.join(','); };
             const smooth = run([500, 100, 100, 100]); const wobbly =
             run([600, 3000, 10, 50]); return smooth + ' | ' + wobbly; })()
-          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end | stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end"
+          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end | stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end"
 
   - name: S-03 hold below threshold never starts; at threshold starts
     expect:
