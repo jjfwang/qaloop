@@ -23,11 +23,16 @@ steps:
     expect:
       - text_contains: {selector: "#connection-state", text: "Connected — a new game session started."}
 
-  # S-02 rationale: every pointerMove while stroking emits exactly one
-  # stroke-sustain, including the move that crosses the hold threshold (start
-  # and sustain fire in the same move), so 4 moves => 4 sustains. Smooth and
-  # wobbly emit byte-identical streams; that equality is the assertion that
-  # matters (INPUT_SCHEME_SPEC §9 — no timing/precision gate), not the count.
+  # S-02 rationale (qaloop #56, supersedes #66): the run() helper models the
+  # app.js hold timer — r.update() fires before any move, exactly as
+  # apps/game-client/app.js does on pointerdown (the contract is documented
+  # in apps/game-client/wire.mjs: "app.js calls this from the hold timer so
+  # a motionless hold still begins"). Without it, the first pointerMove both
+  # starts the stroke via maybeStart() and emits a sustain, adding one
+  # phantom stroke-sustain the real client never produces. holds[0] is the
+  # hold period the timer consumes; moves happen only for holds[1:]. Smooth
+  # and wobbly emit byte-identical streams; that equality is the assertion
+  # that matters (INPUT_SCHEME_SPEC §9 — no timing/precision gate).
   - name: S-02 wobbly and smooth strokes register identically (no precision gate)
     expect:
       - js:
@@ -36,11 +41,12 @@ steps:
             location.href).href); const run = (holds) => { let t = 0; const
             ev = []; const r = w.createStrokeRecognizer({now: () => t,
             holdDurationMs: 500, onEvent: (e) => ev.push(e.type)});
-            r.pointerDown(1); for (const h of holds) { t += h;
+            r.pointerDown(1); t += holds[0]; r.update();
+            for (const h of holds.slice(1)) { t += h;
             r.pointerMove(1); } r.pointerUp(1); return ev.join(','); };
             const smooth = run([500, 100, 100, 100]); const wobbly =
             run([600, 3000, 10, 50]); return smooth + ' | ' + wobbly; })()
-          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end | stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end"
+          contains: "stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end | stroke-start,stroke-sustain,stroke-sustain,stroke-sustain,stroke-end"
 
   - name: S-03 hold below threshold never starts; at threshold starts
     expect:
