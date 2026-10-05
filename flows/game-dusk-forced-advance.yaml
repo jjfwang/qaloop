@@ -1,0 +1,282 @@
+# Flow: game-dusk-forced-advance (stoneage issue #890)
+#
+# SETUP NOTE — the real target: this flow boots the REAL stoneage-reimagined
+# game server at remote main b656de77 via `tsx src/main.ts` (the #883 dusk
+# stack plus the #891 test-only seed affordance), NOT the deterministic
+# fixture socket. ENVIRONMENT_NAME is left unset so the server runs as
+# "local" and honors DEBUG_SEED_DUSK_REFUSAL (the #891 gate).
+#
+# Server source: a scratch overlay at /home/hatch/scratch/sa-dusk-verify
+# (the stoneage checkout is never touched). Overlay recipe: cp -r the
+# checkout, then fetch from remote main b656de77 the #883/#891 file set —
+# the new dusk-*.ts / evening-ritual.ts modules (+ their .test.ts), and the
+# changed websocket.ts, sessions.ts, adjudication.ts, config.ts, world.ts,
+# tick-events.ts, emotion-presentation.ts, presentation-contracts,
+# localization-keys.ts, package.json, plus the #892 test files so
+# `tsc --noEmit` is clean. Preflight before trusting a run:
+# `npx tsc --noEmit -p tsconfig.json` in apps/game-server, then boot.
+#
+# Host page: the static game client served from apps/game-client on :8901.
+# The flow drives a RAW WebSocket from page.evaluate (the client has no
+# debug surface). Critical: the browser always sends an Origin header on
+# the WS upgrade and the server rejects non-allowlisted origins, so the
+# page origin MUST be http://127.0.0.1:8901 (== PUBLIC_CLIENT_ORIGIN /
+# ALLOWED_ORIGINS below).
+#
+# Wire observation notes (read off the overlaid websocket.ts/sessions.ts,
+# not guessed):
+# - Command-committed events (e.g. RelationshipChanged) are NOT pushed as
+#   live DELTA frames; they land in the session delta log and are observed
+#   via RESYNC_REQUEST replay from the WELCOME resume anchor.
+# - The accepted-command path sends no post-command SNAPSHOT, so the
+#   forcedAdvanceRefusalPresentation projection is observed via a
+#   RESYNC_REQUEST whose token is ahead of every committed delta
+#   (path "snapshot" fallback) at
+#   snapshot.projection.entities[pet].forcedAdvanceRefusalPresentation.
+# - isStaleCommand is strict (targetTick < session.tick => STALE), so
+#   forces target lastTick+10 (still inside the 16:48-16:53 dusk arc and
+#   far under MAX_ADJUDICATION_TICK_ADVANCE=120).
+version: 1
+name: game-dusk-forced-advance
+description: >-
+  Dusk forced-advance path (stoneage issue #890) against the real game
+  server at stoneage main b656de77: the #891 debug seed command moves the
+  session clock into the dusk arc with seeded refusal facts
+  (exhausted=true); a PET_FORCE_ADVANCE past the active refusal is
+  ACCEPTED, surfaces the pet-language explanation "exhaustion" on the
+  snapshot projection, and commits exactly one RelationshipChanged event
+  (impactType FORCED_UNSAFE_ADVANCE); a repeated force refuses again with
+  the same explanation and commits no second event (OD-P79/OD-P80).
+target: http://127.0.0.1:8901
+
+services:
+  - name: game_server
+    command: "../../node_modules/.bin/tsx src/main.ts"
+    cwd: "/home/hatch/scratch/sa-dusk-verify/apps/game-server"
+    env:
+      PORT: "3210"
+      PUBLIC_CLIENT_ORIGIN: "http://127.0.0.1:8901"
+      API_ORIGIN: "http://127.0.0.1:3210"
+      WS_ORIGIN: "ws://127.0.0.1:3210"
+      ALLOWED_ORIGINS: "http://127.0.0.1:8901"
+      RELEASE_VERSION: "0.1.0-dusk-verify"
+      PROTOCOL_VERSION: "1"
+      MIN_CLIENT_PROTOCOL_VERSION: "1"
+      MIN_COMPATIBLE_CLIENT_VERSION: "1"
+    wait: {http: "http://127.0.0.1:3210/health"}
+    timeout_s: 120
+  - name: game_client
+    command: "python3 -m http.server 8901 --bind 127.0.0.1"
+    cwd: "/home/hatch/scratch/sa-dusk-verify/apps/game-client"
+    wait: {port: 8901}
+    timeout_s: 30
+
+setup:
+  - name: open the static game client (page origin must be :8901 for the WS allowlist)
+    goto: /
+  - name: install the wire helpers (message pump, ACK/RESYNC matchers) in the page
+    seed:
+      js: |
+        (() => {
+          const S = (window.__dusk = { queue: [], resyncs: [], lastTick: 0, done: {} });
+          S.next = (pred, timeoutMs) => new Promise((resolve) => {
+            const scan = () => {
+              for (let i = 0; i < S.queue.length; i++) {
+                if (pred(S.queue[i])) return S.queue.splice(i, 1)[0];
+              }
+              return null;
+            };
+            const hit = scan();
+            if (hit) return resolve(hit);
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              const m = scan();
+              if (m) { clearInterval(iv); resolve(m); }
+              else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(null); }
+            }, 50);
+          });
+          S.nextResync = (timeoutMs) => new Promise((resolve) => {
+            const n = S.resyncs.length;
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              if (S.resyncs.length > n) { clearInterval(iv); resolve(S.resyncs[S.resyncs.length - 1]); }
+              else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(null); }
+            }, 50);
+          });
+          S.connect = () => new Promise((resolve) => {
+            const ws = new WebSocket("ws://127.0.0.1:3210/socket");
+            S.ws = ws;
+            ws.onmessage = (ev) => {
+              let m;
+              try { m = JSON.parse(ev.data); } catch (e) { return; }
+              if (m && m.kind === "RESYNC") S.resyncs.push(m);
+              else { S.queue.push(m); if (S.queue.length > 800) S.queue.shift(); }
+              if (m && typeof m.tick === "number" && m.tick > S.lastTick) S.lastTick = m.tick;
+            };
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              if (ws.readyState === 1) { clearInterval(iv); resolve(true); }
+              else if (ws.readyState > 1 || Date.now() - t0 > 10000) { clearInterval(iv); resolve(false); }
+            }, 50);
+          });
+          S.cid = (p) => p + "-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+          S.cmd = (cid, type, targetTick, payload) => JSON.stringify({
+            kind: "COMMAND", commandId: cid, commandType: type, schemaVersion: "1.0.0",
+            sessionId: S.sessionId, aggregateId: "pet-1", actorId: "player-1",
+            targetTick, payload,
+          });
+          S.resyncReq = (tick, seq) => JSON.stringify({
+            kind: "RESYNC_REQUEST", resumeToken: { tick, lastConfirmedDeltaSeq: seq },
+          });
+          S.relChanged = (deltas) => deltas.filter((d) =>
+            d.event && d.event.eventType === "RelationshipChanged" &&
+            d.event.payload && d.event.payload.impactType === "FORCED_UNSAFE_ADVANCE");
+          S.petPresentation = (resync) => {
+            const snap = resync && resync.snapshot;
+            const pet = snap && snap.projection.entities.find((e) => e.kind === "pet");
+            return (pet && pet.forcedAdvanceRefusalPresentation) || null;
+          };
+          return "helpers-installed";
+        })()
+
+steps:
+  - name: S-01 handshake — WELCOME disposition new, session id, resume anchor, opening SNAPSHOT
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__dusk;
+              if (S.done.s01) return S.done.s01;
+              const ok = await S.connect();
+              let summary = JSON.stringify({ connected: ok });
+              if (ok) {
+                S.ws.send(JSON.stringify({ kind: "HELLO", supportedProtocolVersions: ["1"],
+                  projectionSchemaVersions: ["1"], resumeToken: null,
+                  policyVersion: "presentation-contracts@1" }));
+                const w = await S.next((m) => m.kind === "WELCOME", 10000);
+                const s = await S.next((m) => m.kind === "SNAPSHOT", 10000);
+                S.sessionId = w && w.sessionId;
+                S.anchor = w && w.resumeAnchor;
+                summary = JSON.stringify({ connected: true,
+                  disposition: w && w.disposition,
+                  snapshot: !!(s && s.kind === "SNAPSHOT"),
+                  hasSession: !!(w && w.sessionId),
+                  hasAnchor: !!(w && w.resumeAnchor && typeof w.resumeAnchor.tick === "number") });
+              }
+              S.done.s01 = summary;
+              return summary;
+            })()
+          contains: '"disposition":"new"'
+
+  - name: S-02 debug seed lands the session in the dusk arc (ACK acceptingTick in dusk)
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__dusk;
+              if (S.done.s02) return S.done.s02;
+              const facts = { threatActive: false, fearHigh: false, exhausted: true,
+                distrustsGround: false, remembersBadOutcome: false };
+              const cid = S.cid("seed");
+              S.ws.send(S.cmd(cid, "DEBUG_SEED_DUSK_REFUSAL", 59400, { facts }));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 10000);
+              const snap = await S.next((m) => m.kind === "SNAPSHOT", 10000);
+              const t = ack && ack.acceptingTick;
+              const minuteOfDay = (t == null) ? -1 : Math.floor((t % 86400) / 60);
+              const isDusk = minuteOfDay >= 1008 && minuteOfDay < 1013;
+              S.duskTick = t;
+              const summary = JSON.stringify({ acceptingTick: t,
+                minuteOfDay, isDusk, snapTick: snap && snap.tick });
+              S.done.s02 = summary;
+              return summary;
+            })()
+          contains: '"isDusk":true'
+
+  # S-03: the force is ACCEPTED; the refusal presentation ("exhaustion",
+  # version "1") rides the snapshot projection; exactly one
+  # RelationshipChanged / FORCED_UNSAFE_ADVANCE is committed. The event is
+  # observed via RESYNC replay (command-committed deltas are not pushed
+  # live); the projection via the RESYNC snapshot-path fallback.
+  - name: S-03 force past the refusal — ACK, exhaustion explanation, exactly one relationship event
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__dusk;
+              if (S.done.s03) return S.done.s03;
+              const cid = S.cid("force1");
+              const target = Math.max(S.duskTick, S.lastTick) + 10;
+              S.ws.send(S.cmd(cid, "PET_FORCE_ADVANCE", target, {}));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 15000);
+              const out = { ack: !!ack, acceptingTick: ack && ack.acceptingTick,
+                targetTick: target, relChanged: -1, explanation: null, version: null };
+              if (ack) {
+                S.force1Tick = ack.acceptingTick;
+                S.ws.send(S.resyncReq(S.anchor.tick, S.anchor.lastConfirmedDeltaSeq));
+                const r1 = await S.nextResync(15000);
+                out.relChanged = r1 ? S.relChanged(r1.deltas).length : -1;
+                out.replayPath = r1 && r1.path;
+                S.ws.send(S.resyncReq(S.duskTick + 600, 0));
+                const r2 = await S.nextResync(15000);
+                const pres = S.petPresentation(r2);
+                out.explanation = pres && pres.explanation;
+                out.version = pres && pres.version;
+                out.snapshotPath = r2 && r2.path;
+              } else {
+                const n = await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+                out.nack = n && (n.disposition + "/" + n.reason);
+              }
+              const summary = JSON.stringify(out);
+              S.done.s03 = summary;
+              return summary;
+            })()
+          contains: '"relChanged":1'
+      - js:
+          script: "(() => window.__dusk.done.s03 || '{\"pending\":true}')()"
+          contains: '"explanation":"exhaustion"'
+
+  # S-04: repeat force (fresh commandId) — same explanation, no second
+  # event (OD-P79 exactly-one-event rule, state-based not persuasion-based).
+  - name: S-04 repeat force — same explanation, still exactly one relationship event
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__dusk;
+              if (S.done.s04) return S.done.s04;
+              const cid = S.cid("force2");
+              const target = Math.max(S.force1Tick, S.lastTick) + 10;
+              S.ws.send(S.cmd(cid, "PET_FORCE_ADVANCE", target, {}));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 15000);
+              const out = { ack: !!ack, acceptingTick: ack && ack.acceptingTick,
+                relChangedTotal: -1, explanation: null };
+              if (ack) {
+                S.ws.send(S.resyncReq(S.anchor.tick, S.anchor.lastConfirmedDeltaSeq));
+                const r3 = await S.nextResync(15000);
+                out.relChangedTotal = r3 ? S.relChanged(r3.deltas).length : -1;
+                S.ws.send(S.resyncReq(S.duskTick + 600, 0));
+                const r4 = await S.nextResync(15000);
+                const pres = S.petPresentation(r4);
+                out.explanation = pres && pres.explanation;
+                out.version = pres && pres.version;
+              } else {
+                const n = await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+                out.nack = n && (n.disposition + "/" + n.reason);
+              }
+              const summary = JSON.stringify(out);
+              S.done.s04 = summary;
+              return summary;
+            })()
+          contains: '"relChangedTotal":1'
+      - js:
+          script: "(() => window.__dusk.done.s04 || '{\"pending\":true}')()"
+          contains: '"explanation":"exhaustion"'
+
+teardown:
+  - name: close the scripted socket
+    seed: {js: "(() => { const s = window.__dusk; if (s && s.ws) { try { s.ws.close(); } catch (e) {} } return 'closed'; })()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 25000, run_ms: 180000}
+investigate_on_failure: true
+max_investigation_actions: 20
