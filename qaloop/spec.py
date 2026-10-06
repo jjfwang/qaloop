@@ -22,15 +22,21 @@ ACTION_OPS = {
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
     "mock",
 }
-STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry"}
+STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
+                 "on_dialog"}
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
     "mock_calls",
     "network_calls",
     "url_contains", "title_contains", "noop", "console_clean", "js",
-    "screenshot_matches", "ax",
+    "screenshot_matches", "ax", "dialog",
 }
+
+# Step-level dialog policy: what the runner does when the page raises a JS
+# dialog during the step. "dismiss" preserves Playwright's default behavior.
+DIALOG_POLICIES = {"accept", "dismiss"}
+DIALOG_TYPES = {"alert", "confirm", "prompt", "beforeunload"}
 
 
 class SpecError(ValueError):
@@ -73,6 +79,7 @@ class Step:
     timeout_ms: int | None
     raw: dict
     retry: int = 0  # extra attempts after a failure (steps phase only)
+    on_dialog: str = "dismiss"  # accept | dismiss — JS dialog policy for the step
 
 
 @dataclass
@@ -345,6 +352,23 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                 raise SpecError(f"{where}: ax.role must be an ARIA role string")
             if val.get("state", "visible") not in {"visible", "hidden", "attached"}:
                 raise SpecError(f"{where}: ax.state must be visible|hidden|attached")
+        elif key == "dialog":
+            if not isinstance(val, dict) or not val:
+                raise SpecError(
+                    f"{where}: assertion dialog needs a mapping like "
+                    f"{{type: confirm, text: 'Are you sure?'}}")
+            unknown_dk = [k for k in val if k not in {"type", "text"}]
+            if unknown_dk:
+                raise SpecError(
+                    f"{where}: dialog assertion takes only type|text, "
+                    f"got {unknown_dk}")
+            if "type" in val and val["type"] not in DIALOG_TYPES:
+                raise SpecError(
+                    f"{where}: dialog type must be "
+                    f"{'|'.join(sorted(DIALOG_TYPES))}, got {val['type']!r}")
+            if "text" in val and (not isinstance(val["text"], str)
+                                  or not val["text"]):
+                raise SpecError(f"{where}: dialog text must be a non-empty string")
     return items
 
 
@@ -369,6 +393,10 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
             f"{where}: retry > 0 is only allowed in the steps phase "
             f"(got phase '{phase}'; mocks register once, "
             f"re-registration semantics are undefined)")
+    on_dialog = raw.get("on_dialog", "dismiss")
+    if on_dialog not in DIALOG_POLICIES:
+        raise SpecError(
+            f"{where}: on_dialog must be accept|dismiss, got {on_dialog!r}")
     op_keys = [k for k in raw if k in ACTION_OPS]
     unknown = [k for k in raw if k not in ACTION_OPS and k not in STEP_META_KEYS]
     if unknown:
@@ -387,7 +415,7 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         name=name or f"{op or 'expect'} #{index}",
         op=op, params=params, expect=expect, expect_items=expect_items,
         continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
-        retry=retry, raw=raw,
+        retry=retry, on_dialog=on_dialog, raw=raw,
     )
 
 

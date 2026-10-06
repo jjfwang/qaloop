@@ -104,7 +104,8 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
              lambda e: f"{e['method']} `{e['url'][:120]}` — {e['failure']}")
     _section("Bad responses (HTTP ≥ 400)", result.bad_responses,
              lambda e: f"{e['method']} `{e['url'][:120]}` → {e['status']}")
-
+    _section("Dialogs", result.dialogs,
+             lambda e: f"{e['type']}: `{e['message'][:160]}`")
     if diagnosis:
         lines += [
             "## Investigator diagnosis",

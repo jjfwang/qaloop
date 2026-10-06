@@ -59,19 +59,50 @@ class Collectors:
         self.failed_requests: list[dict] = []
         self.bad_responses: list[dict] = []
         self.network_log: list[dict] = []
+        self.dialogs: list[dict] = []
+        # Per-step JS-dialog policy, set by the runner before each step's
+        # action ("accept" | "dismiss"; default preserves Playwright behavior).
+        self.dialog_policy: str = "dismiss"
         self._mark = 0  # index into console_errors+page_errors for console_clean
+        self._dialog_mark = 0  # index into dialogs for the dialog assertion
 
     def attach(self, page) -> None:
         page.on("console", self._on_console)
         page.on("pageerror", self._on_pageerror)
         page.on("requestfailed", self._on_requestfailed)
         page.on("response", self._on_response)
+        page.on("dialog", self._on_dialog)
 
     def checkpoint(self) -> None:
         self._mark = len(self.console_errors) + len(self.page_errors)
+        self._dialog_mark = len(self.dialogs)
 
     def errors_since_checkpoint(self) -> list[dict]:
         return (self.console_errors + self.page_errors)[self._mark:]
+
+    def dialogs_since_checkpoint(self) -> list[dict]:
+        """Dialogs raised since the step started (for the dialog assertion)."""
+        return self.dialogs[self._dialog_mark:]
+
+    def _on_dialog(self, dialog) -> None:
+        """Record the dialog, then accept or dismiss per the step's policy.
+
+        Never raises: dialog handling must not break the run.
+        """
+        try:
+            dtype, message = dialog.type, dialog.message
+        except Exception:
+            dtype, message = "unknown", ""
+        self.dialogs.append({
+            "ts": time.time(), "type": dtype, "message": (message or "")[:2000],
+        })
+        try:
+            if self.dialog_policy == "accept":
+                dialog.accept()
+            else:
+                dialog.dismiss()
+        except Exception:
+            pass
 
     def _on_console(self, msg) -> None:
         if msg.type in ("error",):
