@@ -83,6 +83,8 @@ alongside the feature. Conventions:
   screens, `ax` assertions for the user's perceivable contract.
 - Flaky UI: `retry: N` on a `steps`-phase step re-runs it up to N more times
   on failure (first success wins, no delay between attempts).
+- JS dialogs: `on_dialog: accept` (default `dismiss`) on a step sets the runner's policy for a dialog raised while the step's action runs — `accept` takes the confirm's OK path.
+- Assert the dialog itself with `expect: {dialog: {type: confirm, text: "..."}}`: `type` is `alert`|`confirm`|`prompt`|`beforeunload`, `text` a substring of the message; either may be omitted to match any dialog.
 
 ## CLI
 
