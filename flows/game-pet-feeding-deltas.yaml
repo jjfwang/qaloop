@@ -1,0 +1,433 @@
+# Flow: game-pet-feeding-deltas (stoneage issue #936)
+#
+# SETUP NOTE — the real target: this flow boots the REAL stoneage-reimagined
+# game server at remote main e701cf8c via `tsx src/main.ts` (the food-economy
+# stack: foraging need-gates, the #668 authored offer rule table, the #693
+# one-counted-care-per-hunger-episode marker), NOT the deterministic fixture
+# socket (the fixture never sends ACKs). ENVIRONMENT_NAME is left unset so
+# the server runs as "local".
+#
+# Server source: a scratch overlay at /home/hatch/scratch/sa-feed-verify
+# (the stoneage checkout is never touched). Overlay recipe: cp -a the
+# checkout, tree-verified byte-identical to remote main e701cf8c's tree
+# d56f876471ef7eea3380a637d2be4399911cd02b via the GitHub API.
+#
+# Host page: the static game client served from apps/game-client on :8901.
+# The flow drives a RAW WebSocket from page.evaluate (the client has no
+# debug surface). Critical: the browser always sends an Origin header on
+# the WS upgrade and the server rejects non-allowlisted origins, so the
+# page origin MUST be http://127.0.0.1:8901 (== PUBLIC_CLIENT_ORIGIN /
+# ALLOWED_ORIGINS below).
+#
+# Wire observation notes (read off the overlaid websocket.ts/sessions.ts,
+# world.ts, food-economy.ts, adjudication.ts — never guessed):
+# - Command envelope (apps/game-client/wire.mjs buildFeedCommand /
+#   buildForageCommand): {kind:"COMMAND", commandId, commandType,
+#   schemaVersion:"1.0.0", sessionId, aggregateId:"<sessionId>:red-tyrant",
+#   actorId:"browser-player", targetTick, payload:{actionKey, food}}.
+# - isStaleCommand is strict (targetTick < session.tick => STALE), so
+#   commands target lastTick+10 (far under MAX_ADJUDICATION_TICK_ADVANCE=120).
+#   lastTick tracks the freshest known session tick: message ticks AND ACK
+#   acceptingTicks, because each accepted command lands the clock on
+#   max(targetTick, clock.tick+1) (adjudication.ts) — chaining off stale
+#   message ticks alone goes STALE after the second command.
+# - Command-committed events are NOT pushed as live DELTA frames; they land
+#   in the session delta log and are observed via RESYNC_REQUEST replay
+#   from the WELCOME resume anchor.
+# - The committed NeedStateChanged is bands-only (Pillar 2): payload
+#   {commandId, commandType, careAction, entityId, needsBefore (bands),
+#   needsAfter (bands), bandTransitions?[{need,from,to}]}. Numeric micropoint
+#   deltas never cross the wire, so this flow asserts authored outcome
+#   paths + band landings, never numeric deltas.
+# - The safe-refusal cue rides the ACK (the #606 convention):
+#   {kind:"ACK", commandId, acceptingTick, cue:"sniffs-and-turns-away"}.
+#   The cue is NOT committed to the session log — but the declined offer
+#   still commits one NeedStateChanged (the audit trail records every
+#   adjudicated care command). The zero-recovery signal is the ABSENT
+#   bandTransitions: needsBefore == needsAfter, nothing changed.
+# - Baseline needs (world.ts BASELINE_NEEDS_POINTS, OD-P18): hunger 40 =
+#   NOTICEABLE, companionship 40 = NOTICEABLE, threat 10 / fatigue 20 /
+#   comfortDeficit 10 = SETTLED, pain 0 = SETTLED. Hunger drift (0.12
+#   pts/min max) is negligible over the flow; companionship drift is 0 in
+#   NEUTRAL, so band preconditions hold throughout.
+# - Forage need-gate (food-economy.ts forageFood): granted iff the gating
+#   need >= NOTICEABLE (hunger for emberfruit/riverroot) and stock < cap 3.
+#   At baseline both forages grant 1.
+# - #693 one-counted-care-per-hunger-episode (world.ts): after the
+#   Emberfruit accept, hunger sits at 10 pts = SETTLED, so the episode
+#   marker no-ops out and the Riverroot offer reaches the rule table ->
+#   safe-refusal.
+version: 1
+name: game-pet-feeding-deltas
+description: >-
+  Pet feeding outcome paths (stoneage issue #936) against the real game
+  server at stoneage main e701cf8c: forage emberfruit + riverroot (both
+  ACKed), feed emberfruit -> accepted with exactly one NeedStateChanged
+  (hunger NOTICEABLE->SETTLED, the authored preferred delta), feed
+  riverroot -> safe refusal with the ACK cue "sniffs-and-turns-away" and a
+  NeedStateChanged carrying no band transitions (zero recovery — the audit
+  trail records the declined offer but no need changed), then a fresh session where riverroot is the first
+  feed -> cautious accept (hunger NOTICEABLE->SETTLED, the authored
+  alternate delta). All assertions are band + ACK-cue based (Pillar 2:
+  numeric micropoints never cross the wire).
+target: http://127.0.0.1:8901
+
+services:
+  - name: game_server
+    command: "../../node_modules/.bin/tsx src/main.ts"
+    cwd: "/home/hatch/scratch/sa-feed-verify/apps/game-server"
+    env:
+      PORT: "3210"
+      PUBLIC_CLIENT_ORIGIN: "http://127.0.0.1:8901"
+      API_ORIGIN: "http://127.0.0.1:3210"
+      WS_ORIGIN: "ws://127.0.0.1:3210"
+      ALLOWED_ORIGINS: "http://127.0.0.1:8901"
+      RELEASE_VERSION: "0.1.0"
+      PROTOCOL_VERSION: "1"
+      MIN_CLIENT_PROTOCOL_VERSION: "1"
+      MIN_COMPATIBLE_CLIENT_VERSION: "1"
+    wait: {http: "http://127.0.0.1:3210/health"}
+    timeout_s: 120
+  - name: game_client
+    command: "python3 -m http.server 8901 --bind 127.0.0.1"
+    cwd: "/home/hatch/scratch/sa-feed-verify/apps/game-client"
+    wait: {port: 8901}
+    timeout_s: 30
+
+setup:
+  - name: open the static game client (page origin must be :8901 for the WS allowlist)
+    goto: /
+  - name: install the wire helpers (message pump, ACK/RESYNC matchers) in the page
+    seed:
+      js: |
+        (() => {
+          const S = (window.__feed = { queue: [], resyncs: [], lastTick: 0, done: {} });
+          S.next = (pred, timeoutMs) => new Promise((resolve) => {
+            const scan = () => {
+              for (let i = 0; i < S.queue.length; i++) {
+                if (pred(S.queue[i])) return S.queue.splice(i, 1)[0];
+              }
+              return null;
+            };
+            const hit = scan();
+            if (hit) return resolve(hit);
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              const m = scan();
+              if (m) { clearInterval(iv); resolve(m); }
+              else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(null); }
+            }, 50);
+          });
+          S.nextResync = (timeoutMs) => new Promise((resolve) => {
+            const n = S.resyncs.length;
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              if (S.resyncs.length > n) { clearInterval(iv); resolve(S.resyncs[S.resyncs.length - 1]); }
+              else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(null); }
+            }, 50);
+          });
+          S.connect = () => new Promise((resolve) => {
+            const ws = new WebSocket("ws://127.0.0.1:3210/socket");
+            S.ws = ws;
+            ws.onmessage = (ev) => {
+              let m;
+              try { m = JSON.parse(ev.data); } catch (e) { return; }
+              if (m && m.kind === "RESYNC") S.resyncs.push(m);
+              else { S.queue.push(m); if (S.queue.length > 800) S.queue.shift(); }
+              if (m && typeof m.tick === "number" && m.tick > S.lastTick) S.lastTick = m.tick;
+              // Each accepted command lands the session clock on
+              // max(targetTick, clock.tick+1) (adjudication.ts), so the
+              // freshest known tick comes from ACK acceptingTicks — the
+              // next command's targetTick chains off S.lastTick.
+              if (m && m.kind === "ACK" && typeof m.acceptingTick === "number" &&
+                  m.acceptingTick > S.lastTick) S.lastTick = m.acceptingTick;
+            };
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+              if (ws.readyState === 1) { clearInterval(iv); resolve(true); }
+              else if (ws.readyState > 1 || Date.now() - t0 > 10000) { clearInterval(iv); resolve(false); }
+            }, 50);
+          });
+          S.cid = (p) => p + "-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+          S.cmd = (cid, type, targetTick, payload) => JSON.stringify({
+            kind: "COMMAND", commandId: cid, commandType: type, schemaVersion: "1.0.0",
+            sessionId: S.sessionId, aggregateId: S.sessionId + ":red-tyrant",
+            actorId: "browser-player", targetTick, payload,
+          });
+          S.resyncReq = (tick, seq) => JSON.stringify({
+            kind: "RESYNC_REQUEST", resumeToken: { tick, lastConfirmedDeltaSeq: seq },
+          });
+          S.needChanged = (deltas, cid) => deltas.filter((d) =>
+            d.event && d.event.eventType === "NeedStateChanged" &&
+            d.event.payload && d.event.payload.commandId === cid);
+          S.hungerTransition = (deltas, cid) => {
+            const evs = S.needChanged(deltas, cid);
+            if (evs.length !== 1) return null;
+            const bt = evs[0].event.payload.bandTransitions || [];
+            const h = bt.find((t) => t.need === "hunger");
+            return h ? (h.from + "->" + h.to) : null;
+          };
+          S.petHungerBand = (snapshot) => {
+            const proj = snapshot && snapshot.projection;
+            const pet = proj && proj.entities && proj.entities.find((e) => e.kind === "pet");
+            return (pet && pet.needs && pet.needs.hunger) || null;
+          };
+          S.reset = () => {
+            if (S.ws) { try { S.ws.close(); } catch (e) {} }
+            S.queue = []; S.resyncs = []; S.lastTick = 0;
+            S.sessionId = null; S.anchor = null; S.ws = null;
+          };
+          return "helpers-installed";
+        })()
+
+steps:
+  - name: S-01 handshake — WELCOME disposition new, session id, resume anchor, opening SNAPSHOT hunger NOTICEABLE
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s01) return S.done.s01;
+              const ok = await S.connect();
+              let summary = JSON.stringify({ connected: ok });
+              if (ok) {
+                S.ws.send(JSON.stringify({ kind: "HELLO", supportedProtocolVersions: ["1"],
+                  projectionSchemaVersions: ["1"], resumeToken: null,
+                  policyVersion: "presentation-contracts@1" }));
+                const w = await S.next((m) => m.kind === "WELCOME", 10000);
+                const s = await S.next((m) => m.kind === "SNAPSHOT", 10000);
+                S.sessionId = w && w.sessionId;
+                S.anchor = w && w.resumeAnchor;
+                summary = JSON.stringify({ connected: true,
+                  disposition: w && w.disposition,
+                  snapshot: !!(s && s.kind === "SNAPSHOT"),
+                  hasSession: !!(w && w.sessionId),
+                  hasAnchor: !!(w && w.resumeAnchor && typeof w.resumeAnchor.tick === "number"),
+                  hungerBand: S.petHungerBand(s) });
+              }
+              S.done.s01 = summary;
+              return summary;
+            })()
+          contains: '"disposition":"new"'
+      - js:
+          script: "(() => window.__feed.done.s01 || '{\"pending\":true}')()"
+          contains: '"hungerBand":"NOTICEABLE"'
+
+  - name: S-02 forage emberfruit — PET_FORAGE ACKed (no NACK)
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s02) return S.done.s02;
+              const cid = S.cid("forage-ember");
+              const target = S.lastTick + 10;
+              S.ws.send(S.cmd(cid, "PET_FORAGE", target, { actionKey: "forage", food: "emberfruit" }));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 10000);
+              const nack = ack ? null : await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+              const summary = JSON.stringify({ ack: !!ack, targetTick: target,
+                nack: nack && (nack.disposition + "/" + nack.reason) });
+              S.done.s02 = summary;
+              return summary;
+            })()
+          contains: '"ack":true'
+
+  - name: S-03 forage riverroot — PET_FORAGE ACKed (no NACK)
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s03) return S.done.s03;
+              const cid = S.cid("forage-river");
+              const target = S.lastTick + 10;
+              S.ws.send(S.cmd(cid, "PET_FORAGE", target, { actionKey: "forage", food: "riverroot" }));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 10000);
+              const nack = ack ? null : await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+              const summary = JSON.stringify({ ack: !!ack, targetTick: target,
+                nack: nack && (nack.disposition + "/" + nack.reason) });
+              S.done.s03 = summary;
+              return summary;
+            })()
+          contains: '"ack":true'
+
+  # S-04: the emberfruit feed is ACCEPTED with no cue on the ACK; the
+  # RESYNC replay from the anchor shows exactly one NeedStateChanged with
+  # this commandId and the hunger NOTICEABLE->SETTLED band transition
+  # (40-30=10 pts, the authored preferred delta from baseline).
+  - name: S-04 feed emberfruit (accept) — ACK without cue, exactly one NeedStateChanged, hunger NOTICEABLE->SETTLED
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s04) return S.done.s04;
+              const cid = S.cid("feed-ember");
+              const target = S.lastTick + 10;
+              S.ws.send(S.cmd(cid, "PET_FEED", target, { actionKey: "feed", food: "emberfruit" }));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 15000);
+              const out = { ack: !!ack, targetTick: target, noCue: false,
+                needChanged: -1, hungerTransition: null, needsAfterHunger: null, replayPath: null };
+              if (ack) {
+                out.noCue = !("cue" in ack);
+                S.ws.send(S.resyncReq(S.anchor.tick, S.anchor.lastConfirmedDeltaSeq));
+                const r = await S.nextResync(15000);
+                if (r) {
+                  out.replayPath = r.path;
+                  const evs = S.needChanged(r.deltas, cid);
+                  out.needChanged = evs.length;
+                  out.hungerTransition = S.hungerTransition(r.deltas, cid);
+                  out.needsAfterHunger = evs.length === 1 ? evs[0].event.payload.needsAfter.hunger : null;
+                }
+              } else {
+                const n = await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+                out.nack = n && (n.disposition + "/" + n.reason);
+              }
+              const summary = JSON.stringify(out);
+              S.done.s04 = summary;
+              return summary;
+            })()
+          contains: '"ack":true'
+      - js:
+          script: "(() => window.__feed.done.s04 || '{\"pending\":true}')()"
+          contains: '"noCue":true'
+      - js:
+          script: "(() => window.__feed.done.s04 || '{\"pending\":true}')()"
+          contains: '"needChanged":1'
+      - js:
+          script: "(() => window.__feed.done.s04 || '{\"pending\":true}')()"
+          contains: '"hungerTransition":"NOTICEABLE->SETTLED"'
+
+  # S-05: hunger is SETTLED after S-04, so the #693 episode marker no-ops
+  # out and the riverroot offer reaches the rule table -> safe-refusal.
+  # The refusal cue rides the ACK; the declined offer commits one
+  # NeedStateChanged with NO bandTransitions (zero recovery: needsBefore ==
+  # needsAfter).
+  - name: S-05 feed riverroot (safe refusal) — ACK cue sniffs-and-turns-away, one NeedStateChanged with no band transitions, hunger still SETTLED
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s05) return S.done.s05;
+              const cid = S.cid("feed-river");
+              const target = S.lastTick + 10;
+              S.ws.send(S.cmd(cid, "PET_FEED", target, { actionKey: "feed", food: "riverroot" }));
+              const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 15000);
+              const out = { ack: !!ack, targetTick: target, cue: null,
+                needChanged: -1, noBandTransitions: false, replayPath: null,
+                hungerBand: null, snapshotPath: null };
+              if (ack) {
+                out.cue = ack.cue || null;
+                S.ws.send(S.resyncReq(S.anchor.tick, S.anchor.lastConfirmedDeltaSeq));
+                const r1 = await S.nextResync(15000);
+                if (r1) {
+                  out.replayPath = r1.path;
+                  const evs = S.needChanged(r1.deltas, cid);
+                  out.needChanged = evs.length;
+                  out.noBandTransitions = evs.length === 1 &&
+                    !("bandTransitions" in evs[0].event.payload);
+                }
+                // hunger band still SETTLED: force the snapshot path with a
+                // resume token ahead of every committed delta.
+                S.ws.send(S.resyncReq(S.lastTick + 600, 0));
+                const r2 = await S.nextResync(15000);
+                if (r2) {
+                  out.snapshotPath = r2.path;
+                  out.hungerBand = S.petHungerBand(r2.snapshot);
+                }
+              } else {
+                const n = await S.next((m) => m.kind === "NACK" && m.commandId === cid, 2000);
+                out.nack = n && (n.disposition + "/" + n.reason);
+              }
+              const summary = JSON.stringify(out);
+              S.done.s05 = summary;
+              return summary;
+            })()
+          contains: '"ack":true'
+      - js:
+          script: "(() => window.__feed.done.s05 || '{\"pending\":true}')()"
+          contains: '"cue":"sniffs-and-turns-away"'
+      - js:
+          script: "(() => window.__feed.done.s05 || '{\"pending\":true}')()"
+          contains: '"needChanged":1'
+      - js:
+          script: "(() => window.__feed.done.s05 || '{\"pending\":true}')()"
+          contains: '"noBandTransitions":true'
+      - js:
+          script: "(() => window.__feed.done.s05 || '{\"pending\":true}')()"
+          contains: '"hungerBand":"SETTLED"'
+
+  # S-06: fresh session (session isolation from the S-04/S-05 accept
+  # scenario) — riverroot is the first feed, so the rule table grants the
+  # cautious accept (40-20=20 pts, the authored alternate delta).
+  - name: S-06 fresh session, riverroot cautious-accept — ACK without cue, exactly one NeedStateChanged, hunger NOTICEABLE->SETTLED
+    expect:
+      - js:
+          script: |
+            (async () => {
+              const S = window.__feed;
+              if (S.done.s06) return S.done.s06;
+              S.reset();
+              const out = { freshSession: false, forageAck: false, ack: false,
+                noCue: false, needChanged: -1, hungerTransition: null };
+              const ok = await S.connect();
+              if (ok) {
+                S.ws.send(JSON.stringify({ kind: "HELLO", supportedProtocolVersions: ["1"],
+                  projectionSchemaVersions: ["1"], resumeToken: null,
+                  policyVersion: "presentation-contracts@1" }));
+                const w = await S.next((m) => m.kind === "WELCOME", 10000);
+                await S.next((m) => m.kind === "SNAPSHOT", 10000);
+                S.sessionId = w && w.sessionId;
+                S.anchor = w && w.resumeAnchor;
+                out.freshSession = !!(w && w.disposition === "new" && w.sessionId);
+                if (out.freshSession) {
+                  const fcid = S.cid("s6-forage");
+                  S.ws.send(S.cmd(fcid, "PET_FORAGE", S.lastTick + 10,
+                    { actionKey: "forage", food: "riverroot" }));
+                  const fack = await S.next((m) => m.kind === "ACK" && m.commandId === fcid, 10000);
+                  out.forageAck = !!fack;
+                  const cid = S.cid("s6-feed");
+                  S.ws.send(S.cmd(cid, "PET_FEED", S.lastTick + 10,
+                    { actionKey: "feed", food: "riverroot" }));
+                  const ack = await S.next((m) => m.kind === "ACK" && m.commandId === cid, 15000);
+                  out.ack = !!ack;
+                  if (ack) {
+                    out.noCue = !("cue" in ack);
+                    S.ws.send(S.resyncReq(S.anchor.tick, S.anchor.lastConfirmedDeltaSeq));
+                    const r = await S.nextResync(15000);
+                    if (r) {
+                      const evs = S.needChanged(r.deltas, cid);
+                      out.needChanged = evs.length;
+                      out.hungerTransition = S.hungerTransition(r.deltas, cid);
+                    }
+                  }
+                }
+              }
+              out.connected = ok;
+              const summary = JSON.stringify(out);
+              S.done.s06 = summary;
+              return summary;
+            })()
+          contains: '"freshSession":true'
+      - js:
+          script: "(() => window.__feed.done.s06 || '{\"pending\":true}')()"
+          contains: '"ack":true'
+      - js:
+          script: "(() => window.__feed.done.s06 || '{\"pending\":true}')()"
+          contains: '"noCue":true'
+      - js:
+          script: "(() => window.__feed.done.s06 || '{\"pending\":true}')()"
+          contains: '"needChanged":1'
+      - js:
+          script: "(() => window.__feed.done.s06 || '{\"pending\":true}')()"
+          contains: '"hungerTransition":"NOTICEABLE->SETTLED"'
+
+teardown:
+  - name: close the scripted socket
+    seed: {js: "(() => { const s = window.__feed; if (s && s.ws) { try { s.ws.close(); } catch (e) {} } return 'closed'; })()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 25000, run_ms: 180000}
+investigate_on_failure: true
+max_investigation_actions: 20
