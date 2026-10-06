@@ -3253,6 +3253,190 @@ def test_write_evaluation_critic_section():
               text2[text2.find("## Critic"):text2.find("## Critic") + 120])
 
 
+def test_dialog_support():
+    """JS dialogs: per-step accept/dismiss policy + the dialog assertion."""
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.artifacts import Collectors
+    from qaloop.runner import _dialog_matches, RunResult
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n"
+            "  - name: delete asks\n    click: '#del'\n    on_dialog: accept\n"
+            "    expect:\n      - dialog: {type: confirm, text: 'Delete?'}\n"
+            "      - hidden: '#row'\n")
+    s = load(base)
+    st = s.steps[0]
+    check("on_dialog: accept parses", st.on_dialog == "accept", st.on_dialog)
+    check("dialog assertion parses",
+          st.expect_items[0] == ("dialog", {"type": "confirm", "text": "Delete?"}),
+          str(st.expect_items[0]))
+
+    plain = base.replace("    on_dialog: accept\n", "")
+    check("on_dialog defaults to dismiss",
+          load(plain).steps[0].on_dialog == "dismiss")
+
+    for bad, label in [
+        (base.replace("on_dialog: accept", "on_dialog: maybe"), "bad policy"),
+        (base.replace("on_dialog: accept", "on_dialog: true"), "bool policy"),
+        (base.replace("dialog: {type: confirm, text: 'Delete?'}",
+                      "dialog: {}"), "empty mapping"),
+        (base.replace("dialog: {type: confirm, text: 'Delete?'}",
+                      "dialog: true"), "non-mapping"),
+        (base.replace("dialog: {type: confirm, text: 'Delete?'}",
+                      "dialog: {type: toast}"), "bad type"),
+        (base.replace("dialog: {type: confirm, text: 'Delete?'}",
+                      "dialog: {type: confirm, text: ''}"), "empty text"),
+        (base.replace("dialog: {type: confirm, text: 'Delete?'}",
+                      "dialog: {type: confirm, bogus: 1}"), "unknown key"),
+    ]:
+        try:
+            load(bad)
+            check(f"bad dialog spec rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad dialog spec rejected ({label})", True)
+
+    for good in [
+        "dialog: {type: alert}",
+        "dialog: {text: 'bye'}",
+    ]:
+        s = load(base.replace("dialog: {type: confirm, text: 'Delete?'}", good))
+        check(f"partial dialog criteria accepted ({good})",
+              s.steps[0].expect_items[0][0] == "dialog")
+
+    recs = [
+        {"type": "confirm", "message": "Delete this row?"},
+        {"type": "alert", "message": "saved"},
+    ]
+    ok, detail = _dialog_matches(recs, {"type": "confirm", "text": "Delete"})
+    check("dialog match by type+text", ok, detail)
+    ok, _ = _dialog_matches(recs, {"type": "alert"})
+    check("dialog match by type only", ok)
+    ok, _ = _dialog_matches(recs, {"text": "saved"})
+    check("dialog match by text only", ok)
+    ok, _ = _dialog_matches(recs, {})
+    check("dialog match with no criteria matches any", ok)
+    ok, detail = _dialog_matches(recs, {"type": "prompt"})
+    check("dialog type mismatch fails", not ok and "no dialog matched" in detail,
+          detail)
+    ok, detail = _dialog_matches([], {"type": "confirm"})
+    check("no dialogs fails with clear detail",
+          not ok and "no dialog appeared" in detail, detail)
+
+    class StubDialog:
+        def __init__(self, dtype="confirm", message="Sure?"):
+            self.type = dtype
+            self.message = message
+            self.calls = []
+
+        def accept(self):
+            self.calls.append("accept")
+
+        def dismiss(self):
+            self.calls.append("dismiss")
+
+    c = Collectors()
+    d = StubDialog()
+    c._on_dialog(d)
+    check("default policy dismisses",
+          d.calls == ["dismiss"] and len(c.dialogs) == 1
+          and c.dialogs[0]["type"] == "confirm"
+          and c.dialogs[0]["message"] == "Sure?",
+          str(d.calls))
+    c.dialog_policy = "accept"
+    d2 = StubDialog(dtype="prompt", message="Name?")
+    c._on_dialog(d2)
+    check("accept policy accepts", d2.calls == ["accept"], str(d2.calls))
+
+    class BoomDialog(StubDialog):
+        def accept(self):
+            raise RuntimeError("boom")
+
+    c.dialog_policy = "accept"
+    try:
+        c._on_dialog(BoomDialog())
+        check("dialog handler never raises", True)
+    except RuntimeError:
+        check("dialog handler never raises", False, "propagated")
+
+    class WeirdDialog:
+        @property
+        def type(self):
+            raise RuntimeError("no type")
+
+        @property
+        def message(self):
+            raise RuntimeError("no message")
+
+        def dismiss(self):
+            pass
+
+    c.dialog_policy = "dismiss"
+    c._on_dialog(WeirdDialog())
+    check("unreadable dialog recorded as unknown",
+          c.dialogs[-1]["type"] == "unknown", str(c.dialogs[-1]))
+
+    c2 = Collectors()
+    c2._on_dialog(StubDialog(message="first"))
+    c2.checkpoint()
+    c2._on_dialog(StubDialog(message="second"))
+    got = [r["message"] for r in c2.dialogs_since_checkpoint()]
+    check("dialogs_since_checkpoint excludes pre-checkpoint", got == ["second"],
+          str(got))
+
+    class StubPage:
+        def __init__(self):
+            self.handlers = {}
+
+        def on(self, event, fn):
+            self.handlers[event] = fn
+
+    pg = StubPage()
+    c3 = Collectors()
+    c3.attach(pg)
+    check("attach wires the dialog handler", "dialog" in pg.handlers)
+    sd = StubDialog()
+    pg.handlers["dialog"](sd)
+    check("wired handler records + dismisses",
+          sd.calls == ["dismiss"] and c3.dialogs[0]["message"] == "Sure?")
+
+    r = RunResult(flow_name="t", target="http://x", status="passed",
+                  started=0.0, ended=1.0, steps=[], failed_step=None,
+                  console_errors=[], page_errors=[], failed_requests=[],
+                  bad_responses=[], run_dir="/tmp/x",
+                  dialogs=[{"type": "alert", "message": "hi"}])
+    r2 = RunResult.from_dict(r.to_dict())
+    check("RunResult round-trips dialogs",
+          r2.dialogs == [{"type": "alert", "message": "hi"}], str(r2.dialogs))
+    r3 = RunResult.from_dict({"flow_name": "t", "status": "passed", "steps": []})
+    check("old run.json without dialogs loads", r3.dialogs == [])
+
+    # The dialog assertion branch of _check_assertions needs no live page:
+    # feed it a parsed step and pre-recorded dialogs.
+    from qaloop.runner import _check_assertions
+    spec2 = load(base)
+    col = Collectors()
+    col._on_dialog(StubDialog(dtype="confirm", message="Delete?"))
+    col.checkpoint()
+    col._on_dialog(StubDialog(dtype="confirm", message="Delete?"))
+    res = _check_assertions(None, spec2.steps[0], col)
+    check("dialog assertion passes on recorded dialog",
+          res[0].passed and res[0].name == "dialog", res[0].detail)
+    col2 = Collectors()
+    col2.checkpoint()
+    res2 = _check_assertions(None, spec2.steps[0], col2)
+    check("dialog assertion fails with no dialog",
+          not res2[0].passed and "no dialog appeared" in res2[0].detail,
+          res2[0].detail)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

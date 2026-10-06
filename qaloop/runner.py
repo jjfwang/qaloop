@@ -56,6 +56,7 @@ class RunResult:
     run_dir: str
     error: str = ""
     network_log: list[dict] = field(default_factory=list)
+    dialogs: list[dict] = field(default_factory=list)
 
     @property
     def duration_ms(self) -> int:
@@ -83,6 +84,7 @@ class RunResult:
                    failed_requests=d.get("failed_requests", []),
                    bad_responses=d.get("bad_responses", []),
                    network_log=d.get("network_log", []),
+                   dialogs=d.get("dialogs", []),
                    run_dir=d.get("run_dir", ""), error=d.get("error", ""))
 
     def to_dict(self) -> dict:
@@ -115,6 +117,7 @@ class RunResult:
             "failed_requests": self.failed_requests,
             "bad_responses": self.bad_responses,
             "network_log": self.network_log,
+            "dialogs": self.dialogs,
             "run_dir": self.run_dir,
         }
 
@@ -327,6 +330,28 @@ def _status_cmp(entry_status: int, filt: dict) -> bool:
     return entry_status <= filt["lte"]
 
 
+def _dialog_matches(dialogs: list[dict], criteria: dict) -> tuple[bool, str]:
+    """Match recorded dialogs against a `dialog:` assertion's criteria.
+
+    Pure function (no page): criteria may carry `type` (alert|confirm|prompt|
+    beforeunload) and/or `text` (substring of the dialog message). Matches
+    any dialog recorded since the step started.
+    """
+    want_type = criteria.get("type")
+    want_text = criteria.get("text")
+    for d in dialogs:
+        if want_type and d.get("type") != want_type:
+            continue
+        if want_text and want_text not in (d.get("message") or ""):
+            continue
+        return True, f"matched {d.get('type')}: {(d.get('message') or '')[:160]!r}"
+    if not dialogs:
+        return False, "no dialog appeared since the step started"
+    seen = ", ".join(
+        f"{d.get('type')}: {(d.get('message') or '')[:80]!r}" for d in dialogs[:3])
+    return False, f"no dialog matched the criteria (saw: {seen})"
+
+
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
                       run_dir: str = "", mock_hits: dict | None = None,
@@ -455,6 +480,10 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want {val['contains']!r} in {actual[:160]!r}"))
+            elif key == "dialog":
+                ok, detail = _dialog_matches(
+                    collectors.dialogs_since_checkpoint(), val)
+                out.append(AssertionResult(key, ok, detail))
             elif key == "screenshot_matches":
                 from .artifacts import screenshot_rms_diff, write_diff_image
                 baseline = val["baseline"]
@@ -576,6 +605,9 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                     # checkpoint once per step (before the attempt loop) so
                     # console_clean keeps its "since the step started" meaning.
                     collectors.checkpoint()
+                    # Per-step dialog policy: accept or dismiss JS dialogs
+                    # raised while this step's action runs.
+                    collectors.dialog_policy = step.on_dialog
                     sr = StepResult(step.index, phase, step.name, step.op,
                                     "passed", 0)
                     # retry is a steps-phase feature only (spec rejects
@@ -653,6 +685,7 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         failed_requests=collectors.failed_requests,
                         bad_responses=collectors.bad_responses,
                         network_log=collectors.network_log,
+                        dialogs=collectors.dialogs,
                         run_dir=run_dir, error=run_error).to_dict())
     return RunResult(flow_name=spec.name, target=target, status=status,
                      started=started, ended=ended, steps=steps,
@@ -662,4 +695,5 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                      failed_requests=collectors.failed_requests,
                      bad_responses=collectors.bad_responses,
                      network_log=collectors.network_log,
+                     dialogs=collectors.dialogs,
                      run_dir=run_dir, error=run_error)

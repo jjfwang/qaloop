@@ -91,7 +91,9 @@ Step meta keys: `name`, `expect`, `continue_on_fail` (default false —
 a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`),
 `retry` (default 0 — run once; integer ≥ 0; when a step fails it is re-run
 up to `retry` more times, first success wins; attempts run back-to-back
-with no delay; out of scope: cross-step retry, retrying setup-phase mocks).
+with no delay; out of scope: cross-step retry, retrying setup-phase mocks),
+`on_dialog` (`accept`|`dismiss`, default `dismiss` — what the runner does
+with a JS dialog raised while the step's action runs; see `dialog`).
 
 ### `mock` — deterministic data without a backend
 
@@ -147,6 +149,7 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `js` | `{script, contains}` — evaluate JS, polls until output contains text |
 | `screenshot_matches` | `{baseline, selector?, max_diff?}` — visual pinning (see below) |
 | `ax` | `{role, name?, state?}` — accessibility-contract assertion (see below) |
+| `dialog` | `{type?, text?}` — a JS dialog appeared since the step started (see below) |
 
 `text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, and `count`
 all poll until the value matches or the step deadline expires, because
@@ -206,6 +209,29 @@ expect:
 
 Prefer `ax` over CSS selectors when the contract is "the user can perceive
 and operate this control", not "this class exists in the DOM".
+
+### `dialog` — JS dialog assertions
+
+Without a handler Playwright silently auto-dismisses `alert()`/`confirm()`/
+`prompt()`, so a flow could pass while never noticing the dialog it was
+supposed to verify. The runner now records every dialog (type, message) and
+applies the step's `on_dialog` policy (`dismiss` by default, `accept` to take
+the affirmative path — e.g. confirming a destructive action). The `dialog`
+assertion matches against dialogs raised since the step started:
+
+```yaml
+- name: delete asks for confirmation
+  click: "#delete-row"
+  on_dialog: accept                       # take the confirm's OK path
+  expect:
+    - dialog: {type: confirm, text: "Delete this row?"}
+    - hidden: "#row-1"
+```
+
+`type` is `alert`|`confirm`|`prompt`|`beforeunload`; `text` is a substring of
+the dialog message. Either may be omitted to match any dialog. All dialogs
+are listed in the run report and `run.json` under `dialogs`. Note: `prompt()`
+is accepted with empty input — typed prompt input is out of scope.
 
 ## Conventions
 
