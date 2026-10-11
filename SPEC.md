@@ -494,6 +494,53 @@ true` is required), never silently passes. The `network_calls`
 `network_calls` still counts urls only; `request_body` is the separate
 assertion for body matching.
 
+## Flow composition: `include`
+
+A step can inline a shared fragment file instead of repeating the same
+steps across flows:
+
+```yaml
+steps:
+  - name: log in as alice
+    include: fragments/login.yaml
+    with: {user: alice, password: s3cret}
+```
+
+A fragment is a YAML mapping with a required `steps:` list and optional
+`name:`/`description:`. It carries no `setup:`, `teardown:`, `services:`,
+or `target:` — those are rejected at load time, fail-closed, so nothing
+is silently dropped.
+
+Rules:
+
+- The include path resolves **relative to the including file's
+  directory** (nested includes resolve relative to their own fragment's
+  directory — the same convention as screenshot baselines and service
+  `cwd`s). A missing fragment file is a `SpecError`.
+- An include step carries **only** `include`, `with`, and `name`
+  (`name` is documentation, ignored). Combining `include` with an action
+  op or `expect` is a `SpecError`.
+- **Cycles** (a fragment including itself, directly or through others)
+  are a `SpecError` naming the full cycle, e.g.
+  `include cycle detected: flows/a.yaml -> flows/fragments/b.yaml ->
+  flows/a.yaml`.
+- `with:` substitution is **compose-time parameter substitution from
+  `with:` only**: `${name}` and `$name` occurrences in the inlined
+  fragment steps' string values are replaced with `str(value)`
+  (`with:` keys are strings; values are str/int/float/bool scalars).
+  Longest name wins, so `${username}` does not partially match
+  `${user}`.
+- `with:` is **lexically scoped per include level**: a parent's `with`
+  does not leak into a nested include's fragment — the nested include
+  declares its own `with`. Any `${var}` not named in `with:` is left
+  untouched and goes through the flow's normal `$ENV` substitution
+  (missing var = error), exactly as before.
+- Inlined steps keep their own names and are re-indexed at the include
+  position; includes expand in `setup`, `steps`, and `teardown`.
+- Boundary: `${var}` here is load-time parameter substitution from
+  `with:` only — **runtime capture via `store` is issue #87 and out of
+  scope**. Fragments cannot see runtime values.
+
 ## Conventions
 
 - Write the spec alongside the feature; the implementer authors its own

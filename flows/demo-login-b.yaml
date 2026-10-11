@@ -1,0 +1,17 @@
+name: demo-login-b
+description: >-
+  Browser proof for issue #86 `include` composition: the same shared login
+  fragment (flows/fragments/login.yaml) inlined with bob's credentials —
+  proving `with:` substitution is per-include, not shared state.
+target: ${TARGET_URL}
+
+steps:
+  - name: log in as bob via the shared fragment
+    include: fragments/login.yaml
+    with: {user: bob, password: hunter2}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 60000, run_ms: 180000}
+investigate_on_failure: false

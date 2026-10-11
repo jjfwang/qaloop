@@ -1,0 +1,16 @@
+name: demo-login-a
+description: >-
+  Browser proof for issue #86 `include` composition: a shared login
+  fragment (flows/fragments/login.yaml) inlined with alice's credentials.
+target: ${TARGET_URL}
+
+steps:
+  - name: log in as alice via the shared fragment
+    include: fragments/login.yaml
+    with: {user: alice, password: s3cret}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 60000, run_ms: 180000}
+investigate_on_failure: false

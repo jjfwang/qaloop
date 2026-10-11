@@ -5079,6 +5079,207 @@ def test_issue_85_a11y_assertions():
           pg.eval_calls[-1][1] == ([],), str(pg.eval_calls[-1][1]))
 
 
+def test_issue_86_include():
+    """Issue #86: `include` flow composition — shared fragments.
+
+    Loader: include steps expand on the RAW step lists before _parse_steps
+    (so include/with never hit the unknown-keys guard); paths resolve
+    relative to the including file's directory; cycles are SpecErrors;
+    `with:` substitution is compose-time and lexically scoped per include
+    level; leftover ${VAR}s still go through strict env substitution (the
+    seam with issue #87's runtime store, out of scope here).
+    """
+    import tempfile
+    from qaloop.spec import load_spec, SpecError
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def write(root, rel, text):
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+
+    def rejects(path, label, needle=""):
+        try:
+            load_spec(path)
+            check(f"rejected: {label}", False)
+        except SpecError as e:
+            ok = not needle or needle in str(e)
+            check(f"rejected: {label}", ok, str(e) if not ok else "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = "name: t\ntarget: http://x\nsteps:\n"
+        # --- basic inlining order + with substitution (braced + plain) ---
+        write(tmp, "fragments/login.yaml",
+              "steps:\n"
+              "  - name: frag-one\n"
+              "    fill: {target: \"${field}\", text: \"$user\"}\n"
+              "  - name: frag-two\n"
+              "    goto: ${base}/login\n"
+              "    timeout_ms: 5000\n"
+              "  - name: frag-three\n"
+              "    expect:\n"
+              "      - visible: \"${field}\"\n")
+        write(tmp, "flow.yaml", base +
+              "  - name: before\n    expect: {noop: true}\n"
+              "  - name: include the fragment\n"
+              "    include: fragments/login.yaml\n"
+              "    with: {field: \"#user\", user: alice, base: \"http://h\"}\n"
+              "  - name: after\n    expect: {noop: true}\n")
+        spec = load_spec(os.path.join(tmp, "flow.yaml"))
+        names = [s.name for s in spec.steps]
+        check("include inlines at the include position, names kept",
+              names == ["before", "frag-one", "frag-two", "frag-three", "after"],
+              str(names))
+        check("with substitutes braced + plain forms",
+              spec.steps[1].params == {"target": "#user", "text": "alice"},
+              str(spec.steps[1].params))
+        check("with substitutes in urls",
+              spec.steps[2].params == "http://h/login",
+              str(spec.steps[2].params))
+        check("with leaves non-string values untouched",
+              spec.steps[2].timeout_ms == 5000, str(spec.steps[2].timeout_ms))
+        check("with substitutes inside list values",
+              spec.steps[3].expect_items == [("visible", "#user")],
+              str(spec.steps[3].expect_items))
+        # --- nested includes resolve relative to the fragment's own dir ---
+        write(tmp, "fragments/inner.yaml",
+              "steps:\n  - name: deep\n    expect: {noop: true}\n")
+        write(tmp, "fragments/outer.yaml",
+              "steps:\n  - name: mid\n    expect: {noop: true}\n  - include: inner.yaml\n")
+        write(tmp, "rel.yaml", base + "  - include: fragments/outer.yaml\n")
+        spec = load_spec(os.path.join(tmp, "rel.yaml"))
+        check("nested include resolves relative to the fragment's dir",
+              [s.name for s in spec.steps] == ["mid", "deep"],
+              str([s.name for s in spec.steps]))
+        # --- nested with: inner level uses its own with ---
+        write(tmp, "c.yaml",
+              "name: c\nsteps:\n"
+              "  - name: inner\n"
+              "    fill: {target: \"#x\", text: \"${v} and ${w}\"}\n")
+        write(tmp, "b.yaml",
+              "name: b\nsteps:\n"
+              "  - name: middle\n"
+              "    fill: {target: \"#m\", text: \"${v}\"}\n"
+              "  - include: c.yaml\n"
+              "    with: {v: inner, w: deep}\n")
+        write(tmp, "n.yaml", base +
+              "  - include: b.yaml\n    with: {v: outer}\n")
+        spec = load_spec(os.path.join(tmp, "n.yaml"))
+        texts = [s.params["text"] for s in spec.steps]
+        check("nested with is lexically scoped per include level",
+              texts == ["outer", "inner and deep"], str(texts))
+        # --- parent with does NOT leak into a nested include ---
+        write(tmp, "c2.yaml",
+              "name: c2\nsteps:\n"
+              "  - name: inner-no-with\n"
+              "    fill: {target: \"#x\", text: \"v=${v}\"}\n")
+        write(tmp, "b2.yaml",
+              "name: b2\nsteps:\n  - include: c2.yaml\n")
+        write(tmp, "n2.yaml", base +
+              "  - include: b2.yaml\n    with: {v: outer}\n")
+        os.environ.pop("v", None)
+        os.environ.pop("V", None)
+        rejects(os.path.join(tmp, "n2.yaml"),
+                "parent with does not leak into nested include",
+                "env var $v is not set")
+        # --- cycles ---
+        write(tmp, "self.yaml",
+              "name: t\ntarget: http://x\nsteps:\n  - include: self.yaml\n")
+        rejects(os.path.join(tmp, "self.yaml"),
+                "self-include cycle", "include cycle detected")
+        write(tmp, "a.yaml",
+              "name: t\ntarget: http://x\nsteps:\n  - include: b3.yaml\n")
+        write(tmp, "b3.yaml",
+              "name: b3\nsteps:\n  - include: a.yaml\n")
+        rejects(os.path.join(tmp, "a.yaml"),
+                "A->B->A cycle", "include cycle detected")
+        # --- include-step validation ---
+        write(tmp, "fragments/ok.yaml",
+              "steps:\n  - name: ok\n    expect: {noop: true}\n")
+        inc_cases = [
+            ("with not a mapping",
+             "  - include: fragments/ok.yaml\n    with: [1]\n",
+             "`with` must be a mapping"),
+            ("with keys must be strings",
+             "  - include: fragments/ok.yaml\n    with: {1: x}\n",
+             "`with` keys must be strings"),
+            ("with values must be scalars",
+             "  - include: fragments/ok.yaml\n    with: {a: [1]}\n",
+             "`with` values must be scalars"),
+            ("unknown extra key on include step",
+             "  - include: fragments/ok.yaml\n    timeout_ms: 5\n",
+             "include takes only"),
+            ("include + action op",
+             "  - include: fragments/ok.yaml\n    click: \"#x\"\n",
+             "include takes only"),
+            ("include + expect",
+             "  - include: fragments/ok.yaml\n    expect: {noop: true}\n",
+             "include takes only"),
+            ("include not a string",
+             "  - include: 42\n", "`include` must be a non-empty string"),
+            ("missing fragment file",
+             "  - include: fragments/nope.yaml\n", "fragment file not found"),
+        ]
+        for label, block, needle in inc_cases:
+            write(tmp, "e.yaml", base + block)
+            rejects(os.path.join(tmp, "e.yaml"), label, needle)
+        # --- fragment-file validation ---
+        frag_cases = [
+            ("fragment with setup rejected",
+             "name: f\nsetup:\n  - expect: {noop: true}\nsteps:\n  - expect: {noop: true}\n",
+             "fragment allows only"),
+            ("fragment must be a mapping",
+             "- just\n- a\n- list\n", "fragment must be a YAML mapping"),
+            ("fragment steps must be a list",
+             "name: f\nsteps: {a: 1}\n", "fragment `steps` must be a list"),
+        ]
+        for label, ftext, needle in frag_cases:
+            write(tmp, "fragments/bad.yaml", ftext)
+            write(tmp, "e2.yaml", base + "  - include: fragments/bad.yaml\n")
+            rejects(os.path.join(tmp, "e2.yaml"), label, needle)
+        # --- ${ENV} leftovers still go through envsubst (the #87 seam) ---
+        os.environ["ISSUE_86_PROBE"] = "from-env"
+        try:
+            write(tmp, "fragments/env.yaml",
+                  "steps:\n"
+                  "  - name: env\n"
+                  "    fill: {target: \"#e\", text: \"${ISSUE_86_PROBE}\"}\n")
+            write(tmp, "env.yaml", base + "  - include: fragments/env.yaml\n")
+            spec = load_spec(os.path.join(tmp, "env.yaml"))
+            check("leftover ${VAR} envsubst'd from the environment",
+                  spec.steps[0].params["text"] == "from-env",
+                  str(spec.steps[0].params))
+        finally:
+            del os.environ["ISSUE_86_PROBE"]
+        # --- longest-name-first: ${username} wins over ${user} ---
+        write(tmp, "fragments/names.yaml",
+              "steps:\n"
+              "  - name: n\n"
+              "    fill: {target: \"#u\", text: \"${username}/${user}\"}\n")
+        write(tmp, "names.yaml", base +
+              "  - include: fragments/names.yaml\n"
+              "    with: {user: alice, username: alice2}\n")
+        spec = load_spec(os.path.join(tmp, "names.yaml"))
+        check("longest with-name wins",
+              spec.steps[0].params["text"] == "alice2/alice",
+              str(spec.steps[0].params))
+        # --- the shipped demo flows load through load_spec ---
+        for flow, user, pw in (("flows/demo-login-a.yaml", "alice", "s3cret"),
+                               ("flows/demo-login-b.yaml", "bob", "hunter2")):
+            spec = load_spec(os.path.join(repo, flow), strict_env=False)
+            check(f"{flow} inlines 4 fragment steps",
+                  len(spec.steps) == 4, str(len(spec.steps)))
+            fills = [s.params["text"] for s in spec.steps if s.op == "fill"]
+            check(f"{flow} with-substituted for {user}",
+                  fills == [user, pw], str(fills))
+            items = dict(spec.steps[3].expect_items)
+            check(f"{flow} welcome assertion carries the user",
+                  items.get("text_contains", {}).get("text")
+                  == f"Welcome, {user}", str(items))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

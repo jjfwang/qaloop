@@ -190,6 +190,131 @@ def load_services_light(path: str) -> tuple[str, list[dict]]:
     return name, _validate_services(raw.get("services"), where)
 
 
+# Issue #86: include-step composition. Keys an include step may carry
+# (`name` is allowed as documentation and ignored); everything else is
+# rejected so nothing about the inlining is ambiguous.
+_INCLUDE_STEP_KEYS = {"include", "with", "name"}
+# Keys a fragment file may carry. setup/teardown/services/target are
+# rejected fail-closed: a fragment is a step list, and anything else
+# would be silently dropped.
+_FRAGMENT_KEYS = {"name", "description", "steps"}
+# Allowed `with:` value types: scalars only, stringified at compose time.
+_WITH_SCALARS = (str, int, float, bool)
+
+
+def _substitute_with(value: Any, with_map: dict[str, str], where: str) -> Any:
+    """Substitute ${name} / $name in string values from the include `with:` map.
+
+    Only names present in with_map are substituted (longest name first, so
+    ${username} wins over ${user}). Anything else is left untouched so the
+    later envsubst pass treats it as an environment variable, exactly as
+    today — this is the seam with issue #87 (runtime capture via store),
+    which is explicitly out of scope here: this substitution is
+    compose-time only and never touches runtime interpolation.
+    """
+    if not with_map:
+        return value
+    alt = "|".join(re.escape(n) for n in sorted(with_map, key=len, reverse=True))
+    pat = re.compile(r"\$(?:\{(" + alt + r")\}|(" + alt + r"))")
+
+    def repl(m: "re.Match[str]") -> str:
+        return with_map[m.group(1) or m.group(2)]
+
+    if isinstance(value, str):
+        return pat.sub(repl, value)
+    if isinstance(value, dict):
+        return {k: _substitute_with(v, with_map, where) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute_with(v, with_map, where) for v in value]
+    return value
+
+
+def _resolve_includes(raw_steps: Any, including_path: str,
+                      stack: tuple[str, ...], depth: int = 0) -> list:
+    """Expand include steps in a RAW step list (before _parse_steps).
+
+    Returns a flat list of (step, depth) pairs: `depth` is the number of
+    include levels the step has passed through (0 = the flow's own steps).
+    A parent include's `with:` substitution is applied only to the
+    fragment's own steps (depth+1), never to steps from a nested include
+    (deeper) — lexical scoping per include level. load_spec flattens the
+    pairs after the substitution pass.
+    """
+    if not isinstance(raw_steps, list):
+        return raw_steps  # not a list: _parse_steps raises the real error
+    out: list = []
+    base_dir = os.path.dirname(os.path.abspath(including_path))
+    for i, step in enumerate(raw_steps):
+        if not isinstance(step, dict) or "include" not in step:
+            out.append((step, depth))
+            continue
+        where = f"include step {i} in {including_path}"
+        extra = [k for k in step if k not in _INCLUDE_STEP_KEYS]
+        if extra:
+            raise SpecError(
+                f"{where}: include takes only include|with|name, got {extra} "
+                f"(include cannot be combined with an action op or expect)")
+        inc = step.get("include")
+        if not isinstance(inc, str) or not inc:
+            raise SpecError(
+                f"{where}: `include` must be a non-empty string, got {inc!r}")
+        with_map = step.get("with") or {}
+        if not isinstance(with_map, dict):
+            raise SpecError(
+                f"{where}: `with` must be a mapping, got "
+                f"{type(with_map).__name__}")
+        bad_wk = [k for k in with_map if not isinstance(k, str)]
+        if bad_wk:
+            raise SpecError(
+                f"{where}: `with` keys must be strings, got {bad_wk}")
+        bad_wv = [(k, v) for k, v in with_map.items()
+                  if not isinstance(v, _WITH_SCALARS)]
+        if bad_wv:
+            raise SpecError(
+                f"{where}: `with` values must be scalars (str/int/float/bool), "
+                f"got {bad_wv}")
+        # Resolve relative to the INCLUDING file's directory (same
+        # convention as screenshot baselines and service cwds).
+        frag_path = os.path.normpath(os.path.join(base_dir, inc))
+        frag_abs = os.path.abspath(frag_path)
+        if frag_abs in stack:
+            cycle = " -> ".join(os.path.relpath(p) for p in
+                                list(stack) + [frag_abs])
+            raise SpecError(f"include cycle detected: {cycle}")
+        if not os.path.isfile(frag_abs):
+            raise SpecError(
+                f"{where}: fragment file not found: {frag_abs}")
+        with open(frag_abs, encoding="utf-8") as f:
+            frag = yaml.safe_load(f)
+        fwhere = f"fragment {frag_abs}"
+        if not isinstance(frag, dict):
+            raise SpecError(f"{fwhere}: fragment must be a YAML mapping")
+        fextra = [k for k in frag if k not in _FRAGMENT_KEYS]
+        if fextra:
+            raise SpecError(
+                f"{fwhere}: fragment allows only name|description|steps, "
+                f"got {fextra} (setup/teardown/services/target are not "
+                f"supported in fragments)")
+        fsteps = frag.get("steps")
+        if not isinstance(fsteps, list):
+            raise SpecError(
+                f"{fwhere}: fragment `steps` must be a list of steps")
+        resolved = _resolve_includes(fsteps, frag_abs, stack + (frag_abs,),
+                                     depth + 1)
+        str_map = {k: str(v) for k, v in with_map.items()}
+        for s, d in resolved:
+            out.append((_substitute_with(s, str_map, where)
+                        if d == depth + 1 else s, d))
+    return out
+
+
+def _flatten_includes(resolved: list) -> list:
+    """Drop the depth tags from _resolve_includes output."""
+    if not isinstance(resolved, list):
+        return resolved
+    return [s for s, _ in resolved]
+
+
 def _validate_op_params(op: str | None, params: Any, where: str) -> None:
     if op is None:
         return
@@ -721,15 +846,26 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     if not isinstance(record_bodies, bool):
         raise SpecError(
             f"{where}: record_bodies must be a bool, got {record_bodies!r}")
+    # Issue #86: expand include steps on the RAW step lists, before
+    # _parse_steps — so include/with entries never reach _parse_step's
+    # unknown-keys guard, and any ${var} the with: map did not substitute
+    # is still envsubst'd (strict) like today.
+    abs_path = os.path.abspath(path)
+    setup_raw = _flatten_includes(
+        _resolve_includes(raw.get("setup"), path, (abs_path,)))
+    steps_raw = _flatten_includes(
+        _resolve_includes(raw.get("steps"), path, (abs_path,)))
+    teardown_raw = _flatten_includes(
+        _resolve_includes(raw.get("teardown"), path, (abs_path,)))
     return FlowSpec(
         name=name,
         description=str(raw.get("description") or ""),
         target=target,
         viewport={"width": int(viewport.get("width", 1280)),
                   "height": int(viewport.get("height", 800))},
-        setup=_parse_steps(raw.get("setup"), "setup", default_step_ms, strict_env),
-        steps=_parse_steps(raw.get("steps"), "steps", default_step_ms, strict_env),
-        teardown=_parse_steps(raw.get("teardown"), "teardown", default_step_ms, strict_env),
+        setup=_parse_steps(setup_raw, "setup", default_step_ms, strict_env),
+        steps=_parse_steps(steps_raw, "steps", default_step_ms, strict_env),
+        teardown=_parse_steps(teardown_raw, "teardown", default_step_ms, strict_env),
         artifacts=artifacts,
         timeouts={k: int(v) for k, v in timeouts.items()},
         investigate_on_failure=bool(raw.get("investigate_on_failure", True)),
