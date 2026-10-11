@@ -453,6 +453,48 @@ def _dialog_matches(dialogs: list[dict], criteria: dict) -> tuple[bool, str]:
     return False, f"no dialog matched the criteria (saw: {seen})"
 
 
+# Issue #84: single fixed `page.evaluate` read for the `perf` assertion.
+# Returns {lcp_ms, cls, inp_ms} as numbers or null:
+# - LCP: last largest-contentful-paint entry's renderTime || startTime,
+#   null when no such entry was recorded. Read via a short-lived
+#   PerformanceObserver with buffered:true: headless-shell delivers LCP
+#   entries to observers but does not retain them in the queryable
+#   getEntriesByType buffer.
+# - CLS: sum of layout-shift entry values where !hadRecentInput; 0 when
+#   none recorded — that is a real reading, not missing data.
+# - INP: max duration of `first-input` entries with an interactionId,
+#   null when none (no real interaction happened yet). Headless-shell
+#   only records `event` timing entries for an observer registered
+#   before the interaction, which an assertion cannot install after the
+#   fact; first-input entries are buffered and carry the same
+#   interactionId/duration shape, so INP is approximated from the first
+#   interaction (documented limitation, see SPEC.md).
+_PERF_VITALS_SCRIPT = """(async () => {
+  const lcpEntries = await new Promise((resolve) => {
+    const seen = [];
+    let obs = null;
+    try {
+      obs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) seen.push(e);
+      });
+      obs.observe({type: 'largest-contentful-paint', buffered: true});
+    } catch (err) { /* entry type unsupported: lcp stays null */ }
+    setTimeout(() => { if (obs) obs.disconnect(); resolve(seen); }, 60);
+  });
+  let lcp = null;
+  for (const e of lcpEntries) lcp = e.renderTime || e.startTime;
+  let cls = 0;
+  for (const e of performance.getEntriesByType('layout-shift')) {
+    if (!e.hadRecentInput) cls += e.value;
+  }
+  let inp = null;
+  for (const e of performance.getEntriesByType('first-input')) {
+    if (e.interactionId) inp = inp === null ? e.duration : Math.max(inp, e.duration);
+  }
+  return {lcp_ms: lcp, cls: cls, inp_ms: inp};
+})()"""
+
+
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
                       run_dir: str = "", mock_hits: dict | None = None,
@@ -683,6 +725,29 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                                         f"set record_bodies: true to record "
                                         f"request bodies")
                 out.append(AssertionResult(key, ok, detail))
+            elif key == "perf":
+                # Assert Web Vitals performance budgets (issue #84). One
+                # fixed page.evaluate read per poll iteration returns all
+                # metrics; each requested metric is polled via
+                # _poll_value_match until a non-null reading is at or below
+                # its lte budget. Fail-closed: a null reading (no LCP entry
+                # recorded, no interaction yet for INP) never satisfies the
+                # budget. Failure detail names the final observed value,
+                # not a re-read after the poll.
+                def read_vitals():
+                    return page.evaluate(_PERF_VITALS_SCRIPT) or {}
+                ok_all = True
+                parts = []
+                deadline = time.monotonic() + t / 1000.0
+                for metric, budget in val.items():
+                    limit = budget["lte"]
+                    ok, actual = _poll_value_match(
+                        lambda m=metric: read_vitals().get(m),
+                        lambda a, lim=limit: a is not None and a <= lim,
+                        deadline)
+                    parts.append(f"{metric}={actual!r} want <={limit}")
+                    ok_all = ok_all and ok
+                out.append(AssertionResult(key, ok_all, "; ".join(parts)))
             elif key == "url_contains":
                 # Poll page.url until the substring appears or the step
                 # deadline expires (issue #51); detail names the final

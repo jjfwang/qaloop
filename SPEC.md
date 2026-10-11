@@ -240,9 +240,10 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `focused` | `{selector}` — `document.activeElement` is the element |
 | `cookie` | `{name, equals: v}` / `{name, contains: s}` / `{name}` — cookie value, or presence (see below) |
 | `storage` | `{kind: local|session, key, equals?: v}` — web-storage value, or presence (see below) |
+| `perf` | `{lcp_ms: {lte: n}, cls: {lte: n}, inp_ms: {lte: n}}` — Web Vitals performance budgets in ms (LCP, INP) / shift score (CLS) (see below) |
 
 `text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, `count`,
-`attribute`, `value`, `focused`, `cookie`, and `storage`
+`attribute`, `value`, `focused`, `cookie`, `storage`, and `perf`
 all poll until the value matches or the step deadline expires, because
 async-rendered state races a one-shot read: element text is re-read via
 `text_content` (after `wait_for_selector` attaches), `page.url` /
@@ -251,8 +252,9 @@ re-read directly, locator `count()` is re-read
 against the comparator (`equals` > `gte` > `lte`), the attribute is re-read via
 `get_attribute`, the input value via `input_value`, and focus via
 `document.activeElement === el` (Playwright has no `is_focused()`), the cookie
-list via `context.cookies()`, and the storage value via a `page.evaluate` read
-of `getItem`, every 0.15s against
+list via `context.cookies()`, the storage value via a `page.evaluate` read
+of `getItem`, and the Web Vitals metrics via a fixed `page.evaluate` read of
+the Performance API, every 0.15s against
 `min(step.timeout_ms or 15000, 8000)`. On timeout the failure detail names the
 final observed value, not the desired value alone.
 
@@ -376,6 +378,57 @@ detail names the final observed value (e.g. `cookie 'session'=None want
 ='abc123'`); the key is passed to `page.evaluate` as an argument, never
 interpolated into the script. Storage reads the main page, not the
 step's `frame:` scope: storage is keyed on the page origin.
+
+### Web Vitals performance budgets — `perf`
+
+Asserts that the page's Web Vitals metrics stay under the given budgets,
+for contracts like "the hero image renders within the LCP budget" or
+"the CTA responds within the INP budget":
+
+```yaml
+expect:
+  - perf: {lcp_ms: {lte: 2500}, cls: {lte: 0.1}, inp_ms: {lte: 500}}
+```
+
+Supported metrics: `lcp_ms` (Largest Contentful Paint, ms), `cls`
+(Cumulative Layout Shift, shift score), `inp_ms` (Interaction to Next
+Paint, ms). Each metric takes exactly `{lte: N}` — budgets are upper
+bounds, so `gte`/`equals` are rejected, and `N` must be a non-negative
+number. At least one metric is required.
+
+The runner measures via one fixed `page.evaluate` read of the
+Performance API per poll iteration, returning all three metrics at once:
+LCP is the last `largest-contentful-paint` entry's `renderTime ||
+startTime` (`null` when no such entry was recorded); CLS is the sum of
+`layout-shift` entry values with `!hadRecentInput` (`0` when none
+recorded — a real reading); INP is the max `duration` of `first-input`
+entries with an `interactionId` (`null` when none, i.e. no real
+interaction happened yet). Two headless-shell realities shape this
+read: LCP entries are delivered to observers but not retained in the
+queryable `getEntriesByType` buffer, so the read collects them with a
+short-lived `PerformanceObserver` (`buffered: true`); and `event`
+timing entries are only recorded for an observer registered *before*
+the interaction — which an assertion cannot install after the fact —
+so INP is approximated from the buffered `first-input` entry instead
+of the full interaction set (documented limitation: `inp_ms` reflects
+the first interaction, not the worst over the page lifetime). Each
+requested metric is polled every 0.15s until a non-`null` reading is at
+or below its budget or the step deadline expires, because LCP/CLS/INP
+entries land asynchronously.
+Fail-closed on missing data: a `null` reading never satisfies the
+budget — an assertion on `inp_ms` fails on a page nobody interacted
+with rather than passing vacuously. The failure detail names the final
+observed value per metric (e.g. `lcp_ms=3200.5 want <=2500;
+cls=0.0 want <=0.1`).
+
+Note: `event` performance entries (the textbook INP source) are only
+recorded for real user interactions seen by an observer registered
+*before* the interaction. A demo page that asserts `inp_ms` must
+therefore drive a real interaction (e.g. click a control) and give the
+handler real work to do (a trivial handler may not even produce a
+measurable entry); the assertion then reads the buffered `first-input`
+entry for that interaction. Page level: reads the main page, not the
+step's `frame:` scope.
 
 ### Request bodies — `request_body`
 

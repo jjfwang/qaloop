@@ -4844,6 +4844,107 @@ def test_request_body_issue_83():
           r.passed, r.detail)
 
 
+def test_issue_84_perf_assertions():
+    """Issue #84: Web Vitals perf assertion.
+
+    Validation: perf needs a non-empty mapping of metric (lcp_ms, cls,
+    inp_ms) to exactly {lte: non-negative number}; gte/equals, unknown
+    metrics, bool/string/negative budgets, and empty mappings are
+    rejected. Runner: one fixed page.evaluate read per poll iteration;
+    each metric polls until a non-null reading is <= its budget;
+    fail-closed on null; failure detail names the final observed value.
+    """
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step, SpecError, _validate_expect
+
+    def rejects(expect, label):
+        try:
+            _validate_expect(expect, "steps[0]")
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+
+    good = {"perf": {"lcp_ms": {"lte": 2500}, "cls": {"lte": 0.1},
+                       "inp_ms": {"lte": 500}}}
+    check("perf valid mapping accepted",
+          _validate_expect(good, "steps[0]") == [("perf", good["perf"])])
+    rejects({"perf": {}}, "perf empty mapping rejected")
+    rejects({"perf": "fast"}, "perf non-mapping rejected")
+    rejects({"perf": {"fcp_ms": {"lte": 1}}}, "perf unknown metric rejected")
+    rejects({"perf": {"lcp_ms": {}}}, "perf missing lte rejected")
+    rejects({"perf": {"lcp_ms": {"gte": 1}}}, "perf gte rejected")
+    rejects({"perf": {"lcp_ms": {"equals": 1}}}, "perf equals rejected")
+    rejects({"perf": {"lcp_ms": {"lte": 1, "gte": 0}}},
+            "perf two comparators rejected")
+    rejects({"perf": {"lcp_ms": 2500}}, "perf bare number rejected")
+    rejects({"perf": {"lcp_ms": {"lte": -1}}}, "perf negative budget rejected")
+    rejects({"perf": {"cls": {"lte": True}}}, "perf bool budget rejected")
+    rejects({"perf": {"inp_ms": {"lte": "500"}}},
+            "perf string budget rejected")
+    check("perf float budget accepted",
+          _validate_expect({"perf": {"cls": {"lte": 0.05}}}, "steps[0]")
+          == [("perf", {"cls": {"lte": 0.05}})])
+
+    class FakePage:
+        def __init__(self, seq):
+            self.seq = seq
+            self.reads = 0
+            self.scripts = []
+        def evaluate(self, script):
+            self.scripts.append(script)
+            n = self.reads
+            self.reads += 1
+            return self.seq[min(n, len(self.seq) - 1)]
+
+    def run(perf_params, seq, timeout_ms=5000):
+        step = Step(index=0, phase="steps", name="e", op=None, params=None,
+                    expect={}, expect_items=[("perf", perf_params)],
+                    continue_on_fail=False, timeout_ms=timeout_ms,
+                    frame=None, raw={})
+        return _check_assertions(FakePage(seq), step, None)
+
+    params = {"lcp_ms": {"lte": 2500}, "cls": {"lte": 0.1},
+              "inp_ms": {"lte": 500}}
+    res = run(params, [{"lcp_ms": 120.5, "cls": 0.0, "inp_ms": 136.2}])
+    check("perf all budgets met passes", res[0].passed, res[0].detail)
+    check("perf detail names each observed value",
+          "lcp_ms=120.5" in res[0].detail and "cls=0.0" in res[0].detail
+          and "inp_ms=136.2" in res[0].detail, res[0].detail)
+    # lcp violation: FAIL, detail names the observed value
+    res = run(params, [{"lcp_ms": 3200.0, "cls": 0.0, "inp_ms": 100.0}],
+              timeout_ms=300)
+    check("perf lcp violation fails", not res[0].passed, res[0].detail)
+    check("perf violation detail names observed value",
+          "lcp_ms=3200.0" in res[0].detail
+          and "want <=2500" in res[0].detail, res[0].detail)
+    # null metric never satisfies the budget (fail-closed)
+    res = run(params, [{"lcp_ms": 100.0, "cls": 0.0, "inp_ms": None}],
+              timeout_ms=300)
+    check("perf null metric fails closed", not res[0].passed, res[0].detail)
+    check("perf null detail shows None",
+          "inp_ms=None" in res[0].detail, res[0].detail)
+    # cls may be exactly 0: a real reading, passes
+    res = run({"cls": {"lte": 0.1}}, [{"lcp_ms": None, "cls": 0,
+                                      "inp_ms": None}])
+    check("perf cls zero passes", res[0].passed, res[0].detail)
+    # async settling: successive reads converge below the budget
+    res = run(params, [{"lcp_ms": None, "cls": 0.0, "inp_ms": None},
+                       {"lcp_ms": 9000.0, "cls": 0.0, "inp_ms": None},
+                       {"lcp_ms": 800.0, "cls": 0.0, "inp_ms": 120.0}])
+    check("perf polls until readings settle", res[0].passed, res[0].detail)
+    # single evaluate read per poll iteration, no interpolation
+    pg = FakePage([{"lcp_ms": 1.0, "cls": 0.0, "inp_ms": 1.0}])
+    step = Step(index=0, phase="steps", name="e", op=None, params=None,
+                expect={}, expect_items=[("perf", params)],
+                continue_on_fail=False, timeout_ms=5000,
+                frame=None, raw={})
+    _check_assertions(pg, step, None)
+    check("perf uses one fixed script for every read",
+          len(pg.scripts) == 3 and len(set(pg.scripts)) == 1
+          and "largest-contentful-paint" in pg.scripts[0]
+          and "first-input" in pg.scripts[0], str(len(pg.scripts)))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
