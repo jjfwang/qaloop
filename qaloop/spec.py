@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from itertools import product as _cartesian_product
 from typing import Any
 
 import yaml
@@ -118,6 +119,9 @@ class FlowSpec:
     max_investigation_actions: int
     source_path: str
     services: list[dict] = field(default_factory=list)
+    matrix: list[dict] = field(default_factory=list)  # issue #88 —
+    # data-driven combinations: each dict is one combination's variable
+    # map, expanded from the `matrix:` block by _validate_matrix
     # Issue #83: opt-in request-body recording. Default False keeps the
     # network_log schema and privacy posture unchanged (SPEC.md).
     record_bodies: bool = False
@@ -330,6 +334,90 @@ _STORE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
 
+def _is_matrix_scalar(value: Any) -> bool:
+    """Values a matrix combination may carry: JSON scalars (incl. bool)."""
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def expand_matrix(matrix: Any) -> list[dict]:
+    """Normalize a `matrix:` block to a list of combination variable maps.
+
+    Two forms (issue #88):
+    - list of maps: each map is one combination, values are scalars
+      stringified via str() (same rule as #87 `store` captures);
+    - a single map of name -> non-empty list of scalars: expanded as the
+      cross product in key insertion order (deterministic).
+
+    Raises SpecError on: non-list/non-map, empty, values that aren't
+    scalar lists/maps, empty value lists, and names outside
+    [A-Za-z_][A-Za-z0-9_]*. Name collisions with `store` steps are
+    checked by _validate_matrix, which knows the declared store names.
+    """
+    where = "matrix"
+    if not isinstance(matrix, (list, dict)) or not matrix:
+        raise SpecError(
+            f"{where}: must be a non-empty list of variable maps or a "
+            f"non-empty map of variable name to value list, got {matrix!r}")
+    if isinstance(matrix, dict):
+        names = list(matrix.keys())
+        for name in names:
+            if not isinstance(name, str) or not _STORE_NAME.match(name):
+                raise SpecError(
+                    f"{where}: invalid variable name {name!r} "
+                    f"(must match [A-Za-z_][A-Za-z0-9_]*)")
+        value_lists = []
+        for name in names:
+            values = matrix[name]
+            if not isinstance(values, list) or not values:
+                raise SpecError(
+                    f"{where}.{name}: must be a non-empty list of scalar "
+                    f"values, got {values!r}")
+            for v in values:
+                if not _is_matrix_scalar(v):
+                    raise SpecError(
+                        f"{where}.{name}: values must be scalars "
+                        f"(stringified via str()), got {v!r}")
+            value_lists.append([str(v) for v in values])
+        return [dict(zip(names, prod))
+                for prod in _cartesian_product(*value_lists)]
+    combos = []
+    for i, entry in enumerate(matrix):
+        if not isinstance(entry, dict) or not entry:
+            raise SpecError(
+                f"{where}[{i}]: each combination must be a non-empty "
+                f"mapping of variable name to scalar value, got {entry!r}")
+        combo = {}
+        for name, value in entry.items():
+            if not isinstance(name, str) or not _STORE_NAME.match(name):
+                raise SpecError(
+                    f"{where}[{i}]: invalid variable name {name!r} "
+                    f"(must match [A-Za-z_][A-Za-z0-9_]*)")
+            if not _is_matrix_scalar(value):
+                raise SpecError(
+                    f"{where}[{i}].{name}: values must be scalars "
+                    f"(stringified via str()), got {value!r}")
+            combo[name] = str(value)
+        combos.append(combo)
+    return combos
+
+
+def _validate_matrix(raw_matrix: Any, where: str, store_names: set) -> list[dict]:
+    """Validate `matrix:` and expand it; also reject names colliding with
+    `store` steps (a name is seeded by the matrix OR captured — never
+    both, or the runtime table would be ambiguous)."""
+    if raw_matrix is None:
+        return []
+    combos = expand_matrix(raw_matrix)
+    for combo in combos:
+        clash = set(combo) & store_names
+        if clash:
+            raise SpecError(
+                f"{where}: matrix variable(s) {sorted(clash)} also declared "
+                f"by a `store` step — a variable is seeded by the matrix or "
+                f"captured by `store`, not both")
+    return combos
+
+
 def _collect_store_names(raw_steps: Any) -> set:
     """Pre-pass over RAW (pre-envsubst) steps: declared store variable names.
 
@@ -364,7 +452,8 @@ def _find_var_refs(value: Any) -> set:
 
 
 def _check_variable_ordering(setup: list, steps: list, teardown: list,
-                             declared: set, where: str) -> None:
+                             declared: set, where: str,
+                             matrix_names: set | None = None) -> None:
     """Load-time use-before-store check (issue #87).
 
     A ${name} reference in a step's params where no earlier step (in
@@ -373,7 +462,10 @@ def _check_variable_ordering(setup: list, steps: list, teardown: list,
     References to names that are neither declared store variables nor
     environment variables were already rejected by envsubst in strict
     mode; in non-strict mode they are skipped here (the env is unknown).
+    Issue #88: matrix variable names are exempt — the matrix seeds them
+    in the run-scoped table before any step runs.
     """
+    matrix_names = matrix_names or set()
     ordered = ([("setup", s) for s in setup] + [("steps", s) for s in steps]
                + [("teardown", s) for s in teardown])
     first_store: dict = {}  # name -> (global index, phase, step index)
@@ -382,6 +474,8 @@ def _check_variable_ordering(setup: list, steps: list, teardown: list,
             first_store.setdefault(name, (i, phase, s.index))
     for i, (phase, s) in enumerate(ordered):
         for ref in sorted(_find_var_refs(s.params)):
+            if ref in matrix_names:
+                continue  # seeded by the matrix before the run starts
             if ref not in declared:
                 continue
             pos = first_store.get(ref)
@@ -943,9 +1037,10 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     timeouts = {"step_ms": 15000, "run_ms": 300000}
     timeouts.update(raw.get("timeouts") or {})
     default_step_ms = int(timeouts["step_ms"])
-    target = envsubst(raw.get("target", ""), where, strict_env)
-    if not target or not isinstance(target, str):
-        raise SpecError(f"{where}: `target` is required (base URL, $VAR allowed)")
+    # Issue #88: `target:` is parsed after the matrix is validated (see
+    # below), so matrix ${name} refs in the target survive load-time
+    # $ENV expansion untouched.
+    target_raw = raw.get("target", "")
     viewport = raw.get("viewport") or {"width": 1280, "height": 800}
     artifacts = {"screenshot": "per-step", "ax_snapshot": "on-failure", "trace": True}
     artifacts.update(raw.get("artifacts") or {})
@@ -976,13 +1071,23 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     store_names = (_collect_store_names(setup_raw)
                    | _collect_store_names(steps_raw)
                    | _collect_store_names(teardown_raw))
+    # Issue #88: expand and validate `matrix:`; matrix names join the
+    # declared set (skip_names) so ${name} refs survive load-time $ENV
+    # expansion in step params AND in target:.
+    matrix = _validate_matrix(raw.get("matrix"), where, store_names)
+    matrix_names = {name for combo in matrix for name in combo}
+    declared_names = store_names | matrix_names
+    target = envsubst(target_raw, where, strict_env, matrix_names)
+    if not target or not isinstance(target, str):
+        raise SpecError(f"{where}: `target` is required (base URL, $VAR allowed)")
     setup = _parse_steps(setup_raw, "setup", default_step_ms, strict_env,
-                         store_names)
+                         declared_names)
     steps = _parse_steps(steps_raw, "steps", default_step_ms, strict_env,
-                         store_names)
+                         declared_names)
     teardown = _parse_steps(teardown_raw, "teardown", default_step_ms,
-                            strict_env, store_names)
-    _check_variable_ordering(setup, steps, teardown, store_names, where)
+                            strict_env, declared_names)
+    _check_variable_ordering(setup, steps, teardown, declared_names, where,
+                             matrix_names)
     return FlowSpec(
         name=name,
         description=str(raw.get("description") or ""),
@@ -999,4 +1104,5 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         source_path=path,
         services=_validate_services(raw.get("services"), where),
         record_bodies=record_bodies,
+        matrix=matrix,
     )

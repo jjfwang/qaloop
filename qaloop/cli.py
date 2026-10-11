@@ -89,6 +89,12 @@ def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
     # fail-closed in the runner when neither is declared (issue #76).
     from qaloop.env import resolve_upload_dir
     upload_dir = resolve_upload_dir(args.upload_dir)
+    # Issue #88: a spec with `matrix:` runs the flow once per combination,
+    # each in its own run dir under <run_dir>/matrix/, with a combined
+    # summary in the parent REPORT.md.
+    if spec.matrix:
+        return _cmd_verify_matrix(args, spec, run_dir, ledger, runs_root,
+                                  keep_runs, upload_dir)
     result = run_flow(spec, run_dir=run_dir, target=target,
                       headless=not args.headed,
                       executable_path=args.executable_path,
@@ -119,6 +125,55 @@ def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
     if pruned:
         print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
     return 0 if result.status == "passed" else 1
+
+
+def _combo_slug(combo: dict, index: int) -> str:
+    """Filesystem-safe slug for a matrix combination dir (issue #88)."""
+    slug = "-".join(f"{k}-{v}" for k, v in combo.items())
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", slug).strip("-")[:60]
+    return slug or f"combo-{index:02d}"
+
+
+def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
+                       keep_runs: int, upload_dir) -> int:
+    """Run a matrix flow once per combination (issue #88).
+
+    One parent run dir, per-combination subdirs
+    <run_dir>/matrix/<NN>-<combo-slug>/, each with its own run.json and
+    REPORT.md; a combined summary lands in the parent REPORT.md.
+    Exit code 0 iff every combination passed. Per-combination
+    investigation is not run in matrix mode (--investigate applies to
+    single runs only).
+    """
+    from qaloop.report import write_matrix_summary
+    matrix_dir = os.path.join(run_dir, "matrix")
+    os.makedirs(matrix_dir, exist_ok=True)
+    results = []
+    for i, combo in enumerate(spec.matrix):
+        subdir = os.path.join(matrix_dir, f"{i:02d}-{_combo_slug(combo, i)}")
+        os.makedirs(subdir, exist_ok=True)
+        print(f"combination {i + 1}/{len(spec.matrix)}: {combo}")
+        result = run_flow(spec, run_dir=subdir,
+                          target=args.target or spec.target,
+                          headless=not args.headed,
+                          executable_path=args.executable_path,
+                          upload_dir=upload_dir, initial_vars=combo)
+        write_report(result, spec, subdir)
+        results.append((combo, result, subdir))
+        print_summary(result)
+    report_path = write_matrix_summary(spec, results, run_dir)
+    passed = sum(1 for _, r, _ in results if r.status == "passed")
+    print(f"matrix: {passed}/{len(results)} combinations passed")
+    print(f"report: {report_path}")
+    ledger.append({"kind": "scripted-matrix", "run_dir": run_dir,
+                   "flow": spec.name,
+                   "status": "passed" if passed == len(results) else "failed",
+                   "combinations": len(results), "passed": passed,
+                   "cost_usd_est": 0.0})
+    pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
+    if pruned:
+        print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
+    return 0 if passed == len(results) else 1
 
 
 def cmd_baselines(args: argparse.Namespace) -> int:

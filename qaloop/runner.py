@@ -928,6 +928,18 @@ def _interpolate_vars(value, variables: dict, where: str):
     return value
 
 
+# Issue #88: substitute ${name} refs in the flow target from the matrix
+# combination map. Only names present in the combination are replaced;
+# anything else (e.g. an env ref left over from a non-strict load) is
+# left untouched rather than failing the run.
+def _interpolate_target(target: str, initial_vars: dict) -> str:
+    def repl(m: "re.Match") -> str:
+        name = m.group(1) or m.group(2)
+        return initial_vars[name] if name in initial_vars else m.group(0)
+
+    return _VAR_REF.sub(repl, target)
+
+
 def _evaluate_stores(page, step: Step, variables: dict, where: str) -> None:
     """Evaluate each store `js` via page.evaluate and capture str(result).
 
@@ -947,15 +959,21 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
              headless: bool = True, executable_path: str | None = None,
              baseline_update: bool = False,
              upload_dir: str | None = None,
+             initial_vars: dict | None = None,
              ) -> RunResult:
     """Execute the flow. Never raises for flow failures; raises only on harness errors.
 
     baseline_update: screenshot_matches assertions save baselines instead of
     comparing (used by `qaloop baselines --update`).
+    initial_vars: issue #88 — seed map for the run-scoped variable table
+    (one matrix combination); copied, never aliased. A ${name} ref in the
+    target matching a seed name is interpolated from the combination.
     """
     from playwright.sync_api import sync_playwright
 
     target = target or spec.target
+    if initial_vars:
+        target = _interpolate_target(target, initial_vars)
     executable_path = executable_path or os.environ.get("QALOOP_EXECUTABLE_PATH")
     baseline_dir = os.path.dirname(os.path.abspath(spec.source_path or ""))
     started = time.time()
@@ -968,7 +986,9 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     # Issue #87: run-scoped flow-variable table, shared across setup,
     # steps, and teardown. Steps capture via `store:`; later steps read
     # via ${name} interpolation of their params.
-    variables: dict = {}
+    # Issue #88: seeded from the matrix combination (copy, not alias —
+    # the run must never mutate the caller's combination map).
+    variables: dict = dict(initial_vars) if initial_vars else {}
     status, failed_step, run_error = "passed", None, ""
     shot_policy = _screenshot_policy(spec)
     ax_on_failure = spec.artifacts.get("ax_snapshot", "on-failure") == "on-failure"
