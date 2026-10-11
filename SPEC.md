@@ -784,6 +784,88 @@ directories remain, deleting the oldest first (run ids are
 just finished is never pruned. The knob is opt-in: the default is 0, which
 keeps everything. Negative values are rejected with an error (exit 2).
 
+## Worker, failure notifications, compare, flakiness tracking
+
+### Worker (`qaloop worker`)
+
+The worker claims verification jobs from the queue and runs them to
+completion, writing the same run artifacts as `verify` (see above).
+Its flags:
+
+- `--concurrency N` (default 1): the worker claims and runs jobs in
+  parallel through a thread pool of N threads. Claims are atomic
+  (`BEGIN IMMEDIATE` on the queue database), so parallel workers never
+  double-claim a job. Each job gets its own browser — the runner
+  launches and closes one per job — and its own run directory, so
+  concurrent jobs never share a run dir. The default 1 is the old
+  serial claim-and-run loop exactly.
+- `--job-timeout SECS` (default 1800): a job still running after SECS
+  is recorded failed through the queue's normal retry policy with a
+  `job timeout: exceeded Ns` note, instead of surfacing only at the
+  1-hour stale requeue. A per-job payload `timeout_s` overrides the CLI
+  default when it is a positive number; missing, non-positive, or
+  non-numeric values fall back to the default defensively. A terminal
+  timeout (retry budget exhausted) follows the same failure-notification
+  path as any terminal failure. The timed-out browser call is left to
+  finish on its own — the runner's own cleanup closes the browser when
+  the hung call returns.
+- `--keep-runs N` (or the `QALOOP_KEEP_RUNS` env var; the flag wins
+  when both are set): after each job's report is written, at most the
+  N newest run directories are kept, oldest deleted first (see
+  Retention above). The default 0 keeps everything; negative values
+  (and non-integer env values) are rejected with an error (exit 2).
+
+### Failure notifications
+
+When a worker job reaches a terminal failure — the retry budget is
+exhausted, or the job had `max_retries=0` (the enqueue default) so the
+first failure is terminal — the worker POSTs one failure notification
+to the URL in the `QALOOP_NOTIFY_URL` environment variable. Attempts
+that are requeued stay silent; only the terminal outcome notifies.
+
+The POST body is JSON with the keys `job_id`, `kind`, `run_dir`, and
+`summary`, sent with a JSON content type and a 5-second timeout.
+Notification delivery is best-effort and never raises: an unset URL
+sends nothing, and delivery failures are printed to stdout without
+failing the job handling itself.
+
+### `qaloop compare`: diffing two runs
+
+`qaloop compare <runA> <runB>` diffs two run directories from their
+`run.json` artifacts — no browser involved, and the run dirs are
+treated as read-only. Each argument is either a run-dir path (used
+as-is) or a run-id prefix matched against run-dir basenames inside the
+runs root; an unknown or ambiguous prefix is an error.
+
+The structured diff covers:
+
+- the top-level status change (`status_a` vs `status_b`);
+- per-step outcomes keyed by step name: each step is `added`,
+  `removed`, `status_changed`, or `unchanged`;
+- duration deltas at the run level and per step. A step is flagged as
+  a duration regression when run B took more than 20% longer than run
+  A (`DURATION_REGRESSION_THRESHOLD = 0.20`), and only when run A's
+  duration is nonzero.
+
+The runs are `identical` only when the top-level status and every
+step's outcome are unchanged — duration drift alone does not break
+identicalness. A human-readable text rendering of the diff is printed
+with a final `identical` / `differ` line.
+
+Exit codes: 0 when the runs are identical, 1 when they differ (like
+`diff`), 2 on error (missing or corrupt run dir, ambiguous run id).
+
+### Flakiness tracking: pass rate over time
+
+`qaloop dashboard` regenerates the static dashboard from the runs
+root, including a "Pass rate over time" table: runs are grouped by
+flow name and, per flow, ordered by start time; the pass rate is
+computed over the trailing 10 runs (`TREND_WINDOW`), so stale history
+ages out of the trend. A run counts as passed only when its status is
+exactly `"passed"`; corrupt or fieldless entries are tolerated and
+simply count as failures. The table shows recent flakiness per flow
+without opening every report.
+
 ## Evaluate: the semantic judge
 
 `python3 -m qaloop.cli evaluate --claim ... --run <run-dir>
