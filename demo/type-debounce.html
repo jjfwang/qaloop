@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Type/focus demo</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 24px; }
+  #q { font-size: 16px; padding: 8px; width: 280px; }
+  #suggestions { margin-top: 8px; padding: 0; list-style: none; }
+  #suggestions li { padding: 4px 8px; border: 1px solid #ccc; border-top: 0; }
+  #ok { margin-top: 24px; padding: 8px 16px; font-size: 16px; }
+</style>
+</head>
+<body>
+  <h1>Type/focus demo</h1>
+  <label for="q">Search:</label>
+  <input id="q" type="text" autocomplete="off">
+  <ul id="suggestions"></ul>
+  <button id="ok">OK</button>
+
+  <script>
+    // Suggestions are keyed off per-character input events, so only
+    // keystroke-by-keystroke typing fires them — fill() would too, but a
+    // debounced handler proves the event stream arrives over time.
+    const WORDS = ["apple", "apricot", "banana", "blueberry", "cherry"];
+    const input = document.getElementById("q");
+    const list = document.getElementById("suggestions");
+    let timer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const q = input.value.trim().toLowerCase();
+        list.innerHTML = "";
+        WORDS.filter((w) => w.startsWith(q) && q.length > 0).forEach((w) => {
+          const li = document.createElement("li");
+          li.textContent = w;
+          list.appendChild(li);
+        });
+      }, 300);
+    });
+  </script>
+</body>
+</html>

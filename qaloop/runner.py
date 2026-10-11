@@ -248,6 +248,15 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
         page.fill(p["target"], p["text"], timeout=t)
     elif op == "press":
         page.press(p["target"], p["key"], timeout=t)
+    elif op == "type":
+        # Issue #78: keystroke-by-keystroke typing with an optional
+        # inter-keystroke pause in ms — fires per-character
+        # keydown/keypress/input events, unlike fill's instant set.
+        # Playwright 1.63's press_sequentially takes delay as a keyword arg.
+        page.locator(p["target"]).press_sequentially(
+            p["text"], delay=p.get("delay_ms", 0) or 0, timeout=t)
+    elif op == "focus":
+        page.locator(p["target"]).focus(timeout=t)
     elif op == "hover":
         page.hover(p["target"], timeout=t)
     elif op == "scroll":
