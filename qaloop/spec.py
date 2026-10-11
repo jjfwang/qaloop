@@ -34,6 +34,7 @@ ASSERTION_KEYS = {
     "screenshot_matches", "ax", "dialog",
     "attribute", "value", "focused",  # issue #81 — element state
     "cookie", "storage",  # issue #82 — cookies and web storage
+    "request_body",  # issue #83 — opt-in request-body assertions
 }
 
 # Step-level dialog policy: what the runner does when the page raises a JS
@@ -103,6 +104,9 @@ class FlowSpec:
     max_investigation_actions: int
     source_path: str
     services: list[dict] = field(default_factory=list)
+    # Issue #83: opt-in request-body recording. Default False keeps the
+    # network_log schema and privacy posture unchanged (SPEC.md).
+    record_bodies: bool = False
 
 
 _SERVICE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
@@ -476,6 +480,20 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
             if "equals" in val and not isinstance(val["equals"], str):
                 raise SpecError(
                     f"{where}: assertion storage equals must be a string")
+        if key == "request_body":
+            # Issue #83: opt-in request-body assertion. Exactly one of
+            # contains|equals (same exactly-one guard as attribute's
+            # equals|contains); matched against bodies recorded when the
+            # flow opts into `record_bodies: true`.
+            if (not isinstance(val, dict)
+                    or not isinstance(val.get("url"), str)
+                    or not val["url"]
+                    or sum(k in val for k in ("equals", "contains")) != 1
+                    or not isinstance(val.get("equals",
+                                              val.get("contains")), str)):
+                raise SpecError(
+                    f"{where}: assertion request_body needs "
+                    f"{{url, exactly one of equals|contains (a string)}}")
         elif key in {"url_contains", "title_contains"}:
             if not isinstance(val, str):
                 raise SpecError(f"{where}: assertion {key} needs a string")
@@ -627,6 +645,12 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     artifacts.update(raw.get("artifacts") or {})
     if artifacts.get("screenshot") not in {"per-step", "on-failure", "none"}:
         raise SpecError(f"{where}: artifacts.screenshot must be per-step|on-failure|none")
+    # Issue #83: opt-in request-body recording. Must be a real bool;
+    # `record_bodies: "yes"` is a typo, not consent, so it is rejected.
+    record_bodies = raw.get("record_bodies", False)
+    if not isinstance(record_bodies, bool):
+        raise SpecError(
+            f"{where}: record_bodies must be a bool, got {record_bodies!r}")
     return FlowSpec(
         name=name,
         description=str(raw.get("description") or ""),
@@ -642,4 +666,5 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         max_investigation_actions=int(raw.get("max_investigation_actions", 20)),
         source_path=path,
         services=_validate_services(raw.get("services"), where),
+        record_bodies=record_bodies,
     )
