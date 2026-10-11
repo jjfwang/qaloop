@@ -4502,6 +4502,167 @@ def test_element_state_assertions():
           sc.calls[0] == ("wait", "#btn", "attached"), str(sc.calls[:2]))
 
 
+def test_issue_82_cookie_storage_assertions():
+    """Issue #82: cookie / storage assertions.
+
+    Validation: cookie needs a non-empty name and at most one of
+    equals|contains (a string); neither means a presence check. storage
+    needs kind local|session, a non-empty key, and an optional string
+    equals. Runner: cookie reads via page.context.cookies() (a missing
+    cookie never matches, even for contains), storage via page.evaluate
+    with the key passed as a JS arg (a missing key -> null never
+    matches); both poll until the step deadline like attribute/value.
+    """
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step, SpecError, _validate_expect
+
+    def rejects(expect, label):
+        try:
+            _validate_expect(expect, "steps[0]")
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+
+    rejects({"cookie": "session"}, "cookie must be a mapping")
+    rejects({"cookie": {"equals": "x"}}, "cookie missing name")
+    rejects({"cookie": {"name": "", "equals": "x"}}, "cookie name is empty")
+    rejects({"cookie": {"name": "s", "equals": "x", "contains": "y"}},
+            "cookie rejects both equals and contains")
+    rejects({"cookie": {"name": "s", "equals": True}},
+            "cookie equals must be a string")
+    rejects({"cookie": {"name": "s", "contains": 3}},
+            "cookie contains must be a string")
+    check("cookie name-only presence form accepted",
+          _validate_expect({"cookie": {"name": "s"}}, "steps[0]")
+          == [("cookie", {"name": "s"})])
+    rejects({"storage": {"kind": "local"}}, "storage missing key")
+    rejects({"storage": {"key": "k"}}, "storage missing kind")
+    rejects({"storage": {"kind": "cookies", "key": "k"}},
+            "storage rejects bad kind")
+    rejects({"storage": {"kind": "local", "key": ""}},
+            "storage key is empty")
+    rejects({"storage": {"kind": "local", "key": "k", "equals": 1}},
+            "storage equals must be a string")
+    check("storage key-only presence form accepted",
+          _validate_expect({"storage": {"kind": "session", "key": "flag"}},
+                           "steps[0]")
+          == [("storage", {"kind": "session", "key": "flag"})])
+
+    class FakeCtx:
+        def __init__(self):
+            self.cookie_seq = None
+            self.reads = 0
+        def cookies(self):
+            n = self.reads
+            self.reads += 1
+            if self.cookie_seq is not None:
+                return self.cookie_seq[min(n, len(self.cookie_seq) - 1)]
+            return []
+
+    class FakePage:
+        def __init__(self):
+            self.context = FakeCtx()
+            self.store = {}
+            self.store_seq = {}
+            self.store_reads = {}
+            self.eval_calls = []
+        def evaluate(self, script, arg):
+            self.eval_calls.append((script, arg))
+            k = (arg["kind"], arg["key"])
+            n = self.store_reads.get(k, 0)
+            self.store_reads[k] = n + 1
+            seq = self.store_seq.get(k)
+            if seq is not None:
+                return seq[min(n, len(seq) - 1)]
+            return self.store.get(k)
+
+    def run(expect_items, page, timeout_ms=5000):
+        step = Step(index=0, phase="steps", name="e", op=None, params=None,
+                    expect={}, expect_items=expect_items,
+                    continue_on_fail=False, timeout_ms=timeout_ms,
+                    frame=None, raw={})
+        return _check_assertions(page, step, None)
+
+    # cookie equals: pass, fail, detail names final observed value
+    pg = FakePage()
+    pg.context.cookie_seq = [[{"name": "session", "value": "abc123"}]]
+    res = run([("cookie", {"name": "session", "equals": "abc123"})], pg)
+    check("cookie equals passes", res[0].passed, res[0].detail)
+    pg2 = FakePage()
+    pg2.context.cookie_seq = [[{"name": "session", "value": "abc123"}]]
+    res = run([("cookie", {"name": "session", "equals": "other"})], pg2,
+              timeout_ms=300)
+    check("cookie equals fails", not res[0].passed, res[0].detail)
+    check("cookie detail names observed value",
+          "'abc123'" in res[0].detail and "want ='other'" in res[0].detail,
+          res[0].detail)
+    # cookie contains: pass, fail
+    res = run([("cookie", {"name": "session", "contains": "abc"})], pg2)
+    check("cookie contains passes", res[0].passed, res[0].detail)
+    res = run([("cookie", {"name": "session", "contains": "zzz"})], pg2,
+              timeout_ms=300)
+    check("cookie contains fails", not res[0].passed, res[0].detail)
+    # missing cookie never matches, even for contains
+    pg3 = FakePage()
+    res = run([("cookie", {"name": "session", "equals": "abc123"})], pg3,
+              timeout_ms=300)
+    check("missing cookie never matches equals", not res[0].passed,
+          res[0].detail)
+    res = run([("cookie", {"name": "session", "contains": "abc"})], pg3,
+              timeout_ms=300)
+    check("missing cookie never matches contains", not res[0].passed,
+          res[0].detail)
+    check("missing cookie detail shows None", "None" in res[0].detail,
+          res[0].detail)
+    # cookie presence: pass, fail
+    res = run([("cookie", {"name": "session"})], pg2)
+    check("cookie presence passes", res[0].passed, res[0].detail)
+    res = run([("cookie", {"name": "other"})], pg2, timeout_ms=300)
+    check("cookie presence fails when absent", not res[0].passed,
+          res[0].detail)
+    # cookie polls: cookie arrives on the second context.cookies() read
+    pg4 = FakePage()
+    pg4.context.cookie_seq = [[], [{"name": "session", "value": "abc123"}]]
+    res = run([("cookie", {"name": "session", "equals": "abc123"})], pg4)
+    check("cookie polls until match", res[0].passed, res[0].detail)
+    # storage equals: pass, fail, detail names observed value
+    pg5 = FakePage()
+    pg5.store[("local", "consent")] = "accepted"
+    res = run([("storage", {"kind": "local", "key": "consent",
+                          "equals": "accepted"})], pg5)
+    check("storage equals passes", res[0].passed, res[0].detail)
+    res = run([("storage", {"kind": "local", "key": "consent",
+                          "equals": "declined"})], pg5, timeout_ms=300)
+    check("storage equals fails", not res[0].passed, res[0].detail)
+    check("storage detail names observed value",
+          "'accepted'" in res[0].detail and "want ='declined'" in res[0].detail,
+          res[0].detail)
+    # missing key (getItem -> None) never matches; presence passes/fails
+    res = run([("storage", {"kind": "session", "key": "flag"})], pg5)
+    check("storage presence fails when key absent", not res[0].passed,
+          res[0].detail)
+    pg6 = FakePage()
+    pg6.store[("session", "flag")] = "beta"
+    res = run([("storage", {"kind": "session", "key": "flag"})], pg6)
+    check("storage presence passes when set", res[0].passed, res[0].detail)
+    res = run([("storage", {"kind": "session", "key": "flag",
+                          "equals": "x"})], pg5, timeout_ms=300)
+    check("missing storage key never matches", not res[0].passed,
+          res[0].detail)
+    # storage polls: key appears on the second getItem read
+    pg7 = FakePage()
+    pg7.store_seq[("local", "consent")] = [None, "accepted"]
+    res = run([("storage", {"kind": "local", "key": "consent",
+                          "equals": "accepted"})], pg7)
+    check("storage polls until match", res[0].passed, res[0].detail)
+    # the key rides along as a JS arg, never interpolated into the script
+    script, arg = pg5.eval_calls[0]
+    check("storage key passed as JS arg, not interpolated",
+          arg == {"kind": "local", "key": "consent"}
+          and "consent" not in script and "accepted" not in script,
+          script)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

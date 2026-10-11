@@ -237,9 +237,11 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `attribute` | `{selector, name, equals: v}` / `{selector, name, contains: s}` — element attribute value (see below) |
 | `value` | `{selector, equals: v}` — live value of an input after `fill`/`type` |
 | `focused` | `{selector}` — `document.activeElement` is the element |
+| `cookie` | `{name, equals: v}` / `{name, contains: s}` / `{name}` — cookie value, or presence (see below) |
+| `storage` | `{kind: local|session, key, equals?: v}` — web-storage value, or presence (see below) |
 
 `text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, `count`,
-`attribute`, `value`, and `focused`
+`attribute`, `value`, `focused`, `cookie`, and `storage`
 all poll until the value matches or the step deadline expires, because
 async-rendered state races a one-shot read: element text is re-read via
 `text_content` (after `wait_for_selector` attaches), `page.url` /
@@ -247,7 +249,9 @@ async-rendered state races a one-shot read: element text is re-read via
 re-read directly, locator `count()` is re-read
 against the comparator (`equals` > `gte` > `lte`), the attribute is re-read via
 `get_attribute`, the input value via `input_value`, and focus via
-`document.activeElement === el` (Playwright has no `is_focused()`), every 0.15s against
+`document.activeElement === el` (Playwright has no `is_focused()`), the cookie
+list via `context.cookies()`, and the storage value via a `page.evaluate` read
+of `getItem`, every 0.15s against
 `min(step.timeout_ms or 15000, 8000)`. On timeout the failure detail names the
 final observed value, not the desired value alone.
 
@@ -344,6 +348,33 @@ re-read every 0.15s until the step deadline and the failure detail names
 the final observed value (e.g. `#badge: class='chip idle' want contains 'active'`).
 All three resolve inside the step's `frame:` scope like other selector
 assertions.
+
+### Cookies and web storage — `cookie`, `storage`
+
+Two assertions on browser-level state, for contracts like "the login
+request set the session cookie" or "consent was persisted":
+
+```yaml
+expect:
+  - cookie: {name: "session", equals: "abc123"}
+  - cookie: {name: "promo", contains: "summer"}
+  - cookie: {name: "session"}                       # presence only
+  - storage: {kind: local, key: "consent", equals: "accepted"}
+  - storage: {kind: session, key: "flag"}           # presence only
+```
+
+`cookie` needs a non-empty `name` and at most one of `equals` /
+`contains` (never both) as a string; omitting both asserts presence —
+"the login cookie is set". `storage` needs `kind: local|session`, a
+non-empty `key`, and an optional `equals` string; omitting `equals`
+asserts the key exists. Both poll every 0.15s until the step deadline,
+because cookies are often set by an async request and storage by a
+delayed script write. A missing cookie or a missing key (`getItem`
+returns `null`) never matches, not even with `contains`. The failure
+detail names the final observed value (e.g. `cookie 'session'=None want
+='abc123'`); the key is passed to `page.evaluate` as an argument, never
+interpolated into the script. Storage reads the main page, not the
+step's `frame:` scope: storage is keyed on the page origin.
 
 ## Conventions
 

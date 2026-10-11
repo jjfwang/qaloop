@@ -1,0 +1,26 @@
+name: demo-cookie-storage
+description: >-
+  Browser proof for the cookie and web-storage assertions (issue #82): a
+  login button sets a session cookie and local/session storage entries
+  asynchronously, and the flow asserts them with equals, contains, and
+  presence checks.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the cookie/storage demo page
+    goto: /demo/cookie-storage.html
+
+steps:
+  - name: log in and prove the async-set state
+    click: "#login"
+    expect:
+      - cookie: {name: "session", equals: "abc123"}
+      - cookie: {name: "session", contains: "abc"}
+      - storage: {kind: local, key: "consent", equals: "accepted"}
+      - storage: {kind: session, key: "flag"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

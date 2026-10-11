@@ -33,6 +33,7 @@ ASSERTION_KEYS = {
     "url_contains", "title_contains", "noop", "console_clean", "js",
     "screenshot_matches", "ax", "dialog",
     "attribute", "value", "focused",  # issue #81 — element state
+    "cookie", "storage",  # issue #82 — cookies and web storage
 }
 
 # Step-level dialog policy: what the runner does when the page raises a JS
@@ -445,6 +446,36 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     or not val["selector"]):
                 raise SpecError(
                     f"{where}: assertion focused needs {{selector}}")
+        elif key == "cookie":
+            # Issue #82: cookie value. At most one of equals|contains (never
+            # both); neither means a presence check (the cookie is set). A
+            # missing cookie never matches at runtime.
+            if (not isinstance(val, dict)
+                    or not isinstance(val.get("name"), str)
+                    or not val["name"]):
+                raise SpecError(
+                    f"{where}: assertion cookie needs {{name, equals?|contains?}}")
+            if (sum(k in val for k in ("equals", "contains")) > 1
+                    or any(k in val and not isinstance(val[k], str)
+                           for k in ("equals", "contains"))):
+                raise SpecError(
+                    f"{where}: assertion cookie takes at most one of "
+                    f"equals|contains, as a string")
+        elif key == "storage":
+            # Issue #82: web storage value. kind is local|session; key is a
+            # non-empty string; equals (optional, a string) narrows to a
+            # value check, otherwise presence of the key. A missing key
+            # (getItem -> null) never matches at runtime.
+            if (not isinstance(val, dict)
+                    or val.get("kind") not in ("local", "session")
+                    or not isinstance(val.get("key"), str)
+                    or not val["key"]):
+                raise SpecError(
+                    f"{where}: assertion storage needs "
+                    f"{{kind: local|session, key, equals?}}")
+            if "equals" in val and not isinstance(val["equals"], str):
+                raise SpecError(
+                    f"{where}: assertion storage equals must be a string")
         elif key in {"url_contains", "title_contains"}:
             if not isinstance(val, str):
                 raise SpecError(f"{where}: assertion {key} needs a string")
