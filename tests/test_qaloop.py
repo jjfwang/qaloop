@@ -4096,6 +4096,249 @@ def test_resolve_upload_dir():
         os.environ.pop("QALOOP_UPLOAD_DIR", None)
 
 
+def test_frame_scoping():
+    """Issue #80: `frame:` scopes selector actions/assertions to an iframe.
+
+    Name form resolves via page.frame(name=), URL form via a page.frame(url=)
+    substring; a non-matching frame raises RuntimeError (actions) or records
+    an assertion failure; spec validation rejects non-string/empty frame and
+    frame: combined with goto/seed/mock/script.
+    """
+    import tempfile as _tf
+
+    from qaloop.runner import _do_action, _check_assertions, _resolve_scope
+    from qaloop.spec import Step, load_spec, SpecError
+
+    class FakeLocator:
+        def __init__(self, frame, sel):
+            self.frame = frame
+            self.sel = sel
+        def count(self):
+            self.frame.calls.append(("count", self.sel))
+            return 2
+        def wait_for(self, state=None, timeout=None):
+            self.frame.calls.append(("loc_wait", self.sel, state, timeout))
+        @property
+        def first(self):
+            return self
+
+    class FakeFrame:
+        def __init__(self):
+            self.calls = []
+            self.texts = {}
+        def click(self, sel, timeout=None):
+            self.calls.append(("click", sel, timeout))
+        def dblclick(self, sel, timeout=None):
+            self.calls.append(("dblclick", sel, timeout))
+        def fill(self, sel, text, timeout=None):
+            self.calls.append(("fill", sel, text, timeout))
+        def press(self, sel, key, timeout=None):
+            self.calls.append(("press", sel, key, timeout))
+        def check(self, sel, timeout=None):
+            self.calls.append(("check", sel, timeout))
+        def uncheck(self, sel, timeout=None):
+            self.calls.append(("uncheck", sel, timeout))
+        def select_option(self, sel, value, timeout=None):
+            self.calls.append(("select", sel, value, timeout))
+        def locator(self, sel, has_text=None):
+            self.calls.append(("locator", sel, has_text))
+            return FakeLocator(self, sel)
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("selector", selector, state, timeout))
+        def text_content(self, sel):
+            self.calls.append(("text", sel))
+            return self.texts.get(sel, "")
+        def get_by_role(self, role, name=None):
+            self.calls.append(("role", role, name))
+            return FakeLocator(self, f"role:{role}")
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+            self.by_name = {}
+            self.by_url = {}
+        def frame(self, name=None, url=None):
+            self.calls.append(("frame", name,
+                               url.pattern if url is not None else None))
+            if name is not None:
+                return self.by_name.get(name)
+            for u, f in self.by_url.items():
+                if url.search(u):
+                    return f
+            return None
+        def click(self, sel, timeout=None):
+            self.calls.append(("page_click", sel, timeout))
+        def evaluate(self, expr):
+            self.calls.append(("evaluate", expr))
+            return 0
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("page_selector", selector, state, timeout))
+        def text_content(self, sel):
+            self.calls.append(("page_text", sel))
+            return ""
+
+    def mkstep(op, params, frame=None, expect_items=None, step_timeout=5000):
+        return Step(index=0, phase="steps", name="f", op=op, params=params,
+                    expect={}, expect_items=expect_items or [],
+                    continue_on_fail=False, timeout_ms=step_timeout,
+                    frame=frame, raw={})
+
+    fr = FakeFrame()
+    page = FakePage()
+    page.by_name["demo-frame"] = fr
+    url_fr = FakeFrame()
+    page.by_url["http://x/demo/iframe-content.html"] = url_fr
+
+    # no frame: -> the page itself
+    check("no frame: resolves to the page",
+          _resolve_scope(page, mkstep("click", "#b")) is page)
+    # name form routes a click into the frame
+    _do_action(page, mkstep("click", "#b", frame="demo-frame"),
+               "http://x", {})
+    check("click with frame: name -> frame.click",
+          fr.calls == [("click", "#b", 5000)], str(fr.calls))
+    check("click with frame: never touches the page",
+          [c for c in page.calls if c[0] != "frame"] == [], str(page.calls))
+    # url-substring form resolves by frame URL
+    _do_action(page, mkstep("click", "#b", frame="iframe-content"),
+               "http://x", {})
+    check("click with frame: url substring -> frame.click",
+          url_fr.calls == [("click", "#b", 5000)], str(url_fr.calls))
+    # every other frame-scoped action path also lands on the frame
+    fr.calls.clear()
+    _do_action(page, mkstep("dblclick", "#d", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("fill", {"target": "#t", "text": "hi"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("press", {"target": "#k", "key": "Enter"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page, mkstep("check", "#c", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page, mkstep("uncheck", "#u", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("select", {"target": "#s", "value": "v"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("wait", {"target": "#w", "text": "go"},
+                      frame="demo-frame"),
+               "http://x", {})
+    check("frame-scoped dblclick/fill/press/check/uncheck/select/wait-text land on the frame",
+          fr.calls == [("dblclick", "#d", 5000),
+                       ("fill", "#t", "hi", 5000),
+                       ("press", "#k", "Enter", 5000),
+                       ("check", "#c", 5000),
+                       ("uncheck", "#u", 5000),
+                       ("select", "#s", "v", 5000),
+                       ("locator", "#w", "go"),
+                       ("loc_wait", "#w", "visible", 5000)],
+          str(fr.calls))
+    # missing frame: action raises RuntimeError with clear detail
+    # (short timeout — the lookup polls, so a real timeout is slow)
+    try:
+        _do_action(page, mkstep("click", "#b", frame="nope",
+                                step_timeout=50),
+                   "http://x", {})
+        check("missing frame click raises RuntimeError", False)
+    except RuntimeError as e:
+        check("missing frame click raises RuntimeError",
+              "frame not found" in str(e) and "nope" in str(e), str(e))
+    # missing frame: expect-only step records assertion failures, no raise
+    step = mkstep(None, None, frame="nope",
+                  expect_items=[("visible", "#x"), ("url_contains", "x")],
+                  step_timeout=50)
+    results = _check_assertions(page, step, None)
+    check("missing frame -> all assertions fail",
+          len(results) == 2 and all(not r.passed for r in results),
+          str(results))
+    check("missing frame detail names the frame",
+          all("frame not found" in r.detail and "nope" in r.detail
+              for r in results),
+          str([r.detail for r in results]))
+    # assertions with frame: resolve inside the frame
+    fr.texts["#out"] = "hello world"
+    n_before = len(fr.calls)
+    step = mkstep(None, None, frame="demo-frame",
+                  expect_items=[("visible", "#in"),
+                                ("text_contains",
+                                 {"selector": "#out", "text": "hello"}),
+                                ("count",
+                                 {"selector": ".row", "equals": 2}),
+                                ("ax", {"role": "button", "name": "Go"})])
+    results = _check_assertions(page, step, None)
+    check("frame-scoped assertions pass",
+          all(r.passed for r in results), str(results))
+    kinds = [c[0] for c in fr.calls[n_before:]]
+    check("frame-scoped assertions hit the frame only",
+          kinds == ["selector", "selector", "text", "locator", "count",
+                    "role", "loc_wait"],
+          str(fr.calls[n_before:]))
+    check("frame-scoped assertions never hit page selectors",
+          not any(c[0] in ("page_selector", "page_text") for c in page.calls),
+          str(page.calls))
+
+    # the frame lookup polls: a frame that attaches late still resolves
+    class SlowPage(FakePage):
+        def __init__(self, real):
+            super().__init__()
+            self.real = real
+            self.looks = 0
+        def frame(self, name=None, url=None):
+            self.looks += 1
+            return None if self.looks < 3 else self.real
+    slow = SlowPage(fr)
+    scope = _resolve_scope(slow, mkstep("click", "#b", frame="demo-frame"),
+                           timeout_ms=5000)
+    check("frame lookup polls until the frame attaches",
+          scope is fr and slow.looks == 3, str(slow.looks))
+
+    # spec validation
+    def load(body):
+        with _tf.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("name: t\ntarget: http://x\nsteps:\n" + body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            import os as _os
+            _os.unlink(p)
+
+    s = load("  - name: ok\n    click: \"#b\"\n    frame: demo-frame\n")
+    check("frame: accepted, parsed onto the step",
+          s.steps[0].frame == "demo-frame", str(s.steps[0].frame))
+    for body, label in [
+            ("  - name: bad\n    click: \"#b\"\n    frame: 123\n",
+             "frame: 123"),
+            ("  - name: bad\n    click: \"#b\"\n    frame: \"\"\n",
+             "frame empty"),
+            ("  - name: bad\n    goto: /x\n    frame: f\n", "frame + goto"),
+            ("  - name: bad\n    seed: {js: \"x=1\"}\n    frame: f\n",
+             "frame + seed"),
+            ("  - name: bad\n    mock: {url: /x, json: {}}\n    frame: f\n",
+             "frame + mock"),
+            ("  - name: bad\n    script: {js: \"x=1\"}\n    frame: f\n",
+             "frame + script"),
+    ]:
+        try:
+            load(body)
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+    import os as _os2
+    _os2.environ["F"] = "env-frame"
+    try:
+        s = load("  - name: ok\n    click: \"#b\"\n    frame: \"$F\"\n")
+        check("frame: gets env substitution",
+              s.steps[0].frame == "env-frame", str(s.steps[0].frame))
+    finally:
+        del _os2.environ["F"]
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

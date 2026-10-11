@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Iframe content</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 16px; background: #f6f8ff; }
+  button { font-size: 16px; padding: 8px 16px; margin: 4px 0; }
+  #inner-out, #inner-out-2 { margin-top: 8px; min-height: 1.4em; color: #0a5; }
+</style>
+</head>
+<body>
+  <h2>Widget inside the iframe</h2>
+  <button id="inner-btn">Toggle</button>
+  <div id="inner-out">not clicked</div>
+  <button id="inner-btn-2">Toggle via URL form</button>
+  <div id="inner-out-2">not clicked</div>
+  <script>
+    document.getElementById("inner-btn").addEventListener("click", () => {
+      document.getElementById("inner-out").textContent = "clicked";
+    });
+    document.getElementById("inner-btn-2").addEventListener("click", () => {
+      document.getElementById("inner-out-2").textContent = "clicked-by-url";
+    });
+  </script>
+</body>
+</html>

@@ -24,7 +24,7 @@ ACTION_OPS = {
     "mock", "upload", "drag", "type", "focus",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
-                 "on_dialog"}
+                 "on_dialog", "frame"}
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
@@ -81,6 +81,9 @@ class Step:
     raw: dict
     retry: int = 0  # extra attempts after a failure (steps phase only)
     on_dialog: str = "dismiss"  # accept | dismiss — JS dialog policy for the step
+    frame: str | None = None  # issue #80 — iframe/frame scope: frame name
+    # or URL substring; selectors resolve via page.frame(name|url) instead of
+    # the main frame
 
 
 @dataclass
@@ -488,6 +491,15 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
     if on_dialog not in DIALOG_POLICIES:
         raise SpecError(
             f"{where}: on_dialog must be accept|dismiss, got {on_dialog!r}")
+    frame = raw.get("frame")
+    if frame is not None:
+        # Issue #80: frame must be a non-empty string (frame name or URL
+        # substring). A frame can't navigate or register mocks, so frame:
+        # combined with the page-level ops fails fast at spec time.
+        if not isinstance(frame, str) or not frame:
+            raise SpecError(
+                f"{where}: frame must be a non-empty string (frame name "
+                f"or URL substring), got {frame!r}")
     op_keys = [k for k in raw if k in ACTION_OPS]
     unknown = [k for k in raw if k not in ACTION_OPS and k not in STEP_META_KEYS]
     if unknown:
@@ -500,13 +512,18 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         raise SpecError(f"{where}: step has no action op and no expect — nothing to do")
     params = raw[op] if op else None
     _validate_op_params(op, params, where)
+    if frame is not None and op in {"goto", "seed", "mock", "script"}:
+        raise SpecError(
+            f"{where}: frame: cannot be combined with {op} "
+            f"(page-level op — navigates, seeds, mocks or evaluates "
+            f"on the main page only)")
     expect_items = _validate_expect(expect, where)
     return Step(
         index=index, phase=phase,
         name=name or f"{op or 'expect'} #{index}",
         op=op, params=params, expect=expect, expect_items=expect_items,
         continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
-        retry=retry, on_dialog=on_dialog, raw=raw,
+        retry=retry, on_dialog=on_dialog, frame=frame, raw=raw,
     )
 
 

@@ -99,7 +99,47 @@ a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`),
 up to `retry` more times, first success wins; attempts run back-to-back
 with no delay; out of scope: cross-step retry, retrying setup-phase mocks),
 `on_dialog` (`accept`|`dismiss`, default `dismiss` — what the runner does
-with a JS dialog raised while the step's action runs; see `dialog`).
+with a JS dialog raised while the step's action runs; see `dialog`),
+`frame` (`<name | url substring>` — when present, selector resolution goes
+through `page.frame(name=...)`/`page.frame(url=...)` instead of the main
+frame; see below).
+
+### `frame`: iframe/frame scoping for actions and assertions
+
+A step may carry `frame: <name | url substring>` to run its selectors
+inside an iframe instead of the main frame:
+
+```yaml
+- name: toggle the widget inside its iframe
+  click: "#widget-toggle"
+  frame: demo-frame
+  expect:
+    - text_contains: {selector: "#widget-state", text: "on"}
+```
+
+The runner resolves the value first with `page.frame(name=...)` (the
+iframe's `name` attribute), then with `page.frame(url=...)` as a literal
+URL substring, so `frame: iframe-content` matches a frame served from
+`/demo/iframe-content.html`. Frames attach asynchronously (after the
+parent page's DOMContentLoaded), so the lookup polls until the step's
+`timeout_ms` expires — mirroring `wait_for_selector` — and only then does
+a non-matching frame fail the step with
+`RuntimeError: frame not found: '<frame>'` (fail-closed, no silent
+main-frame fallback).
+
+What applies: locator actions (`click`, `dblclick`, `fill`, `press`,
+`type`, `focus`, `hover`, `scroll` with a target, `check`, `uncheck`,
+`select`, `upload`, `drag`) and selector assertions (`visible`, `hidden`,
+`text_contains`, `text_matches`, `count`, `ax`, `screenshot_matches`
+with a `selector`, `wait` with a `target`).
+
+What stays on the main page: `goto`, `reload`, `back`, `wait_ms`,
+targetless/`js`/`response` waits, `seed`, `script`, `mock`, and the
+page-level assertions (`url_contains`, `title_contains`, `console_clean`,
+`js`, `dialog`, `mock_calls`, `network_calls`) — a `Frame` has no URL,
+title, `evaluate`, or dialogs. `frame:` combined with `goto`, `seed`,
+`mock`, or `script` is a spec error. The coordinate form of `drag` uses
+`page.mouse`, which is viewport-relative and therefore not frame-scoped.
 
 ### `wait`: `js` and `response` forms
 
