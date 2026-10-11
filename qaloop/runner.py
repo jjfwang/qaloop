@@ -249,6 +249,16 @@ def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
         page.press(p["target"], p["key"], timeout=t)
     elif op == "hover":
         page.hover(p["target"], timeout=t)
+    elif op == "scroll":
+        target_sel = p.get("target")
+        if target_sel:
+            page.locator(target_sel).scroll_into_view_if_needed(timeout=t)
+        else:
+            pixels = p.get("pixels", 600)
+            direction = p.get("direction", "down")
+            offsets = {"up": (0, -pixels), "down": (0, pixels),
+                       "left": (-pixels, 0), "right": (pixels, 0)}
+            page.mouse.wheel(*offsets[direction])
     elif op == "check":
         page.check(p, timeout=t)
     elif op == "uncheck":
