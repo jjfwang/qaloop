@@ -34,6 +34,35 @@ def _load_runs(runs_root: str) -> list[dict]:
     return runs
 
 
+# Trailing window for the per-flow pass-rate trend (issue #91): only the
+# last N runs per flow count, so stale history ages out of the trend.
+TREND_WINDOW = 10
+
+
+def compute_trends(runs: list[dict]) -> list[dict]:
+    """Per-flow pass-rate-over-time over the trailing TREND_WINDOW runs.
+
+    Runs group by flow_name and sort chronologically by `started`
+    (entries without `started` sort first); corrupt or fieldless
+    entries are tolerated — a run simply counts as failed unless its
+    status is "passed". Returns one dict per flow:
+    flow, runs, passed, pass_rate_pct, recent (oldest -> newest bools).
+    """
+    by_flow: dict[str, list[dict]] = {}
+    for r in runs:
+        by_flow.setdefault(r.get("flow_name") or "—", []).append(r)
+    trends = []
+    for flow, items in sorted(by_flow.items()):
+        ordered = sorted(items, key=lambda r: r.get("started") or 0)
+        recent = ordered[-TREND_WINDOW:]
+        passed = sum(1 for r in recent if r.get("status") == "passed")
+        rate = round(100.0 * passed / len(recent), 1)
+        trends.append({"flow": flow, "runs": len(recent), "passed": passed,
+                       "pass_rate_pct": rate,
+                       "recent": [r.get("status") == "passed" for r in recent]})
+    return trends
+
+
 def build(runs_root: str, out_dir: str) -> str:
     runs = _load_runs(runs_root)
     summary = ledger.summarize()
@@ -65,6 +94,25 @@ def build(runs_root: str, out_dir: str) -> str:
             f"<td>{r.get('duration_ms', '—')}ms</td>"
             f"<td><a href='../runs/{d}/REPORT.md'>{d}</a>{diag}</td></tr>")
 
+    trend_rows = []
+    for t in compute_trends(runs):
+        dots = "".join(
+            f"<span class='{'pass' if ok else 'fail'}' "
+            f"title='{'passed' if ok else 'failed'}'>●</span>"
+            for ok in t["recent"])
+        trend_rows.append(
+            f"<tr><td>{t['flow']}</td><td>{t['runs']}</td>"
+            f"<td>{t['pass_rate_pct']}% "
+            f"({t['passed']}/{t['runs']} passed)</td>"
+            f"<td>{dots or '—'}</td></tr>")
+    if trend_rows:
+        trend_table = (
+            f"<table><tr><th>flow</th><th>runs in window</th>"
+            f"<th>pass rate</th><th>recent (oldest → newest)</th></tr>"
+            f"{''.join(trend_rows)}</table>")
+    else:
+        trend_table = "<p class='muted'>no trend data yet</p>"
+
     html = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>qaloop dashboard</title><style>{CSS}</style></head><body>
 <h1>qaloop dashboard</h1>
@@ -81,6 +129,10 @@ def build(runs_root: str, out_dir: str) -> str:
 <table><tr><th>time</th><th>flow</th><th>status</th><th>duration</th><th>report</th></tr>
 {''.join(rows) if rows else '<tr><td colspan=5 class="muted">no runs yet</td></tr>'}
 </table>
+<h2>Pass rate over time</h2>
+<p class="muted">trailing {TREND_WINDOW} runs per flow, oldest to newest —
+flakiness trends show up here without opening every report.</p>
+{trend_table}
 <h2>Cost ledger</h2>
 <p>scripted runs: {summary['scripted_runs']} at ~$0 &nbsp;·&nbsp;
 investigations: {summary['investigations']} at

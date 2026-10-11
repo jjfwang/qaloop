@@ -101,6 +101,7 @@ alongside the feature. Conventions:
 | `webhook [--port 8090] [--host 127.0.0.1]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
 | `investigate --run <dir> --flow <yaml> [--target URL] [--max-actions N] [--headed] [--executable-path PATH]` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
+| `compare <runA> <runB>` | diff two runs (dir path or run-id prefix in `runs/`): status change, per-step outcomes, duration deltas with >20% regression flags; exit 0 identical / 1 differ / 2 error |
 | `ledger` | cost summary JSON |
 
 - `--executable-path` is available on `verify`, `perform`, `investigate`, and
@@ -270,9 +271,11 @@ default budget 20 actions. Every turn and the final diagnosis land in
 ## Dashboard & ledger
 
 `qaloop dashboard` scans `runs/*/run.json` and writes a static
-`dashboard/index.html`: pass counts, run table with report links, and the
-cost ledger summary — so you can watch the hybrid working (scripted runs at
-~$0, investigations itemized).
+`dashboard/index.html`: pass counts, run table with report links, a
+"Pass rate over time" section (per-flow pass rate over the trailing 10
+runs, oldest → newest, so flakiness trends show up without opening every
+report), and the cost ledger summary — so you can watch the hybrid
+working (scripted runs at ~$0, investigations itemized).
 
 ## The 15-minute loop's verifier role
 

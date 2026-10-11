@@ -6441,6 +6441,242 @@ def test_issue_90_video_recording():
     check("verify --video defaults off", a.video is False, str(a.video))
 
 
+def _syn_step_91(name, status, dur_ms):
+    return {"index": 0, "name": name, "phase": "steps", "op": "goto",
+            "status": status, "duration_ms": dur_ms, "attempts": 1}
+
+
+def _syn_run_dir_91(root, dirname, flow, status, started, dur_ms, steps):
+    d = os.path.join(root, dirname)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "run.json"), "w", encoding="utf-8") as f:
+        json.dump({"flow_name": flow, "status": status, "started": started,
+                   "duration_ms": dur_ms, "steps": steps, "run_dir": d}, f)
+    return d
+
+
+def test_issue_91_trends_chronology_and_window():
+    from qaloop import dashboard
+    # deliberately unsorted; compute_trends must order by `started`
+    runs = [
+        {"flow_name": "f1", "status": "failed", "started": 3.0},
+        {"flow_name": "f1", "status": "passed", "started": 1.0},
+        {"flow_name": "f1", "status": "passed", "started": 2.0},
+        {"flow_name": "f2", "status": "passed", "started": 2.5},
+        {"status": "failed"},  # no flow_name / started -> "—" group
+    ]
+    t = {x["flow"]: x for x in dashboard.compute_trends(runs)}
+    check("trends f1 time-ordered", t["f1"]["recent"] == [True, True, False],
+          str(t["f1"]["recent"]))
+    check("trends f1 2/3 = 66.7%",
+          t["f1"]["pass_rate_pct"] == 66.7 and t["f1"]["passed"] == 2
+          and t["f1"]["runs"] == 3, str(t["f1"]))
+    check("trends f2 single pass",
+          t["f2"]["pass_rate_pct"] == 100.0 and t["f2"]["runs"] == 1,
+          str(t["f2"]))
+    check("trends missing flow_name grouped as dash",
+          t["—"]["runs"] == 1 and t["—"]["pass_rate_pct"] == 0.0, str(t["—"]))
+    # trailing-window math: with a window of 2 only the last 2 count
+    old = dashboard.TREND_WINDOW
+    dashboard.TREND_WINDOW = 2
+    try:
+        t2 = {x["flow"]: x for x in dashboard.compute_trends(runs)}
+        check("trends trailing window math",
+              t2["f1"]["runs"] == 2 and t2["f1"]["pass_rate_pct"] == 50.0
+              and t2["f1"]["recent"] == [True, False], str(t2["f1"]))
+    finally:
+        dashboard.TREND_WINDOW = old
+
+
+def test_issue_91_trends_skips_corrupt_json():
+    from qaloop.dashboard import build
+    old_ledger = os.environ.get("QALOOP_LEDGER")
+    with tempfile.TemporaryDirectory() as root:
+        os.environ["QALOOP_LEDGER"] = os.path.join(root, "ledger.jsonl")
+        try:
+            good1 = _syn_run_dir_91(root, "20261012T000000Z-f1-aaaa", "f1",
+                                    "passed", 1000.0, 10, [])
+            _syn_run_dir_91(root, "20261012T000001Z-f1-bbbb", "f1",
+                            "failed", 2000.0, 10, [])
+            corrupt_dir = os.path.join(root, "20261012T000002Z-f1-cccc")
+            os.makedirs(corrupt_dir, exist_ok=True)
+            with open(os.path.join(corrupt_dir, "run.json"), "w",
+                      encoding="utf-8") as f:
+                f.write("{not json")
+            path = build(root, os.path.join(root, "dash"))
+            html = open(path, encoding="utf-8").read()
+            check("trends section renders", "Pass rate over time" in html,
+                  html[-300:])
+            check("trends counts only valid runs",
+                  "50.0% (1/2 passed)" in html and "f1" in html,
+                  html[-600:])
+            empty_root = os.path.join(root, "empty")
+            os.makedirs(empty_root)
+            path2 = build(empty_root, os.path.join(root, "dash2"))
+            html2 = open(path2, encoding="utf-8").read()
+            check("trends empty root says no trend data",
+                  "no trend data yet" in html2)
+        finally:
+            if old_ledger is None:
+                del os.environ["QALOOP_LEDGER"]
+            else:
+                os.environ["QALOOP_LEDGER"] = old_ledger
+
+
+def test_issue_91_compare_identical():
+    from qaloop.cli import build_parser
+    from qaloop.compare import compare_runs, render_text
+    with tempfile.TemporaryDirectory() as root:
+        steps = [_syn_step_91("load", "passed", 100),
+                 _syn_step_91("click", "passed", 200)]
+        a = _syn_run_dir_91(root, "a", "f", "passed", 1.0, 300, steps)
+        b = _syn_run_dir_91(root, "b", "f", "passed", 2.0, 340, steps)
+        diff = compare_runs(a, b)
+        check("compare identical despite duration drift",
+              diff["identical"] is True, str(diff["identical"]))
+        check("compare duration delta recorded",
+              diff["duration_delta_ms"] == 40, str(diff["duration_delta_ms"]))
+        check("compare all steps unchanged",
+              all(s["change"] == "unchanged" for s in diff["steps"]),
+              str(diff["steps"]))
+        txt = render_text(diff)
+        check("compare text marks identical",
+              txt.endswith("identical") and "steps: all unchanged" in txt, txt)
+        args = build_parser().parse_args(["compare", a, b])
+        check("compare CLI exit 0 on identical", args.fn(args) == 0)
+
+
+def test_issue_91_compare_step_changes():
+    from qaloop.cli import build_parser
+    from qaloop.compare import compare_runs, render_text
+    with tempfile.TemporaryDirectory() as root:
+        a = _syn_run_dir_91(root, "a", "f", "failed", 1.0, 300,
+                            [_syn_step_91("load", "passed", 100),
+                             _syn_step_91("pay", "failed", 100),
+                             _syn_step_91("flip", "passed", 100),
+                             _syn_step_91("flip2", "passed", 100),
+                             _syn_step_91("old", "passed", 50),
+                             _syn_step_91("steady", "passed", 60)])
+        b = _syn_run_dir_91(root, "b", "f", "passed", 2.0, 330,
+                            [_syn_step_91("load", "passed", 100),
+                             _syn_step_91("pay", "passed", 150),
+                             _syn_step_91("flip", "failed", 110),
+                             _syn_step_91("flip2", "failed", 100),
+                             _syn_step_91("new", "passed", 70),
+                             _syn_step_91("steady", "passed", 60)])
+        diff = compare_runs(a, b)
+        by = {s["name"]: s for s in diff["steps"]}
+        check("compare status change",
+              diff["status_changed"] is True and diff["status_a"] == "failed"
+              and diff["status_b"] == "passed")
+        check("compare step failed->passed",
+              by["pay"]["change"] == "status_changed"
+              and by["pay"]["status_a"] == "failed"
+              and by["pay"]["status_b"] == "passed", str(by["pay"]))
+        check("compare added step",
+              by["new"]["change"] == "added"
+              and by["new"]["status_b"] == "passed", str(by["new"]))
+        check("compare removed step",
+              by["old"]["change"] == "removed"
+              and by["old"]["status_a"] == "passed", str(by["old"]))
+        check("compare unchanged step",
+              by["load"]["change"] == "unchanged", str(by["load"]))
+        check("compare not identical", diff["identical"] is False)
+        check("compare regression flagged at +50%",
+              by["pay"]["duration_delta_ms"] == 50
+              and by["pay"]["duration_regression"] is True, str(by["pay"]))
+        check("compare mild +10% is not a regression",
+              by["flip"]["duration_delta_ms"] == 10
+              and by["flip"]["duration_regression"] is False, str(by["flip"]))
+        check("compare added step no regression guard",
+              by["new"]["duration_delta_ms"] == 70
+              and by["new"]["duration_regression"] is False, str(by["new"]))
+        check("compare top-level duration delta",
+              diff["duration_delta_ms"] == 30, str(diff["duration_delta_ms"]))
+        txt = render_text(diff)
+        check("compare text status line",
+              "status: failed -> passed (CHANGED)" in txt, txt)
+        check("compare text step markers",
+              "+ step 'new'" in txt and "- step 'old'" in txt
+              and "! step 'pay'" in txt, txt)
+        check("compare text REGRESSION flagged",
+              "(+50ms) REGRESSION" in txt, txt)
+        check("compare text mild delta shown without flag",
+              "duration: 100ms -> 110ms (+10ms)" in txt, txt)
+        check("compare text skips zero-delta duration line for flip2",
+              txt.count("duration:") == 5, txt)
+        args = build_parser().parse_args(["compare", a, b])
+        check("compare CLI exit 1 on differ", args.fn(args) == 1)
+
+
+def test_issue_91_compare_errors():
+    from qaloop.cli import build_parser
+    from qaloop.compare import CompareError, _load_run_json, resolve_run
+    with tempfile.TemporaryDirectory() as root:
+        empty = os.path.join(root, "empty")
+        os.makedirs(empty)
+        try:
+            _load_run_json(empty)
+            check("compare missing run.json raises", False, "no error")
+        except CompareError as e:
+            check("compare missing run.json raises", "no run.json" in str(e),
+                  str(e))
+        bad = _syn_run_dir_91(root, "bad", "f", "passed", 1.0, 10, [])
+        with open(os.path.join(bad, "run.json"), "w",
+                  encoding="utf-8") as f:
+            f.write("{oops")
+        try:
+            _load_run_json(bad)
+            check("compare corrupt run.json raises", False, "no error")
+        except CompareError as e:
+            check("compare corrupt run.json raises",
+                  "corrupt run.json" in str(e), str(e))
+        lst = os.path.join(root, "lst")
+        os.makedirs(lst)
+        with open(os.path.join(lst, "run.json"), "w",
+                  encoding="utf-8") as f:
+            f.write("[1,2]")
+        try:
+            _load_run_json(lst)
+            check("compare non-dict run.json raises", False, "no error")
+        except CompareError as e:
+            check("compare non-dict run.json raises",
+                  "not an object" in str(e), str(e))
+        os.makedirs(os.path.join(root, "pref-one"))
+        os.makedirs(os.path.join(root, "pref-two"))
+        os.makedirs(os.path.join(root, "unique-aaa"))
+        try:
+            resolve_run("pref", root)
+            check("compare ambiguous prefix raises", False, "no error")
+        except CompareError as e:
+            check("compare ambiguous prefix raises", "ambiguous" in str(e),
+                  str(e))
+        try:
+            resolve_run("zzz-no-such", root)
+            check("compare no-match raises", False, "no error")
+        except CompareError as e:
+            check("compare no-match raises", "no run dir matching" in str(e),
+                  str(e))
+        check("compare unique prefix resolves",
+              resolve_run("unique", root) == os.path.join(root, "unique-aaa"),
+              resolve_run("unique", root))
+        check("compare direct dir resolves",
+              resolve_run(os.path.join(root, "pref-one"), root)
+              == os.path.join(root, "pref-one"))
+        # CLI maps CompareError to exit 2
+        args = build_parser().parse_args(
+            ["compare", "zzz-no-such-run", "also-missing"])
+        old_runs = os.environ.get("QALOOP_RUNS")
+        os.environ["QALOOP_RUNS"] = root
+        try:
+            check("compare CLI exit 2 on missing", args.fn(args) == 2)
+        finally:
+            if old_runs is None:
+                del os.environ["QALOOP_RUNS"]
+            else:
+                os.environ["QALOOP_RUNS"] = old_runs
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
