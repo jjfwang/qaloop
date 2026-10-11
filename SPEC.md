@@ -97,7 +97,11 @@ Step meta keys: `name`, `expect`, `continue_on_fail` (default false —
 a failed step aborts the run), `timeout_ms` (overrides `timeouts.step_ms`),
 `retry` (default 0 — run once; integer ≥ 0; when a step fails it is re-run
 up to `retry` more times, first success wins; attempts run back-to-back
-with no delay; out of scope: cross-step retry, retrying setup-phase mocks),
+with no delay by default — see `retry_delay_ms`; out of scope: cross-step
+retry, retrying setup-phase mocks),
+`retry_delay_ms` (default 0 — milliseconds to wait between retry attempts;
+integer ≥ 0; `> 0` requires `retry > 0` in the steps phase — a delay with no
+retries is a spec error; the delay counts toward the step's duration),
 `on_dialog` (`accept`|`dismiss`, default `dismiss` — what the runner does
 with a JS dialog raised while the step's action runs; see `dialog`),
 `frame` (`<name | url substring>` — when present, selector resolution goes
