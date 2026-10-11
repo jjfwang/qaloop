@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>login demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 320px; margin: 4rem auto; }
+    label { display: block; margin: .5rem 0; }
+    input { width: 100%; padding: .4rem; box-sizing: border-box; }
+    button { margin-top: .75rem; padding: .5rem 1rem; }
+    #welcome { margin-top: 1rem; font-weight: 600; min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <form id="login-form">
+    <label>Username <input id="user" name="user" type="text" autocomplete="off"></label>
+    <label>Password <input id="pass" name="pass" type="password" autocomplete="off"></label>
+    <button id="login" type="submit">Log in</button>
+  </form>
+  <div id="welcome" aria-live="polite"></div>
+  <script>
+    // Pure client-side demo auth: submitting renders "Welcome, <user>".
+    document.getElementById("login-form").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var u = document.getElementById("user").value;
+      document.getElementById("welcome").textContent = "Welcome, " + u;
+    });
+  </script>
+</body>
+</html>

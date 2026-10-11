@@ -1,0 +1,22 @@
+# Shared login fragment (issue #86 `include` composition).
+#
+# A fragment is a step list with `${...}` parameters filled in at compose
+# time from the including step's `with:` mapping. Fragments carry no
+# setup/teardown/services/target — those would be silently dropped, so
+# they are rejected at load time. Any ${var} NOT named in `with:` falls
+# through to the flow's normal $ENV substitution.
+name: login-fragment
+description: >-
+  Shared login interaction for the demo-login proof (issue #86). Open the
+  login page, fill the credentials, submit, and expect the welcome text.
+steps:
+  - name: open the login page
+    goto: /demo/demo-login.html
+  - name: enter the username
+    fill: {target: "#user", text: "${user}"}
+  - name: enter the password
+    fill: {target: "#pass", text: "${password}"}
+  - name: submit and expect the welcome text
+    click: "#login"
+    expect:
+      text_contains: {selector: "#welcome", text: "Welcome, ${user}"}
