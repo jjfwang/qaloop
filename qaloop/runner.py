@@ -9,7 +9,7 @@ import os
 import re
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -899,6 +899,50 @@ def _screenshot_policy(spec: FlowSpec) -> str:
     return spec.artifacts.get("screenshot", "per-step")
 
 
+# Issue #87: runtime ${name}/$name reference shape (same as spec._VAR_REF).
+_VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _interpolate_vars(value, variables: dict, where: str):
+    """Substitute ${name}/$name in step params from the run-scoped table.
+
+    Returns a new structure; the parsed spec is never mutated. A
+    reference to a name that was never captured is a clear step
+    failure naming the variable.
+    """
+    if isinstance(value, str):
+        def repl(m: "re.Match") -> str:
+            name = m.group(1) or m.group(2)
+            if name not in variables:
+                raise RuntimeError(
+                    f"{where}: variable ${{{name}}} was never captured "
+                    f"(no store step set it before this step)")
+            return variables[name]
+
+        return _VAR_REF.sub(repl, value)
+    if isinstance(value, dict):
+        return {k: _interpolate_vars(v, variables, where)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_vars(v, variables, where) for v in value]
+    return value
+
+
+def _evaluate_stores(page, step: Step, variables: dict, where: str) -> None:
+    """Evaluate each store `js` via page.evaluate and capture str(result).
+
+    Runs after a passing step; a failed step captures nothing.
+    Re-storing a name overwrites the previous value.
+    """
+    for name, src in step.store.items():
+        try:
+            result = page.evaluate(src["js"])
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"{where}: store '{name}' evaluation failed: {e}") from e
+        variables[name] = str(result)
+
+
 def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
              headless: bool = True, executable_path: str | None = None,
              baseline_update: bool = False,
@@ -921,6 +965,10 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     # start, keyed by url pattern. Reset each run; mocks registered in
     # setup thread through here, and mock_calls assertions read it.
     mock_hits: dict = {}
+    # Issue #87: run-scoped flow-variable table, shared across setup,
+    # steps, and teardown. Steps capture via `store:`; later steps read
+    # via ${name} interpolation of their params.
+    variables: dict = {}
     status, failed_step, run_error = "passed", None, ""
     shot_policy = _screenshot_policy(spec)
     ax_on_failure = spec.artifacts.get("ax_snapshot", "on-failure") == "on-failure"
@@ -976,11 +1024,20 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         sr.status = "passed"
                         sr.error = ""
                         try:
+                            # Issue #87: interpolate ${name} in the step's
+                            # params from the run-scoped variable table
+                            # before the action, on a copy — the parsed
+                            # spec stays pristine for retries and reports.
+                            where = f"{phase}[{step.index}]"
+                            eff_step = replace(
+                                step,
+                                params=_interpolate_vars(step.params,
+                                                         variables, where))
                             if step.op:
-                                _do_action(page, step, target, mock_hits,
+                                _do_action(page, eff_step, target, mock_hits,
                                            upload_dir=upload_dir)
                             sr.assertions = _check_assertions(
-                                page, step, collectors,
+                                page, eff_step, collectors,
                                 baseline_dir=baseline_dir,
                                 baseline_update=baseline_update,
                                 run_dir=run_dir,
@@ -994,6 +1051,11 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                                     f"{a.name}: {a.detail}"
                                     for a in failed_asserts[:3])
                             else:
+                                # A passing step captures its store
+                                # variables; a failed step captures
+                                # nothing.
+                                _evaluate_stores(page, step, variables,
+                                                 where)
                                 break  # first success wins
                         except Exception as e:  # noqa: BLE001
                             sr.status = "failed"

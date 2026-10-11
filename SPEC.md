@@ -538,8 +538,52 @@ Rules:
 - Inlined steps keep their own names and are re-indexed at the include
   position; includes expand in `setup`, `steps`, and `teardown`.
 - Boundary: `${var}` here is load-time parameter substitution from
-  `with:` only — **runtime capture via `store` is issue #87 and out of
-  scope**. Fragments cannot see runtime values.
+  `with:` only — **runtime capture via `store` is a separate feature**,
+  described in the next section. Fragments cannot see runtime values.
+
+### Flow variables — `store` and `${var}` interpolation
+
+Steps can capture page state into run-scoped variables and reuse them
+later in the run:
+
+```yaml
+steps:
+  - name: create an item and capture its generated id
+    click: "#create"
+    store: {itemId: {js: "document.querySelector('.row').dataset.itemId"}}
+  - name: delete the item using the captured id
+    click: ".del[data-item-id='${itemId}']"
+```
+
+Rules:
+
+- `store` is a step-level meta key (alongside `name`, `expect`,
+  `timeout_ms`, ...): a mapping of variable name to
+  `{js: <expression>}`. Variable names match `[A-Za-z_][A-Za-z0-9_]*`.
+  Only the `js` source is supported; `text`/`attribute` capture is
+  explicitly later and rejected at load (`SpecError`), fail-closed.
+- The `js` expression is evaluated with `page.evaluate` **after** the
+  step's action and assertions pass; `str(result)` is captured. A
+  failed step captures nothing. Re-storing a name overwrites the
+  previous value.
+- The variable table is run-scoped: shared across `setup`, `steps`,
+  and `teardown`, in execution order.
+- Before each step, `${name}` (or `$name`) in the step's **params**
+  is interpolated from the table — selectors, fill text, `js` source,
+  and so on. `expect`, `store`'s `js`, and other keys are not
+  interpolated.
+- A stored name is exempt from load-time `$ENV` expansion: where a
+  name is both an environment variable and a declared store variable,
+  the runtime table wins.
+- A `${name}` that is neither a declared store variable nor an
+  environment variable is a `SpecError` at load time.
+- A `${name}` referencing a declared variable with no earlier `store`
+  step is a `SpecError` at load time (use-before-store, statically
+  known — including a step referencing its own `store`, which is
+  evaluated after the step).
+- At runtime, referencing a variable that was never captured (e.g.
+  the `store` step was skipped) fails the step with an error naming
+  the variable.
 
 ## Conventions
 

@@ -1,0 +1,29 @@
+name: demo-flow-variables
+description: >-
+  Browser proof for flow variables (issue #87): create a row whose id is
+  generated at runtime, capture it with `store:` into ${itemId}, assert
+  the row is visible, then delete the row using the captured id and
+  assert it is gone.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the flow-variables demo page
+    goto: /demo/flow-variables.html
+
+steps:
+  - name: create an item and capture its generated id
+    click: "#create"
+    store: {itemId: {js: "document.querySelector('.row').dataset.itemId"}}
+    expect:
+      - visible: ".row"
+
+  - name: delete the item using the captured id
+    click: ".del[data-item-id='${itemId}']"
+    expect:
+      - hidden: ".row"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

@@ -24,7 +24,7 @@ ACTION_OPS = {
     "mock", "upload", "drag", "type", "focus",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
-                 "on_dialog", "frame"}
+                 "on_dialog", "frame", "store"}  # issue #87 — flow variables
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
@@ -52,15 +52,21 @@ class SpecError(ValueError):
     """Raised when a flow spec is invalid."""
 
 
-def envsubst(value: Any, where: str, strict: bool = True) -> Any:
+def envsubst(value: Any, where: str, strict: bool = True,
+             skip_names: set | None = None) -> Any:
     """Recursively expand $VAR / ${VAR} in strings.
 
     strict=True (default): a missing var is an error.
     strict=False: missing vars are left as-is (for `validate` without env).
+    skip_names: issue #87 — declared runtime store variables. ${name}
+    references to these are left untouched so the runner can interpolate
+    them from the run-scoped variable table instead.
     """
     if isinstance(value, str):
         def repl(m: "re.Match[str]") -> str:
             name = m.group(1).strip("{}")
+            if skip_names and name in skip_names:
+                return m.group(0)
             if name not in os.environ:
                 if not strict:
                     return m.group(0)
@@ -69,9 +75,9 @@ def envsubst(value: Any, where: str, strict: bool = True) -> Any:
 
         return _ENV_VAR.sub(repl, value)
     if isinstance(value, dict):
-        return {k: envsubst(v, where, strict) for k, v in value.items()}
+        return {k: envsubst(v, where, strict, skip_names) for k, v in value.items()}
     if isinstance(value, list):
-        return [envsubst(v, where, strict) for v in value]
+        return [envsubst(v, where, strict, skip_names) for v in value]
     return value
 
 
@@ -92,6 +98,9 @@ class Step:
     frame: str | None = None  # issue #80 — iframe/frame scope: frame name
     # or URL substring; selectors resolve via page.frame(name|url) instead of
     # the main frame
+    store: dict = field(default_factory=dict)  # issue #87 — flow
+    # variables: {name: {js: <expr>}} evaluated after the step; the
+    # captured str(result) feeds ${name} interpolation in later steps
 
 
 @dataclass
@@ -313,6 +322,80 @@ def _flatten_includes(resolved: list) -> list:
     if not isinstance(resolved, list):
         return resolved
     return [s for s, _ in resolved]
+
+
+# Issue #87: flow-variable names (also the runtime ${name} reference
+# shape). Matches envsubst's \w for names starting with a letter.
+_STORE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _collect_store_names(raw_steps: Any) -> set:
+    """Pre-pass over RAW (pre-envsubst) steps: declared store variable names.
+
+    Runs before env substitution so ${name} runtime references survive
+    load-time $ENV expansion untouched. Defensive: malformed store
+    entries are ignored here — _parse_step raises the real error.
+    """
+    names = set()
+    if not isinstance(raw_steps, list):
+        return names
+    for s in raw_steps:
+        if isinstance(s, dict):
+            store = s.get("store")
+            if isinstance(store, dict):
+                names.update(k for k in store if isinstance(k, str))
+    return names
+
+
+def _find_var_refs(value: Any) -> set:
+    """Collect ${name}/$name references in a value (strings, dicts, lists)."""
+    refs = set()
+    if isinstance(value, str):
+        for m in _VAR_REF.finditer(value):
+            refs.add(m.group(1) or m.group(2))
+    elif isinstance(value, dict):
+        for v in value.values():
+            refs |= _find_var_refs(v)
+    elif isinstance(value, list):
+        for v in value:
+            refs |= _find_var_refs(v)
+    return refs
+
+
+def _check_variable_ordering(setup: list, steps: list, teardown: list,
+                             declared: set, where: str) -> None:
+    """Load-time use-before-store check (issue #87).
+
+    A ${name} reference in a step's params where no earlier step (in
+    execution order: setup, steps, teardown) declares `store` for that
+    name can never be captured at runtime, so it is a SpecError.
+    References to names that are neither declared store variables nor
+    environment variables were already rejected by envsubst in strict
+    mode; in non-strict mode they are skipped here (the env is unknown).
+    """
+    ordered = ([("setup", s) for s in setup] + [("steps", s) for s in steps]
+               + [("teardown", s) for s in teardown])
+    first_store: dict = {}  # name -> (global index, phase, step index)
+    for i, (phase, s) in enumerate(ordered):
+        for name in s.store:
+            first_store.setdefault(name, (i, phase, s.index))
+    for i, (phase, s) in enumerate(ordered):
+        for ref in sorted(_find_var_refs(s.params)):
+            if ref not in declared:
+                continue
+            pos = first_store.get(ref)
+            if pos is None or pos[0] >= i:
+                # pos is None: declared somewhere the pre-pass saw but no
+                # parsed step carries it (unreachable in practice); pos[0]
+                # >= i covers same-step self-reference (store evaluates
+                # after the step, so it cannot feed its own params).
+                detail = (f"first stored by {pos[1]}[{pos[2]}]"
+                          if pos is not None else "never stored")
+                raise SpecError(
+                    f"{where}: {phase}[{s.index}]: variable ${{{ref}}} is "
+                    f"used before any step stores it ({detail}) — declare "
+                    f"`store` for it in an earlier step")
 
 
 def _validate_op_params(op: str | None, params: Any, where: str) -> None:
@@ -770,6 +853,32 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
     if on_dialog not in DIALOG_POLICIES:
         raise SpecError(
             f"{where}: on_dialog must be accept|dismiss, got {on_dialog!r}")
+    # Issue #87: step-level variable capture. Only the js source is
+    # supported in this slice; text/attribute sources are explicitly
+    # later (the issue), so anything else fails closed.
+    store = raw.get("store") or {}
+    if not isinstance(store, dict):
+        raise SpecError(
+            f"{where}: store must be a mapping of variable name -> source, "
+            f"got {type(store).__name__}")
+    for vname, src in store.items():
+        if not isinstance(vname, str) or not _STORE_NAME.match(vname):
+            raise SpecError(
+                f"{where}: store variable names must match "
+                f"[A-Za-z_][A-Za-z0-9_]*, got {vname!r}")
+        if not isinstance(src, dict):
+            raise SpecError(
+                f"{where}: store '{vname}' source must be a mapping, got "
+                f"{type(src).__name__}")
+        if set(src) != {"js"}:
+            raise SpecError(
+                f"{where}: store '{vname}' supports only the js source "
+                f"(text/attribute capture is not yet supported), got "
+                f"{sorted(src)}")
+        js = src["js"]
+        if not isinstance(js, str) or not js:
+            raise SpecError(
+                f"{where}: store '{vname}' js must be a non-empty string")
     frame = raw.get("frame")
     if frame is not None:
         # Issue #80: frame must be a non-empty string (frame name or URL
@@ -802,17 +911,19 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         name=name or f"{op or 'expect'} #{index}",
         op=op, params=params, expect=expect, expect_items=expect_items,
         continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
-        retry=retry, on_dialog=on_dialog, frame=frame, raw=raw,
+        retry=retry, on_dialog=on_dialog, frame=frame, store=store, raw=raw,
     )
 
 
 def _parse_steps(raw: Any, phase: str, default_timeout_ms: int,
-               strict_env: bool = True) -> list[Step]:
+               strict_env: bool = True,
+               skip_names: set | None = None) -> list[Step]:
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise SpecError(f"{phase}: must be a list of steps")
-    return [_parse_step(envsubst(s, f"{phase}[{i}]", strict_env), i, phase, default_timeout_ms)
+    return [_parse_step(envsubst(s, f"{phase}[{i}]", strict_env, skip_names),
+                        i, phase, default_timeout_ms)
             for i, s in enumerate(raw)]
 
 
@@ -857,15 +968,30 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         _resolve_includes(raw.get("steps"), path, (abs_path,)))
     teardown_raw = _flatten_includes(
         _resolve_includes(raw.get("teardown"), path, (abs_path,)))
+    # Issue #87: collect declared store variable names across all phases
+    # BEFORE env substitution, so ${name} runtime references in step
+    # params survive load-time $ENV expansion untouched; a stored name
+    # is also exempt when it shadows an environment variable (the
+    # runtime table wins).
+    store_names = (_collect_store_names(setup_raw)
+                   | _collect_store_names(steps_raw)
+                   | _collect_store_names(teardown_raw))
+    setup = _parse_steps(setup_raw, "setup", default_step_ms, strict_env,
+                         store_names)
+    steps = _parse_steps(steps_raw, "steps", default_step_ms, strict_env,
+                         store_names)
+    teardown = _parse_steps(teardown_raw, "teardown", default_step_ms,
+                            strict_env, store_names)
+    _check_variable_ordering(setup, steps, teardown, store_names, where)
     return FlowSpec(
         name=name,
         description=str(raw.get("description") or ""),
         target=target,
         viewport={"width": int(viewport.get("width", 1280)),
                   "height": int(viewport.get("height", 800))},
-        setup=_parse_steps(setup_raw, "setup", default_step_ms, strict_env),
-        steps=_parse_steps(steps_raw, "steps", default_step_ms, strict_env),
-        teardown=_parse_steps(teardown_raw, "teardown", default_step_ms, strict_env),
+        setup=setup,
+        steps=steps,
+        teardown=teardown,
         artifacts=artifacts,
         timeouts={k: int(v) for k, v in timeouts.items()},
         investigate_on_failure=bool(raw.get("investigate_on_failure", True)),

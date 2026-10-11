@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>flow variables demo</title>
+</head>
+<body>
+<h1>Item list</h1>
+<button id="create">Create item</button>
+<div id="list"></div>
+<script>
+let counter = 0;
+document.getElementById("create").addEventListener("click", () => {
+  // Each row gets a generated id the flow cannot know in advance: it
+  // must capture it at runtime via store:, then reuse it with ${var}.
+  counter++;
+  const id = "item-" + Date.now() + "-" + counter;
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dataset.itemId = id;
+  const label = document.createElement("span");
+  label.textContent = "Row " + id + " ";
+  const del = document.createElement("button");
+  del.className = "del";
+  del.dataset.itemId = id;
+  del.textContent = "Delete";
+  del.addEventListener("click", () => row.remove());
+  row.appendChild(label);
+  row.appendChild(del);
+  document.getElementById("list").appendChild(row);
+});
+</script>
+</body>
+</html>
