@@ -10,6 +10,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field, replace
+from urllib.error import HTTPError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -38,6 +39,9 @@ class StepResult:
     assertions: list[AssertionResult] = field(default_factory=list)
     artifacts: StepArtifacts = field(default_factory=StepArtifacts)
     attempts: int = 1  # attempts actually used (1-indexed count)
+    # Issue #96: HTTP status of a seed step's request (None for js seeds
+    # and for non-seed steps); recorded structurally in run.json.
+    seed_status: int | None = None
 
 
 @dataclass
@@ -78,7 +82,8 @@ class RunResult:
                             for a in s.get("assertions", [])],
                 artifacts=StepArtifacts(
                     screenshot=s.get("screenshot"), ax_snapshot=s.get("ax_snapshot")),
-                attempts=s.get("attempts", 1)))
+                attempts=s.get("attempts", 1),
+                seed_status=s.get("seed_status")))
         return cls(flow_name=d["flow_name"], target=d.get("target", ""),
                    status=d["status"], started=d.get("started", 0),
                    ended=d.get("ended", 0), steps=steps,
@@ -107,7 +112,7 @@ class RunResult:
                     "index": s.index, "phase": s.phase, "name": s.name,
                     "op": s.op, "status": s.status,
                     "duration_ms": s.duration_ms, "error": s.error,
-                    "attempts": s.attempts,
+                    "attempts": s.attempts, "seed_status": s.seed_status,
                     "assertions": [
                         {"name": a.name, "passed": a.passed, "detail": a.detail}
                         for a in s.assertions
@@ -179,21 +184,39 @@ def _ensure_origin(page, target: str) -> None:
         page.goto(target, wait_until="domcontentloaded")
 
 
-def _do_seed(page, params: dict, timeout_ms: int, target: str) -> None:
+class SeedRequestError(Exception):
+    """A seed HTTP request failed with a 4xx/5xx response.
+
+    Carries the response status so run.json records it structurally
+    (StepResult.seed_status) instead of burying it in the error string.
+    """
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"seed request failed: HTTP {status}: {detail}")
+        self.status = status
+
+
+def _do_seed(page, params: dict, timeout_ms: int, target: str) -> int | None:
+    """Run a seed step; return the HTTP response status (None for js seeds)."""
     if "js" in params:
         _ensure_origin(page, target)
         page.evaluate(params["js"])
-        return
+        return None
     http = params["http"]
     method = http.get("method", "POST").upper()
     data = None
     headers = {"Content-Type": "application/json"}
+    # User-supplied headers win over the default Content-Type (issue #96).
+    headers.update(http.get("headers") or {})
     if "json" in http:
         import json as _json
         data = _json.dumps(http["json"]).encode()
     req = Request(http["url"], data=data, headers=headers, method=method)
-    with urlopen(req, timeout=timeout_ms / 1000) as resp:
-        resp.read()
+    try:
+        with urlopen(req, timeout=timeout_ms / 1000) as resp:
+            resp.read()
+            return resp.status
+    except HTTPError as e:
+        raise SeedRequestError(e.code, e.reason) from e
 
 
 def _route_delay(route, delay_s: float) -> None:
@@ -276,7 +299,8 @@ def _do_mock(page, params: dict, mock_hits: dict) -> None:
 
 
 def _do_action(page, step: Step, target: str, mock_hits: dict,
-               upload_dir: str | None = None) -> None:
+               upload_dir: str | None = None) -> int | None:
+    """Run one action; returns a seed step's HTTP status (None otherwise)."""
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
     # Issue #80: selector-resolving ops run against the frame scope when the
@@ -386,7 +410,7 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
     elif op == "back":
         page.go_back(timeout=t, wait_until="domcontentloaded")
     elif op == "seed":
-        _do_seed(page, p, t, target)
+        return _do_seed(page, p, t, target)
     elif op == "script":
         _ensure_origin(page, target)
         page.evaluate(p["js"])
@@ -1072,8 +1096,11 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                                 params=_interpolate_vars(step.params,
                                                          variables, where))
                             if step.op:
-                                _do_action(page, eff_step, target, mock_hits,
-                                           upload_dir=upload_dir)
+                                # Issue #96: seed steps report their HTTP
+                                # status; other ops report None.
+                                sr.seed_status = _do_action(
+                                    page, eff_step, target, mock_hits,
+                                    upload_dir=upload_dir)
                             sr.assertions = _check_assertions(
                                 page, eff_step, collectors,
                                 baseline_dir=baseline_dir,
@@ -1098,6 +1125,10 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         except Exception as e:  # noqa: BLE001
                             sr.status = "failed"
                             sr.error = f"{type(e).__name__}: {str(e)[:400]}"
+                            # Issue #96: a failed seed request still records
+                            # its status structurally, not just in the error.
+                            if isinstance(e, SeedRequestError):
+                                sr.seed_status = e.status
                         # Issue #95: failed and attempts remain — wait
                         # retry_delay_ms between attempts (default 0 keeps
                         # the back-to-back behavior). No delay after the

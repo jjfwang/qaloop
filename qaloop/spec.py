@@ -679,7 +679,15 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
         if "http" in params:
             http = params["http"]
             if not isinstance(http, dict) or "url" not in http:
-                raise SpecError(f"{where}: seed.http needs {{url, method?, json?}}")
+                raise SpecError(
+                    f"{where}: seed.http needs {{url, method?, json?, headers?}}")
+            if "headers" in http:
+                headers = http["headers"]
+                if (not isinstance(headers, dict)
+                        or any(not isinstance(k, str) or not isinstance(v, str)
+                               for k, v in headers.items())):
+                    raise SpecError(
+                        f"{where}: seed.http.headers must be a dict of str->str")
     elif op == "script":
         if not isinstance(params, dict) or "js" not in params:
             raise SpecError(f"{where}: script needs {{js: ...}}")
