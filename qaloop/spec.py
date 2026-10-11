@@ -36,6 +36,7 @@ ASSERTION_KEYS = {
     "cookie", "storage",  # issue #82 — cookies and web storage
     "request_body",  # issue #83 — opt-in request-body assertions
     "perf",  # issue #84 — Web Vitals performance budgets
+    "a11y",  # issue #85 — axe-core accessibility scan
 }
 
 # Step-level dialog policy: what the runner does when the page raises a JS
@@ -511,6 +512,44 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     raise SpecError(
                         f"{where}: assertion perf metric {metric!r} budget "
                         f"must be a non-negative number, got {n!r}")
+        elif key == "a11y":
+            # Issue #85: axe-core accessibility violation audit. A
+            # non-empty mapping with required violations: {lte: budget}
+            # (only lte: budgets are upper bounds, like perf) and an
+            # optional rules: [axe rule ids] scope. The budget is a
+            # non-negative number (same guard as perf budgets).
+            if not isinstance(val, dict) or not val:
+                raise SpecError(
+                    f"{where}: assertion a11y needs a non-empty mapping "
+                    f"with violations: {{lte: budget}} "
+                    f"(optional rules: [...])")
+            unknown_a11y = [k for k in val
+                            if k not in {"violations", "rules"}]
+            if unknown_a11y:
+                raise SpecError(
+                    f"{where}: assertion a11y takes only "
+                    f"violations|rules, got {unknown_a11y}")
+            budget = val.get("violations")
+            if (not isinstance(budget, dict) or len(budget) != 1
+                    or "lte" not in budget):
+                raise SpecError(
+                    f"{where}: assertion a11y needs "
+                    f"violations: {{lte: budget}}")
+            n = budget["lte"]
+            # bools are numbers in Python; a bool budget is always a typo
+            if isinstance(n, bool) or not isinstance(n, (int, float)) \
+                    or n < 0:
+                raise SpecError(
+                    f"{where}: assertion a11y violations budget must be "
+                    f"a non-negative number, got {n!r}")
+            if "rules" in val:
+                rules = val["rules"]
+                if (not isinstance(rules, list) or not rules
+                        or not all(isinstance(r, str) and r
+                                   for r in rules)):
+                    raise SpecError(
+                        f"{where}: assertion a11y rules must be a "
+                        f"non-empty list of axe rule id strings")
         if key == "request_body":
             # Issue #83: opt-in request-body assertion. Exactly one of
             # contains|equals (same exactly-one guard as attribute's

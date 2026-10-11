@@ -4945,6 +4945,140 @@ def test_issue_84_perf_assertions():
           and "first-input" in pg.scripts[0], str(len(pg.scripts)))
 
 
+def test_issue_85_a11y_assertions():
+    """Issue #85: axe-core a11y assertion.
+
+    Validation: a11y needs a non-empty mapping with violations: {lte:
+    non-negative number} (only lte) and optional rules: [axe rule id
+    strings]; non-mappings, missing violations, gte, bare numbers,
+    negative/bool budgets, unknown keys, and bad rules are rejected.
+    Runner: vendored axe.min.js injected idempotently
+    (add_script_tag only when window.axe is undefined), one-shot
+    axe.run per step with optional runOnly scope; PASS when the
+    violation count is <= the budget, FAIL names the count, ids, and
+    first descriptions; injection/scan errors fail closed.
+    """
+    from qaloop.runner import _check_assertions, _axe_scan
+    from qaloop.spec import Step, SpecError, _validate_expect
+
+    def rejects(expect, label):
+        try:
+            _validate_expect(expect, "steps[0]")
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+
+    good = {"a11y": {"violations": {"lte": 0},
+                     "rules": ["color-contrast"]}}
+    check("a11y valid mapping accepted",
+          _validate_expect(good, "steps[0]") == [("a11y", good["a11y"])])
+    check("a11y violations-only accepted",
+          _validate_expect({"a11y": {"violations": {"lte": 3}}}, "steps[0]")
+          == [("a11y", {"violations": {"lte": 3}})])
+    rejects({"a11y": {}}, "a11y empty mapping rejected")
+    rejects({"a11y": "no violations"}, "a11y non-mapping rejected")
+    rejects({"a11y": {"rules": ["image-alt"]}},
+            "a11y missing violations rejected")
+    rejects({"a11y": {"violations": {"gte": 0}}}, "a11y gte rejected")
+    rejects({"a11y": {"violations": {"equals": 0}}}, "a11y equals rejected")
+    rejects({"a11y": {"violations": 0}}, "a11y bare number rejected")
+    rejects({"a11y": {"violations": {"lte": -1}}},
+            "a11y negative budget rejected")
+    rejects({"a11y": {"violations": {"lte": True}}},
+            "a11y bool budget rejected")
+    rejects({"a11y": {"violations": {"lte": "0"}}},
+            "a11y string budget rejected")
+    rejects({"a11y": {"violations": {"lte": 0, "gte": 0}}},
+            "a11y two comparators rejected")
+    rejects({"a11y": {"violations": {"lte": 0}, "bogus": 1}},
+            "a11y unknown key rejected")
+    rejects({"a11y": {"violations": {"lte": 0}, "rules": []}},
+            "a11y empty rules rejected")
+    rejects({"a11y": {"violations": {"lte": 0}, "rules": "color-contrast"}},
+            "a11y string rules rejected")
+    rejects({"a11y": {"violations": {"lte": 0}, "rules": [42]}},
+            "a11y non-string rules rejected")
+    rejects({"a11y": {"violations": {"lte": 0}, "rules": [""]}},
+            "a11y blank rule rejected")
+
+    VIOLS = [{"id": "image-alt",
+              "description": "Images must have alternate text"},
+             {"id": "button-name",
+              "description": "Buttons must have discernible text"}]
+
+    class FakeA11yPage:
+        def __init__(self, violations=None, fail_msg=None):
+            self._violations = list(violations or [])
+            self._fail_msg = fail_msg
+            self.script_tags = []
+            self.eval_calls = []
+            self.axe_present = False
+        def evaluate(self, script, *args):
+            self.eval_calls.append((script, args))
+            if "typeof window.axe" in script:
+                return not self.axe_present
+            if self._fail_msg:
+                raise RuntimeError(self._fail_msg)
+            return [dict(v) for v in self._violations]
+        def add_script_tag(self, content=None, **kwargs):
+            self.script_tags.append(content)
+            self.axe_present = True
+
+    def run(a11y_params, page, timeout_ms=5000):
+        step = Step(index=0, phase="steps", name="e", op=None, params=None,
+                    expect={}, expect_items=[("a11y", a11y_params)],
+                    continue_on_fail=False, timeout_ms=timeout_ms,
+                    frame=None, raw={})
+        return _check_assertions(page, step, None)
+
+    pg = FakeA11yPage(violations=VIOLS)
+    res = run({"violations": {"lte": 5}}, pg)
+    check("a11y under budget passes", res[0].passed, res[0].detail)
+    check("a11y pass detail names count",
+          "violations=2 want <=5" in res[0].detail, res[0].detail)
+    check("a11y injects vendored script once",
+          len(pg.script_tags) == 1 and "axe" in pg.script_tags[0]
+          and len(pg.script_tags[0]) > 100000,
+          f"tags={len(pg.script_tags)}")
+    # Second scan on the same page skips re-injection.
+    res = run({"violations": {"lte": 5}}, pg)
+    check("a11y injection is idempotent", res[0].passed
+          and len(pg.script_tags) == 1, f"tags={len(pg.script_tags)}")
+    # Violation: FAIL, detail names count, ids, descriptions.
+    res = run({"violations": {"lte": 0}}, FakeA11yPage(violations=VIOLS))
+    check("a11y over budget fails", not res[0].passed, res[0].detail)
+    check("a11y fail detail names ids and descriptions",
+          "violations=2 want <=0" in res[0].detail
+          and "ids=image-alt,button-name" in res[0].detail
+          and "Images must have alternate text" in res[0].detail
+          and "Buttons must have discernible text" in res[0].detail,
+          res[0].detail)
+    # Exactly at budget passes.
+    res = run({"violations": {"lte": 2}}, FakeA11yPage(violations=VIOLS))
+    check("a11y at budget passes", res[0].passed, res[0].detail)
+    # Empty violation list passes with empty ids.
+    res = run({"violations": {"lte": 0}}, FakeA11yPage())
+    check("a11y clean page passes", res[0].passed, res[0].detail)
+    check("a11y clean detail shows zero ids",
+          "violations=0 want <=0; ids=" in res[0].detail, res[0].detail)
+    # Fail-closed: injection/scan error fails with the error named.
+    res = run({"violations": {"lte": 0}},
+              FakeA11yPage(fail_msg="axe is not defined"))
+    check("a11y scan error fails closed",
+          not res[0].passed and "axe scan failed: axe is not defined"
+          in res[0].detail, res[0].detail)
+    # rules list is passed through to the scan wrapper.
+    pg = FakeA11yPage()
+    _axe_scan(pg, ["color-contrast"])
+    check("a11y rules passed to evaluate",
+          pg.eval_calls[-1][1] == (["color-contrast"],),
+          str(pg.eval_calls[-1][1]))
+    pg = FakeA11yPage()
+    _axe_scan(pg, None)
+    check("a11y no-rules passes empty list",
+          pg.eval_calls[-1][1] == ([],), str(pg.eval_calls[-1][1]))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

@@ -1,0 +1,26 @@
+name: demo-a11y
+description: >-
+  Browser proof for the a11y assertion (issue #85): the demo page carries
+  deliberate violations (an <img> without alt, an empty <button>), so the
+  full-scan step fails with the violation ids named in the detail; a
+  rules-scoped color-contrast check on the same page passes.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the a11y demo page
+    goto: /demo/demo-a11y.html
+
+steps:
+  - name: full scan fails with named violations
+    expect:
+      a11y: {violations: {lte: 0}}
+    continue_on_fail: true
+  - name: rules-scoped color-contrast check passes
+    expect:
+      a11y: {violations: {lte: 0}, rules: ["color-contrast"]}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 60000, run_ms: 180000}
+investigate_on_failure: false
