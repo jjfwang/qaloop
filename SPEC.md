@@ -106,7 +106,21 @@ retries is a spec error; the delay counts toward the step's duration),
 with a JS dialog raised while the step's action runs; see `dialog`),
 `frame` (`<name | url substring>` — when present, selector resolution goes
 through `page.frame(name=...)`/`page.frame(url=...)` instead of the main
-frame; see below).
+frame; see below),
+`screenshot` (`always`|`never`|`on-failure`, default none — per-step override
+of the flow-level `artifacts.screenshot` policy: `always` captures the step
+screenshot regardless of the flow policy, `never` suppresses it,
+`on-failure` captures only if the step failed; when absent the flow policy
+governs, so omitting the key is byte-identical to not having the override).
+
+```yaml
+  - name: always photograph this step
+    screenshot: always                # even when artifacts.screenshot: on-failure
+    click: "#buy"
+  - name: skip the screenshot for this noisy step
+    screenshot: never                 # even when artifacts.screenshot: per-step
+    wait: "#spinner"
+```
 
 ### `frame`: iframe/frame scoping for actions and assertions
 

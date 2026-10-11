@@ -26,7 +26,8 @@ ACTION_OPS = {
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
                  "retry_delay_ms",  # issue #95 — delay between retry attempts
-                 "on_dialog", "frame", "store"}  # issue #87 — flow variables
+                 "on_dialog", "frame", "store",  # issue #87 — flow variables
+                 "screenshot"}  # issue #97 — per-step screenshot override
 
 ASSERTION_KEYS = {
     "visible", "hidden", "text_contains", "text_matches", "count",
@@ -45,6 +46,11 @@ ASSERTION_KEYS = {
 # dialog during the step. "dismiss" preserves Playwright's default behavior.
 DIALOG_POLICIES = {"accept", "dismiss"}
 DIALOG_TYPES = {"alert", "confirm", "prompt", "beforeunload"}
+# Issue #97: per-step `screenshot:` override values. Distinct from the
+# flow-level artifacts.screenshot values (per-step|on-failure|none):
+# always = shoot regardless of flow policy, never = skip the shot,
+# on-failure = shoot only if the step failed.
+STEP_SCREENSHOT_POLICIES = {"always", "never", "on-failure"}
 
 # Issue #84: metric names supported by the `perf` assertion.
 PERF_METRICS = {"lcp_ms", "cls", "inp_ms"}
@@ -106,6 +112,9 @@ class Step:
     store: dict = field(default_factory=dict)  # issue #87 — flow
     # variables: {name: {js: <expr>}} evaluated after the step; the
     # captured str(result) feeds ${name} interpolation in later steps
+    # issue #97 — per-step screenshot override (always|never|on-failure);
+    # None (absent) inherits the flow-level artifacts.screenshot policy
+    screenshot: str | None = None
 
 
 @dataclass
@@ -1018,6 +1027,13 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
     if on_dialog not in DIALOG_POLICIES:
         raise SpecError(
             f"{where}: on_dialog must be accept|dismiss, got {on_dialog!r}")
+    # Issue #97: per-step screenshot override. Absent -> None, the flow
+    # policy governs; anything else must be a valid override value.
+    screenshot = raw.get("screenshot")
+    if screenshot is not None and screenshot not in STEP_SCREENSHOT_POLICIES:
+        raise SpecError(
+            f"{where}: screenshot must be always|never|on-failure, "
+            f"got {screenshot!r}")
     # Issue #87: step-level variable capture. Only the js source is
     # supported in this slice; text/attribute sources are explicitly
     # later (the issue), so anything else fails closed.
@@ -1077,7 +1093,7 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         op=op, params=params, expect=expect, expect_items=expect_items,
         continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
         retry=retry, retry_delay_ms=retry_delay_ms, on_dialog=on_dialog,
-        frame=frame, store=store, raw=raw,
+        frame=frame, store=store, screenshot=screenshot, raw=raw,
     )
 
 

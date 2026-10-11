@@ -929,6 +929,22 @@ def _screenshot_policy(spec: FlowSpec) -> str:
     return spec.artifacts.get("screenshot", "per-step")
 
 
+# Issue #97: decide whether the runner captures the step screenshot.
+# step_screenshot is the step-level `screenshot:` override
+# (always|never|on-failure) or None to inherit the flow-level shot_policy
+# (per-step|on-failure|none).
+def _should_screenshot(step_screenshot: str | None, shot_policy: str,
+                       status: str) -> bool:
+    if step_screenshot == "never":
+        return False
+    if step_screenshot == "always":
+        return True
+    if step_screenshot == "on-failure":
+        return status == "failed"
+    return shot_policy == "per-step" or (
+        shot_policy == "on-failure" and status == "failed")
+
+
 # Issue #87: runtime ${name}/$name reference shape (same as spec._VAR_REF).
 _VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
@@ -1144,8 +1160,10 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
 
                     # artifacts
                     try:
-                        if shot_policy == "per-step" or (
-                                shot_policy == "on-failure" and sr.status == "failed"):
+                        # Issue #97: per-step screenshot override (None =
+                        # inherit the flow policy) decides the capture.
+                        if _should_screenshot(step.screenshot, shot_policy,
+                                              sr.status):
                             sp = shot_path(phase, step.index)
                             page.screenshot(path=sp)
                             sr.artifacts.screenshot = sp
