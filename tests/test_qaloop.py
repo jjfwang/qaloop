@@ -5280,6 +5280,233 @@ def test_issue_86_include():
                   == f"Welcome, {user}", str(items))
 
 
+def test_issue_87_flow_variables():
+    """Issue #87: step-level `store` capture + `${var}` runtime interpolation.
+
+    Loader: store parses (js source only; text/attribute rejected);
+    declared ${name} survives strict envsubst (and shadows env vars —
+    runtime table wins); undefined ${name} is a SpecError at load;
+    use-before-store ordering is a SpecError where statically known.
+    Runner: _interpolate_vars substitutes from the table (missing var =
+    clear failure naming it); _evaluate_stores captures str(result) via
+    page.evaluate, re-store overwrites, eval failure names the variable.
+    """
+    import tempfile
+    from qaloop.spec import (load_spec, SpecError, _collect_store_names,
+                             _find_var_refs, _check_variable_ordering, Step)
+    from qaloop.runner import _interpolate_vars, _evaluate_stores
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def rejects(text, label, needle=""):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(text)
+        try:
+            load_spec(f.name)
+            check(f"rejected: {label}", False)
+        except SpecError as e:
+            ok = not needle or needle in str(e)
+            check(f"rejected: {label}", ok, str(e) if not ok else "")
+        finally:
+            os.unlink(f.name)
+
+    base = "name: v\ntarget: http://t\nsteps:\n"
+
+    # --- valid store spec parses ---
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, base +
+              "  - name: capture\n"
+              "    click: \"#create\"\n"
+              "    store: {itemId: {js: \"document.title\"}}\n"
+              "  - name: use\n"
+              "    click: \".del[data-item-id='${itemId}']\"\n")
+        spec = load_spec(f.name)
+        check("store parses to {name: {js}}",
+              spec.steps[0].store == {"itemId": {"js": "document.title"}},
+              str(spec.steps[0].store))
+        check("declared ${itemId} survives strict envsubst",
+              spec.steps[1].params == ".del[data-item-id='${itemId}']",
+              str(spec.steps[1].params))
+        os.unlink(f.name)
+
+    # --- store shape rejections ---
+    rejects(base + "  - name: s\n    click: \"#b\"\n    store: [1]\n",
+            "store must be a mapping", "must be a mapping")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {9lives: {js: \"1\"}}\n",
+            "bad variable name", "[A-Za-z_][A-Za-z0-9_]*")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: \"document.title\"}\n",
+            "store source must be a mapping", "must be a mapping")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: {text: \".row\"}}\n",
+            "text source not yet supported", "only the js source")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: {attribute: \".row\"}}\n",
+            "attribute source not yet supported", "only the js source")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: {js: \"\", text: \"x\"}}\n",
+            "mixed sources rejected", "only the js source")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: {js: \"\"}}\n",
+            "empty js rejected", "non-empty string")
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {vid: {js: 42}}\n",
+            "non-string js rejected", "non-empty string")
+
+    # --- undefined ${name} is a SpecError at load (strict) ---
+    if "ISSUE87_PROBE" in os.environ:
+        del os.environ["ISSUE87_PROBE"]
+    rejects(base + "  - name: s\n    click: \".x${ISSUE87_PROBE}\"\n",
+            "undefined var rejected", "is not set")
+
+    # --- stored name shadows an env var: runtime table wins at load ---
+    os.environ["ISSUE87_SHADOW"] = "from-env"
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name, base +
+                  "  - name: capture\n"
+                  "    click: \"#b\"\n"
+                  "    store: {ISSUE87_SHADOW: {js: \"1\"}}\n"
+                  "  - name: use\n"
+                  "    click: \".x${ISSUE87_SHADOW}\"\n")
+            spec = load_spec(f.name)
+            check("declared name exempt from env expansion",
+                  spec.steps[1].params == ".x${ISSUE87_SHADOW}",
+                  str(spec.steps[1].params))
+            os.unlink(f.name)
+    finally:
+        del os.environ["ISSUE87_SHADOW"]
+
+    # --- use-before-store ordering ---
+    rejects(base + "  - name: use\n    click: \".x${vid}\"\n"
+            "  - name: store\n    click: \"#b\"\n"
+            "    store: {vid: {js: \"1\"}}\n",
+            "use-before-store rejected", "used before any step stores it")
+    rejects(base + "  - name: self\n    click: \".x${vid}\"\n"
+            "    store: {vid: {js: \"1\"}}\n",
+            "same-step self-reference rejected",
+            "used before any step stores it")
+    # declared in setup, used in steps: fine
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, "name: v\ntarget: http://t\n"
+              "setup:\n"
+              "  - name: cap\n    goto: /x\n"
+              "    store: {vid: {js: \"1\"}}\n"
+              "steps:\n"
+              "  - name: use\n    click: \".x${vid}\"\n"
+              "  - name: recap\n    click: \"#b\"\n"
+              "    store: {vid: {js: \"2\"}}\n"
+              "  - name: reuse\n    click: \".y${vid}\"\n")
+        spec = load_spec(f.name)
+        check("cross-phase and re-store ordering accepted",
+              spec.setup[0].store == {"vid": {"js": "1"}}
+              and spec.steps[1].store == {"vid": {"js": "2"}})
+        os.unlink(f.name)
+    # declared-but-never-stored reference: ordering error via direct call
+    st = Step(index=0, phase="steps", name="s", op="click",
+              params=".x${ghost}", expect={}, expect_items=[],
+              continue_on_fail=False, timeout_ms=1000, raw={})
+    try:
+        _check_variable_ordering([], [st], [], {"ghost"}, "spec x")
+        check("never-stored reference rejected", False)
+    except SpecError as e:
+        check("never-stored reference rejected", "never stored" in str(e),
+              str(e))
+    # non-strict load: an unset env var in params is skipped by the
+    # ordering check (the env is unknown at validate time)
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, base +
+              "  - name: capture\n"
+              "    click: \"#b\"\n"
+              "    store: {vid: {js: \"1\"}}\n"
+              "  - name: use\n"
+              "    goto: \"http://t/${ISSUE87_UNSET_ENV}\"\n")
+        spec = load_spec(f.name, strict_env=False)
+        check("non-strict: unset env ref skipped by ordering",
+              spec.steps[1].params == "http://t/${ISSUE87_UNSET_ENV}",
+              str(spec.steps[1].params))
+        os.unlink(f.name)
+
+    # --- _collect_store_names / _find_var_refs edge branches ---
+    check("collect skips non-list", _collect_store_names(None) == set())
+    check("collect skips non-dict steps",
+          _collect_store_names(["x", {"store": [1]}]) == set())
+    check("collect gathers names",
+          _collect_store_names([{"store": {"a": {"js": "1"}, 9: {}}}])
+          == {"a"})
+    check("find_var_refs nested",
+          _find_var_refs({"a": ["${x}", 5, {"b": "$y"}]}) == {"x", "y"})
+    check("find_var_refs ignores non-strings",
+          _find_var_refs([1, None, True]) == set())
+
+    # --- _interpolate_vars ---
+    check("interpolates ${name} and $name",
+          _interpolate_vars("a ${v} b $v", {"v": "X"}, "w") == "a X b X")
+    check("interpolates nested structures",
+          _interpolate_vars({"t": ["${v}"], "n": 3}, {"v": "X"}, "w")
+          == {"t": ["X"], "n": 3})
+    check("non-strings pass through",
+          _interpolate_vars(42, {"v": "X"}, "w") == 42)
+    check("leaves $5 alone",
+          _interpolate_vars("costs $5", {"v": "X"}, "w") == "costs $5")
+    try:
+        _interpolate_vars(".x${missing}", {}, "steps[2]")
+        check("missing var fails", False)
+    except RuntimeError as e:
+        check("missing var names the variable",
+              "${missing}" in str(e) and "never captured" in str(e),
+              str(e))
+
+    # --- _evaluate_stores with a stub page ---
+    class FakePage:
+        def __init__(self, results):
+            self.results = results
+            self.calls = []
+
+        def evaluate(self, js):
+            self.calls.append(js)
+            if js == "boom":
+                raise ValueError("page exploded")
+            return self.results[js]
+
+    st = Step(index=0, phase="steps", name="s", op="click", params="#b",
+              expect={}, expect_items=[], continue_on_fail=False,
+              timeout_ms=1000, raw={},
+              store={"a": {"js": "document.title"}, "n": {"js": "40 + 2"}})
+    page = FakePage({"document.title": "hello", "40 + 2": 42})
+    variables = {}
+    _evaluate_stores(page, st, variables, "steps[0]")
+    check("stores str(result)",
+          variables == {"a": "hello", "n": "42"}, str(variables))
+    # re-store overwrites
+    page2 = FakePage({"document.title": "bye", "40 + 2": 7})
+    _evaluate_stores(page2, st, variables, "steps[0]")
+    check("re-store overwrites", variables["a"] == "bye", str(variables))
+    st_boom = Step(index=1, phase="steps", name="s2", op=None, params=None,
+                   expect={}, expect_items=[], continue_on_fail=False,
+                   timeout_ms=1000, raw={}, store={"b": {"js": "boom"}})
+    try:
+        _evaluate_stores(FakePage({}), st_boom, {}, "steps[1]")
+        check("store eval failure raises", False)
+    except RuntimeError as e:
+        check("store eval failure names the variable",
+              "'b'" in str(e) and "evaluation failed" in str(e), str(e))
+    # no stores: no-op
+    st_empty = Step(index=2, phase="steps", name="s3", op=None, params=None,
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=1000, raw={}, store={})
+    _evaluate_stores(FakePage({}), st_empty, variables, "steps[2]")
+    check("empty store is a no-op", variables["a"] == "bye")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
@@ -5290,4 +5517,5 @@ if __name__ == "__main__":
             print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
+
 
