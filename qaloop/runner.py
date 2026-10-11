@@ -128,6 +128,41 @@ def _resolve_url(target: str, url: str) -> str:
     return urljoin(target.rstrip("/") + "/", url.lstrip("/"))
 
 
+def _resolve_scope(page, step: Step, timeout_ms: int | None = None):
+    """Return the Page or Frame that selector lookups resolve against.
+
+    Issue #80: a step may carry `frame: <name | url substring>`; then all
+    selector lookups resolve inside that frame instead of the main frame.
+    Lookup is by frame name first (the iframe's `name` attribute), then by
+    URL substring — a literal substring match on the frame's URL. Frames
+    attach asynchronously (after the parent's DOMContentLoaded), so the
+    lookup polls until the step timeout expires, mirroring
+    wait_for_selector semantics. Raises RuntimeError with a clear detail
+    when no frame matches, so the step fails (action errors propagate;
+    assertions record the failure).
+    """
+    frame = step.frame
+    if not frame:
+        return page
+    wait_ms = (timeout_ms if timeout_ms is not None
+               else step.timeout_ms or 15000)
+    url_rx = re.compile(re.escape(frame))
+    deadline = time.monotonic() + wait_ms / 1000
+    while True:
+        scope = page.frame(name=frame)
+        if scope is None:
+            scope = page.frame(url=url_rx)
+        if scope is not None:
+            return scope
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"frame not found: {frame!r}")
+        # page.frame() is a local lookup on the driver's last-known frame
+        # tree, so a cheap round trip is needed for freshly attached or
+        # navigated frames to become visible to the lookup.
+        page.evaluate("0")
+        time.sleep(0.15)
+
+
 def _ensure_origin(page, target: str) -> None:
     """Seed/script ops need a document from the target origin.
 
@@ -238,31 +273,36 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
                upload_dir: str | None = None) -> None:
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
+    # Issue #80: selector-resolving ops run against the frame scope when the
+    # step carries frame:. Page-level ops (goto, reload, back, wait_ms,
+    # wait without target / js / response, seed, script, mock) stay on the
+    # main page, as does page.mouse (a Frame has no mouse).
+    scope = _resolve_scope(page, step, t)
     if op == "goto":
         page.goto(_resolve_url(target, p), timeout=t, wait_until="domcontentloaded")
     elif op == "click":
-        page.click(p, timeout=t)
+        scope.click(p, timeout=t)
     elif op == "dblclick":
-        page.dblclick(p, timeout=t)
+        scope.dblclick(p, timeout=t)
     elif op == "fill":
-        page.fill(p["target"], p["text"], timeout=t)
+        scope.fill(p["target"], p["text"], timeout=t)
     elif op == "press":
-        page.press(p["target"], p["key"], timeout=t)
+        scope.press(p["target"], p["key"], timeout=t)
     elif op == "type":
         # Issue #78: keystroke-by-keystroke typing with an optional
         # inter-keystroke pause in ms — fires per-character
         # keydown/keypress/input events, unlike fill's instant set.
         # Playwright 1.63's press_sequentially takes delay as a keyword arg.
-        page.locator(p["target"]).press_sequentially(
+        scope.locator(p["target"]).press_sequentially(
             p["text"], delay=p.get("delay_ms", 0) or 0, timeout=t)
     elif op == "focus":
-        page.locator(p["target"]).focus(timeout=t)
+        scope.locator(p["target"]).focus(timeout=t)
     elif op == "hover":
-        page.hover(p["target"], timeout=t)
+        scope.hover(p["target"], timeout=t)
     elif op == "scroll":
         target_sel = p.get("target")
         if target_sel:
-            page.locator(target_sel).scroll_into_view_if_needed(timeout=t)
+            scope.locator(target_sel).scroll_into_view_if_needed(timeout=t)
         else:
             pixels = p.get("pixels", 600)
             direction = p.get("direction", "down")
@@ -270,11 +310,11 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
                        "left": (-pixels, 0), "right": (pixels, 0)}
             page.mouse.wheel(*offsets[direction])
     elif op == "check":
-        page.check(p, timeout=t)
+        scope.check(p, timeout=t)
     elif op == "uncheck":
-        page.uncheck(p, timeout=t)
+        scope.uncheck(p, timeout=t)
     elif op == "select":
-        page.select_option(p["target"], p["value"], timeout=t)
+        scope.select_option(p["target"], p["value"], timeout=t)
     elif op == "upload":
         # Issue #76: file upload via the runner, guarded like perform.
         # Fail-closed: the upload dir must be declared via
@@ -285,12 +325,12 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
                 "set QALOOP_UPLOAD_DIR")
         from qaloop.upload import check_upload_path
         checked = check_upload_path(p["path"], upload_dir)
-        page.locator(p["target"]).set_input_files(checked, timeout=t)
+        scope.locator(p["target"]).set_input_files(checked, timeout=t)
     elif op == "drag":
-        src = page.locator(p["target"])
+        src = scope.locator(p["target"])
         to = p["to"]
         if isinstance(to, str):
-            src.drag_to(page.locator(to), timeout=t)
+            src.drag_to(scope.locator(to), timeout=t)
         else:
             # Playwright 1.63's drag_to takes only a Locator, so the coords
             # form drives the mouse directly: mousedown on the source, move
@@ -327,9 +367,9 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
                                 timeout=wt)
         elif sel:
             if text:
-                page.locator(sel, has_text=text).wait_for(state=state, timeout=wt)
+                scope.locator(sel, has_text=text).wait_for(state=state, timeout=wt)
             else:
-                page.wait_for_selector(sel, state=state, timeout=wt)
+                scope.wait_for_selector(sel, state=state, timeout=wt)
         else:
             page.wait_for_load_state(state if state in ("load", "domcontentloaded", "networkidle") else "load",
                                      timeout=wt)
@@ -369,13 +409,13 @@ def _poll_value_match(read, match, deadline_s):
         time.sleep(0.15)
 
 
-def _poll_text_match(page, sel, match, deadline_s):
+def _poll_text_match(scope, sel, match, deadline_s):
     """Re-read text_content until match(actual) succeeds or the deadline passes.
 
     Thin wrapper over _poll_value_match, kept so the text-assertion call sites
-    and their behavior are unchanged.
+    and their behavior are unchanged. scope is a Page or a Frame.
     """
-    return _poll_value_match(lambda: page.text_content(sel) or "",
+    return _poll_value_match(lambda: scope.text_content(sel) or "",
                              match, deadline_s)
 
 
@@ -422,25 +462,32 @@ def _check_assertions(page, step: Step, collectors: Collectors,
     t = min(step.timeout_ms or 15000, 8000)
     for key, val in step.expect_items:
         try:
+            # Issue #80: selector assertions resolve inside the step's frame
+            # scope when frame: is set. A non-matching frame raises
+            # RuntimeError, recorded below as an assertion failure.
+            # Page-level assertions (url, title, console, js, dialog, mock /
+            # network calls) stay on the main page: a Frame has no URL,
+            # title, evaluate, or dialogs.
+            scope = _resolve_scope(page, step, t)
             if key == "visible":
-                page.wait_for_selector(val, state="visible", timeout=t)
+                scope.wait_for_selector(val, state="visible", timeout=t)
                 out.append(AssertionResult(key, True, val))
             elif key == "hidden":
-                page.wait_for_selector(val, state="hidden", timeout=t)
+                scope.wait_for_selector(val, state="hidden", timeout=t)
                 out.append(AssertionResult(key, True, val))
             elif key == "text_contains":
                 sel, text = val["selector"], val["text"]
-                page.wait_for_selector(sel, state="attached", timeout=t)
+                scope.wait_for_selector(sel, state="attached", timeout=t)
                 ok, actual = _poll_text_match(
-                    page, sel, lambda a: text in a,
+                    scope, sel, lambda a: text in a,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want {text!r} in {actual[:160]!r}"))
             elif key == "text_matches":
                 sel, pattern = val["selector"], val["pattern"]
-                page.wait_for_selector(sel, state="attached", timeout=t)
+                scope.wait_for_selector(sel, state="attached", timeout=t)
                 ok, actual = _poll_text_match(
-                    page, sel, lambda a: re.search(pattern, a) is not None,
+                    scope, sel, lambda a: re.search(pattern, a) is not None,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"want /{pattern}/ in {actual[:160]!r}"))
@@ -460,7 +507,7 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     match, want = (lambda a: a <= val["lte"],
                                    f"<={val['lte']}")
                 ok, n = _poll_value_match(
-                    lambda: page.locator(sel).count(), match,
+                    lambda: scope.locator(sel).count(), match,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"{sel}: count={n} want {want}"))
@@ -556,8 +603,8 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 os.makedirs(os.path.dirname(shot), exist_ok=True)
                 selector = val.get("selector")
                 if selector:
-                    page.wait_for_selector(selector, state="attached", timeout=t)
-                    page.locator(selector).screenshot(path=shot)
+                    scope.wait_for_selector(selector, state="attached", timeout=t)
+                    scope.locator(selector).screenshot(path=shot)
                 else:
                     page.screenshot(path=shot)
                 if baseline_update or not os.path.exists(baseline):
@@ -590,7 +637,8 @@ def _check_assertions(page, step: Step, collectors: Collectors,
             elif key == "ax":
                 role, name = val["role"], val.get("name")
                 state = val.get("state", "visible")
-                loc = page.get_by_role(role, name=name) if name else page.get_by_role(role)
+                loc = (scope.get_by_role(role, name=name) if name
+                       else scope.get_by_role(role))
                 loc.first.wait_for(state=state, timeout=t)
                 out.append(AssertionResult(
                     key, True,

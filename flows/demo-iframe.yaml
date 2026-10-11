@@ -1,0 +1,33 @@
+name: demo-iframe
+description: >-
+  Browser proof for the frame: step meta key (issue #80): clicks a button
+  inside an iframe by frame name and asserts the in-frame result, then
+  repeats the click+assert via the URL-substring form.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the iframe demo page
+    goto: /demo/iframe-demo.html
+
+steps:
+  - name: click the button inside the frame (name form)
+    click: "#inner-btn"
+    frame: demo-frame
+    expect:
+      - text_contains: {selector: "#inner-out", text: "clicked"}
+  - name: assert in-frame state with frame-scoped expect-only step
+    frame: demo-frame
+    expect:
+      - visible: "#inner-btn"
+      - count: {selector: "#inner-out", equals: 1}
+  - name: click the second button (url-substring form)
+    click: "#inner-btn-2"
+    frame: iframe-content
+    expect:
+      - text_contains: {selector: "#inner-out-2", text: "clicked-by-url"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
