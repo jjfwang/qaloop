@@ -87,7 +87,7 @@ and previously booted services are stopped.
 | `wait` | `{target?, state?, text?, js?, response?, timeout_ms?}` | four disjoint forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load); `js`: poll a JS expression until truthy; `response`: wait for a network response whose URL contains the substring (`js`/`response` take no `target`/`state`/`text`, and never both at once — see below) |
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
-| `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
+| `seed` | `{http: {url, method?, json?, headers?}}` or `{js: "..."}` | test-data / state setup (see below) |
 | `upload` | `{target, path}` | `locator.set_input_files` on a file input; `path` must be absolute and inside the declared upload dir (`verify --upload-dir` or `QALOOP_UPLOAD_DIR` env) — undeclared dir or violation fails the step |
 | `drag` | `{target, to}` | drag-and-drop — `to` is a target selector or `{x: N, y: N}` page coordinates; drives drops and sliders |
 | `mock` | `{url, json?|body?|path?, status?, method?, headers?, times?, delay_ms?}` | register a network mock before navigation (see below) |
@@ -220,6 +220,29 @@ passes. Only *served* hits count: requests that fell through on a method
 mismatch, or that arrived after `times` was exceeded, do not count. A URL
 with no registered mock — or no hits yet — evaluates as 0, so
 `mock_calls: {url: "**/api/x", equals: 0}` asserts the request was never made.
+
+### `seed` — test-data setup via HTTP or page JS
+
+`seed` with `http` issues a real HTTP request (default `method` POST with a
+`Content-Type: application/json` header; `json` is sent as the body).
+`headers` (optional, a dict of string to string) is merged over the default
+headers — user values win, so `headers: {Content-Type: text/plain}` overrides
+the default and `headers: {Authorization: "Bearer ..."}` adds auth.
+
+```yaml
+setup:
+  - name: create a test user
+    seed:
+      http:
+        url: http://localhost:8000/users
+        json: {name: test-user}
+        headers: {X-Tenant: t1}   # optional; merged over the defaults
+```
+
+The response status is recorded structurally in run.json as the step's
+`seed_status` (null for `js` seeds and non-seed steps). A 4xx/5xx response
+fails the step fast with `seed request failed: HTTP <status>: ...` — the
+status stays on the step record rather than living only in the error text.
 
 ## Assertions (`expect:` mapping)
 

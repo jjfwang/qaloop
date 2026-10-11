@@ -7305,6 +7305,213 @@ def test_issue_91_compare_errors():
                 os.environ["QALOOP_RUNS"] = old_runs
 
 
+def test_seed_http_headers_and_status():
+    # Issue #96: seed.http headers validation + response status surfacing.
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.runner import (_do_seed, run_flow, RunResult, SeedRequestError,
+                               StepResult)
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path)
+        finally:
+            os.unlink(path)
+
+    def rejects(text, why):
+        try:
+            load(text)
+            check(why, False, "no error raised")
+        except SpecError as e:
+            check(why, True)
+
+    # --- (a) spec validation: headers accepted / rejected ---
+    good = ("name: s\ntarget: http://x\nsteps:\n"
+            "  - name: seed ok\n"
+            "    seed: {http: {url: http://x/u, headers: {X-Tenant: t1}}}\n")
+    try:
+        load(good)
+        check("seed.http headers dict accepted", True)
+    except SpecError as e:
+        check("seed.http headers dict accepted", False, str(e))
+    rejects(good.replace("headers: {X-Tenant: t1}", "headers: X-Tenant"),
+            "seed.http non-dict headers rejected")
+    rejects(good.replace("headers: {X-Tenant: t1}", "headers: {X-Tenant: 5}"),
+            "seed.http non-str header value rejected")
+    try:
+        load("name: s\ntarget: http://x\nsteps:\n"
+             "  - name: bad\n    seed: {http: {method: POST}}\n")
+        check("seed.http error names headers?", False, "no error raised")
+    except SpecError as e:
+        check("seed.http error names headers?",
+              "headers?" in str(e), str(e))
+
+    # --- (b)/(c) local HTTP server: header forwarding + 500 fail-fast ---
+    received = {}
+
+    class OkHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received["headers"] = dict(self.headers)
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class FailHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b"error"
+            self.send_response(500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    ok_server = HTTPServer(("127.0.0.1", 0), OkHandler)
+    ok_port = ok_server.server_address[1]
+    fail_server = HTTPServer(("127.0.0.1", 0), FailHandler)
+    fail_port = fail_server.server_address[1]
+    for srv in (ok_server, fail_server):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        status = _do_seed(
+            None,
+            {"http": {"url": f"http://127.0.0.1:{ok_port}/ok",
+                      "json": {"a": 1},
+                      "headers": {"X-Tenant": "t1"}}},
+            5000, "http://x")
+        check("seed returns response status", status == 200, str(status))
+        check("custom header forwarded",
+              received["headers"].get("X-Tenant") == "t1",
+              str(received.get("headers")))
+        check("default Content-Type kept",
+              received["headers"].get("Content-Type") == "application/json",
+              str(received.get("headers")))
+        _do_seed(None,
+                 {"http": {"url": f"http://127.0.0.1:{ok_port}/ok",
+                           "headers": {"Content-Type": "text/plain"}}},
+                 5000, "http://x")
+        check("user Content-Type overrides default",
+              received["headers"].get("Content-Type") == "text/plain",
+              str(received.get("headers")))
+
+        # --- run_flow with a faked browser: 500 fails fast, status recorded
+        import playwright.sync_api as pw_sync
+
+        class FakePage:
+            url = "http://x/"
+
+            def on(self, event, handler):
+                pass
+
+            def evaluate(self, js):
+                return None
+
+            def goto(self, url, **kw):
+                pass
+
+        class FakeCtx:
+            def new_page(self):
+                return FakePage()
+
+            def close(self):
+                pass
+
+        class FakeBrowser:
+            def new_context(self, **kw):
+                return FakeCtx()
+
+            def close(self):
+                pass
+
+        class FakePW:
+            class chromium:
+                @staticmethod
+                def launch(**kw):
+                    return FakeBrowser()
+
+        class FakePWCM:
+            def __enter__(self):
+                return FakePW()
+
+            def __exit__(self, *a):
+                return False
+
+        old_pw = pw_sync.sync_playwright
+        pw_sync.sync_playwright = lambda: FakePWCM()
+        try:
+            spec = load(
+                "name: seedfail\ntarget: http://x\nsteps:\n"
+                "  - name: js seed\n    seed: {js: \"x=1\"}\n"
+                "  - name: bad seed\n"
+                f"    seed: {{http: {{url: http://127.0.0.1:{fail_port}/boom}}}}\n"
+                "artifacts: {screenshot: none, ax_snapshot: none, "
+                "trace: false}\n")
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(spec, run_dir=run_dir)
+                check("500 seed fails the run",
+                      result.status == "failed", result.status)
+                js_step, bad_step = result.steps
+                check("500 seed records seed_status 500",
+                      bad_step.seed_status == 500, str(bad_step.seed_status))
+                check("fail-fast error names the status",
+                      "500" in bad_step.error
+                      and "seed request failed" in bad_step.error,
+                      bad_step.error)
+                check("js seed has no seed_status",
+                      js_step.seed_status is None, str(js_step.seed_status))
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as fh:
+                    data = json.load(fh)
+                check("run.json carries seed_status 500",
+                      data["steps"][1]["seed_status"] == 500,
+                      str(data["steps"][1].get("seed_status")))
+                check("run.json js seed seed_status null",
+                      data["steps"][0]["seed_status"] is None)
+        finally:
+            pw_sync.sync_playwright = old_pw
+    finally:
+        ok_server.shutdown()
+        fail_server.shutdown()
+        ok_server.server_close()
+        fail_server.server_close()
+
+    # --- (d) StepResult seed_status serializes round-trip ---
+    seeded = StepResult(index=0, phase="steps", name="s", op="seed",
+                        status="passed", duration_ms=1, seed_status=201)
+    rr = RunResult(flow_name="f", target="t", status="passed",
+                   started=0.0, ended=1.0, steps=[seeded],
+                   failed_step=None, console_errors=[], page_errors=[],
+                   failed_requests=[], bad_responses=[], run_dir="/tmp/x")
+    d = rr.to_dict()
+    check("to_dict carries seed_status", d["steps"][0]["seed_status"] == 201,
+          str(d["steps"][0].get("seed_status")))
+    check("from_dict restores seed_status",
+          RunResult.from_dict(d).steps[0].seed_status == 201)
+    plain = StepResult(index=0, phase="steps", name="s", op="click",
+                       status="passed", duration_ms=1)
+    d2 = RunResult(flow_name="f", target="t", status="passed",
+                   started=0.0, ended=1.0, steps=[plain],
+                   failed_step=None, console_errors=[], page_errors=[],
+                   failed_requests=[], bad_responses=[],
+                   run_dir="/tmp/x").to_dict()
+    check("seed_status defaults to None",
+          d2["steps"][0]["seed_status"] is None,
+          str(d2["steps"][0].get("seed_status")))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
