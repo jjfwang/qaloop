@@ -35,12 +35,16 @@ ASSERTION_KEYS = {
     "attribute", "value", "focused",  # issue #81 — element state
     "cookie", "storage",  # issue #82 — cookies and web storage
     "request_body",  # issue #83 — opt-in request-body assertions
+    "perf",  # issue #84 — Web Vitals performance budgets
 }
 
 # Step-level dialog policy: what the runner does when the page raises a JS
 # dialog during the step. "dismiss" preserves Playwright's default behavior.
 DIALOG_POLICIES = {"accept", "dismiss"}
 DIALOG_TYPES = {"alert", "confirm", "prompt", "beforeunload"}
+
+# Issue #84: metric names supported by the `perf` assertion.
+PERF_METRICS = {"lcp_ms", "cls", "inp_ms"}
 
 
 class SpecError(ValueError):
@@ -480,6 +484,33 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
             if "equals" in val and not isinstance(val["equals"], str):
                 raise SpecError(
                     f"{where}: assertion storage equals must be a string")
+        elif key == "perf":
+            # Issue #84: Web Vitals performance budgets. A non-empty
+            # mapping of metric name to exactly {lte: budget}; budgets are
+            # upper bounds, so only the lte comparator is allowed (same
+            # exactly-one guard as attribute/cookie). The budget is a
+            # non-negative number (same guard as network_calls status).
+            if not isinstance(val, dict) or not val:
+                raise SpecError(
+                    f"{where}: assertion perf needs a non-empty mapping "
+                    f"of metric -> {{lte: budget}}")
+            for metric, budget in val.items():
+                if metric not in PERF_METRICS:
+                    raise SpecError(
+                        f"{where}: assertion perf has unknown metric "
+                        f"{metric!r} (known: {sorted(PERF_METRICS)})")
+                if (not isinstance(budget, dict) or len(budget) != 1
+                        or "lte" not in budget):
+                    raise SpecError(
+                        f"{where}: assertion perf metric {metric!r} needs "
+                        f"exactly {{lte: budget}}")
+                n = budget["lte"]
+                # bools are numbers in Python; a bool budget is always a typo
+                if isinstance(n, bool) or not isinstance(n, (int, float)) \
+                        or n < 0:
+                    raise SpecError(
+                        f"{where}: assertion perf metric {metric!r} budget "
+                        f"must be a non-negative number, got {n!r}")
         if key == "request_body":
             # Issue #83: opt-in request-body assertion. Exactly one of
             # contains|equals (same exactly-one guard as attribute's

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>web vitals demo</title>
+<style>
+  #hero { width: 640px; height: 400px; background: #315FD6; color: #fff;
+          font-size: 56px; display: flex; align-items: center;
+          justify-content: center; }
+  #act { font-size: 20px; padding: 12px 28px; margin-top: 16px; }
+  #out { margin-top: 12px; }
+</style>
+</head>
+<body>
+<div id="hero">Web Vitals demo</div>
+<button id="act">Do it</button>
+<p id="out">not clicked</p>
+<script>
+// The click handler does real, deliberate work (~120ms) so the
+// browser's event-timing pipeline records an `event` entry with an
+// interactionId; a trivial handler may not produce one at all, which
+// would make the inp_ms assertion fail closed on missing data.
+document.getElementById("act").addEventListener("click", () => {
+  const start = performance.now();
+  while (performance.now() - start < 120) { /* heavy handler */ }
+  document.getElementById("out").textContent = "clicked";
+});
+</script>
+</body>
+</html>

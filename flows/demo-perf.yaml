@@ -1,0 +1,23 @@
+name: demo-perf
+description: >-
+  Browser proof for the perf assertion (issue #84): the demo page renders a
+  large hero element quickly (LCP) and a button whose click handler does
+  real work so the first-input entry is measurable (INP); the flow drives
+  the interaction and asserts Web Vitals budgets via expect.perf.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the web vitals demo page
+    goto: /demo/perf.html
+
+steps:
+  - name: interact and prove the performance budgets
+    click: "#act"
+    expect:
+      perf: {lcp_ms: {lte: 2500}, cls: {lte: 0.1}, inp_ms: {lte: 500}}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
