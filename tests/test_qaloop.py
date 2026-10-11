@@ -339,6 +339,163 @@ def test_worker_once_empty_queue_exits():
         check("once-mode prints empty-queue message", "queue empty" in out, out.strip() or "(no output)")
 
 
+@contextlib.contextmanager
+def _notify_env(url):
+    """Set QALOOP_NOTIFY_URL, restoring the old value on exit."""
+    old = os.environ.get("QALOOP_NOTIFY_URL")
+    os.environ["QALOOP_NOTIFY_URL"] = url
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ["QALOOP_NOTIFY_URL"]
+        else:
+            os.environ["QALOOP_NOTIFY_URL"] = old
+
+
+@contextlib.contextmanager
+def _raise_run_one_flow():
+    """Browser-free stub where worker._run_one_flow raises."""
+    from qaloop import worker
+    real = worker._run_one_flow
+
+    def fake(flow_path, target, runs_root, headless, executable_path,
+             do_investigate, keep_runs=0):
+        raise RuntimeError("boom")
+
+    worker._run_one_flow = fake
+    try:
+        yield
+    finally:
+        worker._run_one_flow = real
+
+
+@contextlib.contextmanager
+def _notify_stub(status=200):
+    """Threaded local HTTP stub recording POST bodies; yields (received, url)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    received = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append((self.path, json.loads(self.rfile.read(n))))
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield received, f"http://127.0.0.1:{srv.server_port}/notify"
+    finally:
+        srv.shutdown()
+        t.join()
+
+
+def test_worker_failure_notify_webhook():
+    from qaloop import queue, worker
+    with temp_db(), _notify_stub() as (received, url):
+        with _notify_env(url):
+            jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"},
+                                max_retries=1)
+            with _stub_run_one_flow(("failed", "/tmp/runs/f")):
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+                check("retry requeue sends no notification", received == [],
+                      str(received))
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("terminal failure notifies exactly once", len(received) == 1,
+              str(len(received)))
+        path, payload = received[0]
+        check("payload job_id matches", payload.get("job_id") == jid, str(payload))
+        check("payload kind matches", payload.get("kind") == "verify-flow",
+              str(payload))
+        check("payload run_dir matches", payload.get("run_dir") == "/tmp/runs/f",
+              str(payload))
+        check("payload summary names attempts",
+              "attempt 2" in str(payload.get("summary", "")), str(payload))
+        check("job recorded failed", row["status"] == "failed", row["status"])
+
+
+def test_worker_exception_notify_webhook():
+    from qaloop import queue, worker
+    with temp_db(), _notify_stub() as (received, url):
+        with _notify_env(url):
+            jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+            with _raise_run_one_flow():
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("exception path still records failure", row["status"] == "failed",
+              row["status"])
+        check("exception path notifies once", len(received) == 1, str(len(received)))
+        path, payload = received[0]
+        check("exception payload job_id matches", payload.get("job_id") == jid,
+              str(payload))
+        check("exception payload run_dir empty", payload.get("run_dir") == "",
+              str(payload))
+        check("exception payload summary mentions error",
+              "worker error" in str(payload.get("summary", "")), str(payload))
+
+
+def test_worker_notify_failure_is_fail_closed():
+    from qaloop import queue, worker
+    with temp_db():
+        # 500 from the webhook must not raise and must not change job handling.
+        with _notify_stub(status=500) as (received, url):
+            with _notify_env(url):
+                jid = queue.enqueue("verify-flow",
+                                    {"flow": "x.yaml", "target": "http://x"})
+                with _stub_run_one_flow(("failed", "/tmp/runs/f")):
+                    try:
+                        worker.handle_job(queue.claim(), **_handle_kwargs())
+                        raised = False
+                    except Exception:
+                        raised = True
+        check("500 webhook raises nothing", not raised)
+        check("500 webhook attempt was made", len(received) == 1,
+              str(len(received)))
+        check("job still recorded failed",
+              _job_row(jid)["status"] == "failed", _job_row(jid)["status"])
+        # Closed port (connection refused) likewise must not raise.
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}/notify"
+        s.close()
+        with _notify_env(dead):
+            jid2 = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+            with _stub_run_one_flow(("failed", "/tmp/runs/f")):
+                try:
+                    worker.handle_job(queue.claim(), **_handle_kwargs())
+                    raised = False
+                except Exception:
+                    raised = True
+        check("dead webhook raises nothing", not raised)
+        check("dead webhook job still recorded failed",
+              _job_row(jid2)["status"] == "failed", _job_row(jid2)["status"])
+
+
+def test_worker_no_notify_when_url_unset():
+    from qaloop import queue, worker
+    old = os.environ.pop("QALOOP_NOTIFY_URL", None)
+    try:
+        with temp_db():
+            jid = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+            with _stub_run_one_flow(("failed", "/tmp/runs/f")):
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+            check("unset URL job still recorded failed",
+                  _job_row(jid)["status"] == "failed", _job_row(jid)["status"])
+    finally:
+        if old is not None:
+            os.environ["QALOOP_NOTIFY_URL"] = old
+
+
+
 def test_cli_enqueue_max_retries_flag():
     from qaloop.cli import build_parser
     args = build_parser().parse_args(["enqueue", "--kind", "verify-flow", "--flow", "x.yaml",

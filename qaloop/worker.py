@@ -77,6 +77,33 @@ def boot_repo_env(preset: dict, profile: str | None = None) -> tuple[list[ProcTa
     return boot_env_entries(entries, workdir)
 
 
+def _notify_failure(job_id: int, kind: str, run_dir: str, summary: str) -> None:
+    """POST a failure notification to QALOOP_NOTIFY_URL; never raises.
+
+    Notification failures are swallowed and logged: a dead or missing
+    webhook must never fail the job handling itself.
+    """
+    url = os.environ.get("QALOOP_NOTIFY_URL", "").strip()
+    if not url:
+        return
+    import json as _json
+    import urllib.request
+    body = _json.dumps({
+        "job_id": job_id,
+        "kind": kind,
+        "run_dir": run_dir,
+        "summary": summary,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as e:  # noqa: BLE001 — notification is best-effort
+        print(f"notify failed (job {job_id}): {e}")
+
+
 def _run_one_flow(flow_path: str, target: str, runs_root: str,
                   headless: bool, executable_path: str | None,
                   do_investigate: bool, keep_runs: int = 0) -> tuple[str, str]:
@@ -164,10 +191,19 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
         if status == "passed":
             q.complete(job["id"], "done", run_dir=run_dir, note=f"{kind} -> {status}")
         else:
-            q.record_failure(job["id"], f"{kind} -> {status}")
+            attempts = (job.get("attempts") or 0) + 1
+            outcome = q.record_failure(job["id"], f"{kind} -> {status}")
+            if outcome == "failed":
+                # Terminal failure: notify once; retries ("requeued") stay silent.
+                _notify_failure(job["id"], kind, run_dir,
+                                f"{kind} -> {status} (attempt {attempts})")
     except Exception as e:  # noqa: BLE001 — job failure is recorded, not raised
         traceback.print_exc()
-        q.record_failure(job["id"], f"worker error: {e}"[:2000])
+        attempts = (job.get("attempts") or 0) + 1
+        outcome = q.record_failure(job["id"], f"worker error: {e}"[:2000])
+        if outcome == "failed":
+            _notify_failure(job["id"], kind, "",
+                            f"worker error: {e} (attempt {attempts})"[:2000])
     finally:
         for t in targets:
             t.stop()

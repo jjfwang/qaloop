@@ -247,6 +247,12 @@ binary override), `QALOOP_LEDGER` (cost-ledger JSONL path override, default
 `runs/ledger.jsonl` under the qaloop checkout), `QALOOP_WEBHOOK_SECRET`, `QALOOP_ENQUEUE_TOKEN`,
 `QALOOP_MODEL_*` (base url, name, key, per-1M prices).
 
+`QALOOP_NOTIFY_URL`: on a *terminal* worker job failure (retries exhausted or
+`max_retries=0`) the worker POSTs a JSON notification to this URL with
+`job_id`, `kind`, `run_dir`, and `summary` (attempt count included). Retried
+failures that get requeued do not notify. Notification failures — bad URL,
+connection refused, 5xx — are logged and never fail the job handling itself.
+
 ## Queue → worker → webhook
 
 The unattended path: GitHub sends `pull_request` events to `/webhook/github`
