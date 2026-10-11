@@ -79,6 +79,7 @@ and previously booted services are stopped.
 | `fill` | `{target, text}` | clears first |
 | `press` | `{target, key}` | e.g. `{target: "#q", key: "Enter"}` |
 | `hover` | `{target}` | mouse hover on the selector — drives CSS `:hover` states, tooltips, and hover menus |
+| `scroll` | `{target? , direction?: up\|down\|left\|right, pixels?: N}` | with `target`: `locator.scroll_into_view_if_needed` (step timeout); without `target`: `mouse.wheel` — down/up scroll ±pixels vertically, left/right horizontally (default `pixels` 600); drives lazy/infinite-scroll content deterministically |
 | `check` / `uncheck` | selector | checkboxes |
 | `select` | `{target, value}` | `<select>` value |
 | `wait` | `{target?, state?, text?, timeout_ms?}` | two forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load) |

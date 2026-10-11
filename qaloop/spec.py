@@ -18,7 +18,8 @@ SPEC_VERSION = 1
 _ENV_VAR = re.compile(r"\$(\w+|\{[^}]+\})")
 
 ACTION_OPS = {
-    "goto", "click", "dblclick", "fill", "press", "hover", "check", "uncheck",
+    "goto", "click", "dblclick", "fill", "press", "hover", "scroll", "check",
+    "uncheck",
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
     "mock",
 }
@@ -194,6 +195,22 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
         if (not isinstance(params, dict) or not isinstance(params.get("target"), str)
                 or not params["target"]):
             raise SpecError(f"{where}: hover needs {{target}}")
+    elif op == "scroll":
+        if not isinstance(params, dict):
+            raise SpecError(f"{where}: scroll needs a mapping")
+        if not any(k in params for k in ("target", "direction", "pixels")):
+            raise SpecError(
+                f"{where}: scroll needs at least one of target, direction, pixels")
+        target = params.get("target")
+        if target is not None and (not isinstance(target, str) or not target):
+            raise SpecError(f"{where}: scroll target must be a non-empty string")
+        direction = params.get("direction")
+        if direction is not None and direction not in {"up", "down", "left", "right"}:
+            raise SpecError(
+                f"{where}: scroll direction must be up|down|left|right")
+        pixels = params.get("pixels")
+        if pixels is not None and (not isinstance(pixels, int) or pixels < 0):
+            raise SpecError(f"{where}: scroll pixels must be a non-negative integer")
     elif op == "select":
         if not isinstance(params, dict) or "target" not in params or "value" not in params:
             raise SpecError(f"{where}: select needs {{target, value}}")

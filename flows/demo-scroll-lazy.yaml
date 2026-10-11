@@ -1,0 +1,32 @@
+name: demo-scroll-lazy
+description: >-
+  Browser proof for the scroll action op (issue #75): lazy content is absent
+  before scrolling, appears after scrolling by pixels (IntersectionObserver
+  sentinel), and scroll with a target brings a far-down element into view.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the lazy scroll demo page
+    goto: /demo/scroll-lazy.html
+
+steps:
+  - name: lazy items are absent before any scroll
+    expect:
+      - hidden: "#item-3"
+
+  - name: scrolling down by pixels loads the lazy items
+    scroll: {direction: down, pixels: 3200}
+    expect:
+      - visible: "#item-3"
+      - text_contains: {selector: "#item-3", text: "lazy loaded"}
+
+  - name: scroll target brings the sentinel into view
+    scroll: {target: "#sentinel"}
+    expect:
+      - visible: "#item-6"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

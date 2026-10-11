@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>lazy scroll demo</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 24px; }
+  h1 { margin: 0 0 16px; }
+  #feed { max-width: 640px; }
+  .item {
+    padding: 24px;
+    border: 1px solid #9db3e6;
+    border-radius: 8px;
+    margin: 0 0 16px;
+    background: #f0f4ff;
+  }
+  #filler { height: 3200px; }
+  #sentinel { height: 2px; }
+</style>
+</head>
+<body>
+  <h1>Lazy content demo</h1>
+  <div id="feed">
+    <div class="item" id="item-1">Item 1 (rendered on load)</div>
+  </div>
+  <div id="filler"></div>
+  <div id="sentinel"></div>
+  <script>
+    let n = 1;
+    const feed = document.getElementById('feed');
+    const sentinel = document.getElementById('sentinel');
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        // Deterministic: the first intersection loads every lazy item at once.
+        while (n < 6) {
+          n++;
+          const d = document.createElement('div');
+          d.className = 'item';
+          d.id = 'item-' + n;
+          d.textContent = 'Item ' + n + ' (lazy loaded)';
+          feed.appendChild(d);
+        }
+        io.unobserve(sentinel);
+      }
+    });
+    io.observe(sentinel);
+  </script>
+</body>
+</html>

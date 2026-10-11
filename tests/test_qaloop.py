@@ -3494,6 +3494,98 @@ def test_hover_op():
           page2.calls == [("#tip-trigger", 5000)], str(page2.calls))
 
 
+def test_scroll_op():
+    """scroll op: spec validation (target/direction/pixels) and the runner
+    calling scroll_into_view_if_needed for a target, or mouse.wheel with the
+    right sign/axis otherwise (issue #75)."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: s\n    scroll: PARAMS\n")
+    for good, label in [
+        ('{target: "#more"}', "target only"),
+        ("{direction: up}", "direction only"),
+        ("{pixels: 1200}", "pixels only"),
+        ('{direction: left, pixels: 200}', "direction + pixels"),
+    ]:
+        s = load(base.replace("PARAMS", good))
+        check(f"scroll parses ({label})", s.steps[1].op == "scroll")
+    for bad, label in [
+        ("'#more'", "bare string"),
+        ('""', "empty string"),
+        ("{}", "empty mapping"),
+        ("{foo: 1}", "no target/direction/pixels"),
+        ('{target: ""}', "empty target"),
+        ("{target: 42}", "non-string target"),
+        ('{direction: "sideways"}', "bad direction"),
+        ("{pixels: -50}", "negative pixels"),
+        ("{pixels: 1.5}", "non-integer pixels"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad scroll rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad scroll rejected ({label})", True)
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+        def scroll_into_view_if_needed(self, timeout=None):
+            self.page.calls.append(("into_view", self.selector, timeout))
+
+    class FakeMouse:
+        def __init__(self, page):
+            self.page = page
+        def wheel(self, dx, dy):
+            self.page.calls.append(("wheel", dx, dy))
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+            self.mouse = FakeMouse(self)
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+    def run_step(params, timeout_ms=None):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="s", op="scroll",
+                    params=params, expect={}, expect_items=[],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+        _do_action(page, step, "http://x", {})
+        return page.calls
+
+    calls = run_step({"target": "#more"})
+    check("scroll with target uses scroll_into_view_if_needed and default timeout",
+          calls == [("into_view", "#more", 15000)], str(calls))
+    calls = run_step({"target": "#more"}, timeout_ms=5000)
+    check("scroll with target honors step timeout_ms",
+          calls == [("into_view", "#more", 5000)], str(calls))
+    check("scroll down defaults to +600 vertical",
+          run_step({"direction": "down"}) == [("wheel", 0, 600)])
+    check("scroll up maps to -600 vertical",
+          run_step({"direction": "up"}) == [("wheel", 0, -600)])
+    check("scroll left maps to -600 horizontal",
+          run_step({"direction": "left"}) == [("wheel", -600, 0)])
+    check("scroll right maps to +600 horizontal",
+          run_step({"direction": "right"}) == [("wheel", 600, 0)])
+    check("scroll honors custom pixels",
+          run_step({"direction": "down", "pixels": 1200}) == [("wheel", 0, 1200)])
+    check("scroll pixels without direction defaults to down",
+          run_step({"pixels": 300}) == [("wheel", 0, 300)])
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
