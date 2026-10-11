@@ -1,0 +1,34 @@
+version: 1
+name: demo-wait-js-response
+description: >-
+  Self-contained demo of qaloop's two new wait forms (issue #79): the
+  /api/waitdata endpoint is mocked with an 800ms delay, the flow first waits
+  for the network response, then polls a JS flag until the app marks the
+  data loaded, then asserts the rendered text.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the slow data API (responds after 800ms)
+    mock: {url: "**/api/waitdata", json: {message: "data arrived"}, delay_ms: 800}
+  - name: open the demo page
+    goto: /demo/wait-js-response.html
+
+steps:
+  - name: trigger the fetch
+    click: "#load"
+
+  - name: wait for the network response (headers)
+    wait: {response: "/api/waitdata", timeout_ms: 10000}
+
+  - name: wait for the app to mark the data loaded
+    wait: {js: "window.dataLoaded === true", timeout_ms: 10000}
+
+  - name: rendered data is visible
+    expect:
+      - text_contains: {selector: "#out", text: "data arrived"}
+
+teardown: []
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
