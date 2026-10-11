@@ -495,6 +495,35 @@ _PERF_VITALS_SCRIPT = """(async () => {
 })()"""
 
 
+# Issue #85: vendored axe-core (qaloop/assets/axe.min.js, bundled
+# in-repo for determinism and offline safety — see assets/README.md).
+_AXE_MIN_JS = os.path.join(os.path.dirname(__file__), "assets", "axe.min.js")
+
+# Issue #85: one-shot axe.run wrapper. Playwright evaluate awaits the
+# returned promise. rules is a list of axe rule ids (or [] to scan with
+# axe's default rule set); each violation is reduced to {id,
+# description} so the result stays JSON-serializable.
+_AXE_RUN_SCRIPT = """(rules) => axe.run(document,
+    rules && rules.length ? {runOnly: {type: "rule", values: rules}} : {})
+  .then((r) => r.violations.map((v) => ({id: v.id, description: v.description})))"""  # noqa: E501
+
+
+def _axe_scan(page, rules: list | None) -> list[dict]:
+    """Run the vendored axe-core scan once (issue #85).
+
+    Injects the vendored axe.min.js idempotently — only when
+    window.axe is undefined — then runs a one-shot axe.run. Unlike
+    the perf assertion, this never polls: axe.run is seconds-heavy
+    per iteration. Raises on injection or scan errors; the caller
+    fails the assertion closed on those.
+    """
+    if page.evaluate("typeof window.axe === 'undefined'"):
+        with open(_AXE_MIN_JS, "r", encoding="utf-8") as f:
+            source = f.read()
+        page.add_script_tag(content=source)
+    return page.evaluate(_AXE_RUN_SCRIPT, rules or [])
+
+
 def _check_assertions(page, step: Step, collectors: Collectors,
                       baseline_dir: str = "", baseline_update: bool = False,
                       run_dir: str = "", mock_hits: dict | None = None,
@@ -748,6 +777,30 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     parts.append(f"{metric}={actual!r} want <={limit}")
                     ok_all = ok_all and ok
                 out.append(AssertionResult(key, ok_all, "; ".join(parts)))
+            elif key == "a11y":
+                # Assert axe-core accessibility violations (issue #85).
+                # One-shot scan per step (never polled like perf: axe.run
+                # is seconds-heavy per iteration). The violation count
+                # must be at or below the lte budget; the optional rules
+                # list scopes the scan to those axe rule ids. Fail-closed:
+                # an injection or scan error fails the assertion with the
+                # error named, never passes silently. Failure detail
+                # names the violation count, the violating rule ids, and
+                # the first two violation descriptions (truncated).
+                limit = val["violations"]["lte"]
+                try:
+                    violations = _axe_scan(page, val.get("rules"))
+                except Exception as e:  # noqa: BLE001
+                    out.append(AssertionResult(
+                        key, False, f"axe scan failed: {e}"))
+                else:
+                    n = len(violations)
+                    ids = ",".join(v["id"] for v in violations)
+                    detail = f"violations={n} want <={limit}; ids={ids}"
+                    for v in violations[:2]:
+                        detail += (f" | {v['id']}: "
+                                   f"{v['description'][:160]}")
+                    out.append(AssertionResult(key, n <= limit, detail))
             elif key == "url_contains":
                 # Poll page.url until the substring appears or the step
                 # deadline expires (issue #51); detail names the final

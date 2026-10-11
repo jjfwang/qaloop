@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>a11y demo</title>
+<style>
+  body { background: #fff; color: #111; font-family: sans-serif; }
+  #hero { width: 640px; height: 200px; background: #315FD6; color: #fff;
+          font-size: 44px; display: flex; align-items: center;
+          justify-content: center; }
+  #act { font-size: 20px; padding: 12px 28px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<!-- Deliberate violations for the a11y demo flow (issue #85):
+     an <img> with no alt text (image-alt) and a <button> with no
+     accessible name (button-name). -->
+<div id="hero">Accessibility demo</div>
+<img id="mascot" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+<button id="act"></button>
+<p>Black-on-white body text: the scoped color-contrast check passes.</p>
+</body>
+</html>

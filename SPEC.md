@@ -241,6 +241,7 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `cookie` | `{name, equals: v}` / `{name, contains: s}` / `{name}` — cookie value, or presence (see below) |
 | `storage` | `{kind: local|session, key, equals?: v}` — web-storage value, or presence (see below) |
 | `perf` | `{lcp_ms: {lte: n}, cls: {lte: n}, inp_ms: {lte: n}}` — Web Vitals performance budgets in ms (LCP, INP) / shift score (CLS) (see below) |
+| `a11y` | `{violations: {lte: n}, rules?: [...]}` — axe-core accessibility scan (see below) |
 
 `text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, `count`,
 `attribute`, `value`, `focused`, `cookie`, `storage`, and `perf`
@@ -306,6 +307,45 @@ expect:
 
 Prefer `ax` over CSS selectors when the contract is "the user can perceive
 and operate this control", not "this class exists in the DOM".
+
+### `a11y` — deterministic accessibility audit
+
+Asserts against a one-shot [axe-core](https://github.com/dequelabs/axe-core)
+scan of the page, i.e. a deterministic audit of WCAG violations — where
+`ax` asks "can a screen-reader user reach this control?" (`ax` = the
+user-centric accessibility *contract* via role locators), `a11y` asks
+"does the page carry accessibility *violations*?" (`a11y` = the
+violation audit).
+
+```yaml
+expect:
+  - a11y: {violations: {lte: 0}}                              # no violations
+  - a11y: {violations: {lte: 0}, rules: ["color-contrast"]}   # scoped scan
+```
+
+`violations` takes exactly `{lte: N}` — violation counts are upper
+bounds, so `gte`/`equals` are rejected, and `N` must be a non-negative
+number. `rules` (optional) is a non-empty list of axe rule ids
+(e.g. `["color-contrast", "image-alt"]`); without it the scan runs
+axe-core's default rule set.
+
+The runner injects the vendored axe-core bundle idempotently (only when
+`window.axe` is undefined), then calls `axe.run(document, {runOnly})`
+once per step — `runOnly` is omitted when `rules` is not given. Unlike
+the polling assertions this is a one-shot read: axe.run is seconds-heavy
+per iteration, so it never polls. The scan is fail-closed: an injection
+or scan error fails the assertion with the error named, never passes
+silently. The failure detail names the violation count, the violating
+rule ids, and the first two violation descriptions (truncated), e.g.
+`violations=2 want <=0; ids=image-alt,button-name | image-alt: Images
+must have alternate text | button-name: Buttons must have discernible
+text`. Page level: reads the main page, not the step's `frame:` scope.
+
+Vendoring decision: axe-core is bundled in-repo at
+`qaloop/assets/axe.min.js` (axe-core 4.10.2, MPL-2.0; provenance in
+`qaloop/assets/README.md`), never fetched at runtime, so scans stay
+deterministic and offline-safe. The license header is intact at the top
+of the bundled file.
 
 ### `dialog` — JS dialog assertions
 
