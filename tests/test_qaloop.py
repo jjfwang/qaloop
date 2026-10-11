@@ -340,6 +340,168 @@ def test_worker_once_empty_queue_exits():
 
 
 @contextlib.contextmanager
+def _stub_handle_job(fn):
+    """Browser-free stub for worker.handle_job (plain attribute swap)."""
+    from qaloop import worker
+    real = worker.handle_job
+    worker.handle_job = fn
+    try:
+        yield
+    finally:
+        worker.handle_job = real
+
+
+def test_worker_concurrency_no_double_claim():
+    import threading
+    import time
+    from qaloop import queue, worker
+    with temp_db():
+        jids = [queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+                for _ in range(8)]
+        seen, lock = [], threading.Lock()
+
+        def stub(job, **kwargs):
+            time.sleep(0.05)  # widen the race window
+            with lock:
+                seen.append(job["id"])
+            queue.complete(job["id"], "done")
+
+        with _stub_handle_job(stub):
+            worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                              once=True, poll_s=0.01, headless=True,
+                              executable_path=None, concurrency=4)
+        check("parallel claims handle all 8 jobs", len(seen) == 8,
+              f"handled {len(seen)}")
+        check("no job double-claimed", sorted(seen) == sorted(jids), str(sorted(seen)))
+        statuses = [_job_row(j)["status"] for j in jids]
+        check("all jobs done", all(s == "done" for s in statuses), str(statuses))
+
+
+def test_worker_concurrency_once_waits_for_inflight():
+    import threading
+    import time
+    from qaloop import queue, worker
+    with temp_db():
+        j1 = queue.enqueue("verify-flow", {"flow": "a.yaml", "target": "http://x"})
+        j2 = queue.enqueue("verify-flow", {"flow": "b.yaml", "target": "http://x"})
+        finished, lock = [], threading.Lock()
+
+        def stub(job, **kwargs):
+            time.sleep(0.3)  # claim() will briefly see an empty queue
+            with lock:
+                finished.append(job["id"])
+            queue.complete(job["id"], "done")
+
+        with _stub_handle_job(stub):
+            worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                              once=True, poll_s=0.01, headless=True,
+                              executable_path=None, concurrency=2)
+        check("--once waits for in-flight jobs before exiting",
+              sorted(finished) == sorted([j1, j2]), str(sorted(finished)))
+
+
+def test_worker_concurrency_one_is_serial():
+    from qaloop import queue, worker
+    with temp_db():
+        jids = [queue.enqueue("verify-flow", {"flow": f"{i}.yaml", "target": "http://x"})
+                for i in range(4)]
+        order = []
+
+        def stub(job, **kwargs):
+            order.append(job["id"])
+            queue.complete(job["id"], "done")
+
+        with _stub_handle_job(stub):
+            worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                              once=True, poll_s=0.01, headless=True,
+                              executable_path=None, concurrency=1)
+        check("concurrency=1 handles jobs in claim order", order == jids, str(order))
+
+
+def test_worker_concurrency_rejects_invalid():
+    import argparse
+    import io
+    from qaloop import queue, worker
+    from qaloop.cli import cmd_worker
+    raised = False
+    try:
+        worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                          once=True, poll_s=0.01, concurrency=0)
+    except ValueError:
+        raised = True
+    check("run_worker concurrency=0 raises ValueError", raised)
+    bad = argparse.Namespace(flows="/tmp/flows", once=True, poll=5.0,
+                             headed=False, executable_path=None,
+                             keep_runs=None, concurrency=0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_worker(bad)
+    check("CLI --concurrency 0 errors", rc == 2 and "ERROR" in buf.getvalue(),
+          f"rc={rc}")
+    good = argparse.Namespace(flows="/tmp/flows", once=True, poll=0.01,
+                              headed=False, executable_path=None,
+                              keep_runs=None, concurrency=2)
+    with temp_db():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_worker(good)
+    check("CLI --concurrency 2 passes through and exits 0 on empty queue",
+          rc == 0, f"rc={rc}")
+
+
+def test_worker_target_url_isolation_under_threads():
+    """Two concurrent _run_one_flow calls with different targets must each
+    see their own TARGET_URL (proves the set+load_spec lock)."""
+    import threading
+    import time
+    import types
+    from qaloop import worker
+    captured, lock = {}, threading.Lock()
+    saved = {k: getattr(worker, k) for k in
+             ("load_spec", "run_flow", "new_run_dir", "write_report",
+              "print_summary", "prune_old_runs")}
+    saved_ledger_append = worker.ledger.append
+    old_target = os.environ.get("TARGET_URL")
+
+    def fake_load_spec(path):
+        with lock:
+            captured[threading.current_thread().name] = os.environ.get("TARGET_URL")
+        time.sleep(0.05)  # widen the race window
+        return types.SimpleNamespace(name="x", investigate_on_failure=False)
+
+    worker.load_spec = fake_load_spec
+    worker.run_flow = lambda spec, run_dir=None, target=None, **kw: \
+        types.SimpleNamespace(status="passed", duration_ms=1)
+    worker.new_run_dir = lambda root, name: os.path.join(root, name)
+    worker.write_report = lambda *a, **k: None
+    worker.print_summary = lambda *a, **k: None
+    worker.prune_old_runs = lambda *a, **k: None
+    worker.ledger.append = lambda *a, **k: None
+    try:
+        ts = [threading.Thread(target=worker._run_one_flow,
+                               args=("/tmp/x.yaml", url, "/tmp/r", True, None, False),
+                               name=name)
+              for url, name in (("http://target-one", "t-one"),
+                                ("http://target-two", "t-two"))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    finally:
+        for k, v in saved.items():
+            setattr(worker, k, v)
+        worker.ledger.append = saved_ledger_append
+        if old_target is None:
+            os.environ.pop("TARGET_URL", None)
+        else:
+            os.environ["TARGET_URL"] = old_target
+    check("concurrent flows each see their own TARGET_URL",
+          captured.get("t-one") == "http://target-one"
+          and captured.get("t-two") == "http://target-two",
+          str(captured))
+
+
+@contextlib.contextmanager
 def _notify_env(url):
     """Set QALOOP_NOTIFY_URL, restoring the old value on exit."""
     old = os.environ.get("QALOOP_NOTIFY_URL")

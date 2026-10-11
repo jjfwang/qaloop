@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
@@ -16,6 +18,11 @@ from . import ledger
 from . import queue as q
 
 QALOOP_HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Guard the os.environ["TARGET_URL"] set + load_spec pair in _run_one_flow.
+# spec.py expands ${TARGET_URL} from the process environment, so without the
+# lock two concurrent workers could read each other's target URL.
+_TARGET_URL_LOCK = threading.Lock()
 
 
 def load_repos_config(path: str | None = None) -> dict:
@@ -108,8 +115,11 @@ def _run_one_flow(flow_path: str, target: str, runs_root: str,
                   headless: bool, executable_path: str | None,
                   do_investigate: bool, keep_runs: int = 0) -> tuple[str, str]:
     """Run a single flow. Returns (status, run_dir)."""
-    os.environ["TARGET_URL"] = target  # must precede load_spec: specs use ${TARGET_URL}
-    spec = load_spec(flow_path)
+    with _TARGET_URL_LOCK:
+        # must precede load_spec: specs use ${TARGET_URL}; the lock keeps a
+        # concurrent worker thread from seeing this thread's target URL
+        os.environ["TARGET_URL"] = target
+        spec = load_spec(flow_path)
     run_dir = new_run_dir(runs_root, spec.name)
     result = run_flow(spec, run_dir=run_dir, target=target, headless=headless,
                       executable_path=executable_path)
@@ -212,19 +222,38 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
 def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
                poll_s: float = 5, headless: bool = True,
                executable_path: str | None = None,
-               repos_config_path: str | None = None, keep_runs: int = 0) -> None:
+               repos_config_path: str | None = None, keep_runs: int = 0,
+               concurrency: int = 1) -> None:
+    """Claim jobs and handle them, one at a time (concurrency=1) or in
+    parallel via a thread pool. Each job gets its own browser: handle_job ->
+    run_flow launches and closes one per invocation (Playwright sync objects
+    are not thread-safe, so browsers are never shared). q.claim() is atomic
+    across threads, so parallel claims never double-claim."""
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be >= 1 (got {concurrency!r})")
     repos_config = load_repos_config(repos_config_path)
     q.requeue_stale()
-    print(f"worker up — flows={flows_dir} runs={runs_root}")
-    while True:
-        job = q.claim()
-        if job is None:
-            if once:
-                print("queue empty — done")
-                return
-            time.sleep(poll_s)
-            continue
-        print(f"claimed job #{job['id']} ({job['kind']})")
-        handle_job(job, flows_dir=flows_dir, runs_root=runs_root,
-                   headless=headless, executable_path=executable_path,
-                   repos_config=repos_config, keep_runs=keep_runs)
+    print(f"worker up — flows={flows_dir} runs={runs_root} concurrency={concurrency}")
+    handle_kwargs = dict(flows_dir=flows_dir, runs_root=runs_root,
+                         headless=headless, executable_path=executable_path,
+                         repos_config=repos_config, keep_runs=keep_runs)
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        pending: set = set()
+        while True:
+            job = q.claim()
+            if job is not None:
+                print(f"claimed job #{job['id']} ({job['kind']})")
+                fut = executor.submit(handle_job, job, **handle_kwargs)
+                if concurrency == 1:
+                    # serial: wait before the next claim (exactly the old loop)
+                    fut.result()
+                else:
+                    pending.add(fut)
+            else:
+                # queue empty: retire finished futures; --once exits only
+                # when no claimable job AND nothing in flight
+                pending = {f for f in pending if not f.done()}
+                if not pending and once:
+                    print("queue empty — done")
+                    return
+                time.sleep(poll_s)
