@@ -25,6 +25,7 @@ ACTION_OPS = {
     "mock", "upload", "drag", "type", "focus",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
+                 "retry_delay_ms",  # issue #95 — delay between retry attempts
                  "on_dialog", "frame", "store"}  # issue #87 — flow variables
 
 ASSERTION_KEYS = {
@@ -95,6 +96,9 @@ class Step:
     timeout_ms: int | None
     raw: dict
     retry: int = 0  # extra attempts after a failure (steps phase only)
+    # issue #95 — ms to wait between retry attempts; default 0 keeps the
+    # back-to-back behavior; > 0 requires retry > 0 in the steps phase
+    retry_delay_ms: int = 0
     on_dialog: str = "dismiss"  # accept | dismiss — JS dialog policy for the step
     frame: str | None = None  # issue #80 — iframe/frame scope: frame name
     # or URL substring; selectors resolve via page.frame(name|url) instead of
@@ -989,6 +993,19 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
             f"{where}: retry > 0 is only allowed in the steps phase "
             f"(got phase '{phase}'; mocks register once, "
             f"re-registration semantics are undefined)")
+    retry_delay_ms = raw.get("retry_delay_ms", 0)
+    if (isinstance(retry_delay_ms, bool)
+            or not isinstance(retry_delay_ms, int) or retry_delay_ms < 0):
+        raise SpecError(
+            f"{where}: retry_delay_ms must be an integer >= 0, "
+            f"got {retry_delay_ms!r}")
+    # Issue #95: a delay with no retries (or outside the steps phase) would
+    # be silently inert — fail fast, mirroring the retry > 0 phase rule.
+    if retry_delay_ms > 0 and (phase != "steps" or retry == 0):
+        raise SpecError(
+            f"{where}: retry_delay_ms > 0 requires retry > 0 in the steps "
+            f"phase (got retry={retry}, phase '{phase}'; a delay with no "
+            "retries to separate is inert)")
     on_dialog = raw.get("on_dialog", "dismiss")
     if on_dialog not in DIALOG_POLICIES:
         raise SpecError(
@@ -1051,7 +1068,8 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
         name=name or f"{op or 'expect'} #{index}",
         op=op, params=params, expect=expect, expect_items=expect_items,
         continue_on_fail=continue_on_fail, timeout_ms=timeout_ms,
-        retry=retry, on_dialog=on_dialog, frame=frame, store=store, raw=raw,
+        retry=retry, retry_delay_ms=retry_delay_ms, on_dialog=on_dialog,
+        frame=frame, store=store, raw=raw,
     )
 
 

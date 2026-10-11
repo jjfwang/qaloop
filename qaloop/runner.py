@@ -1098,7 +1098,16 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         except Exception as e:  # noqa: BLE001
                             sr.status = "failed"
                             sr.error = f"{type(e).__name__}: {str(e)[:400]}"
-                        # failed and attempts remain: loop back-to-back, no delay
+                        # Issue #95: failed and attempts remain — wait
+                        # retry_delay_ms between attempts (default 0 keeps
+                        # the back-to-back behavior). No delay after the
+                        # final attempt. Kept inside the loop so the delay
+                        # counts in the step duration and the console_clean
+                        # checkpoint (taken once before the loop) keeps its
+                        # "since the step started" meaning.
+                        if (sr.status == "failed" and step.retry_delay_ms > 0
+                                and attempt + 1 < max_attempts):
+                            time.sleep(step.retry_delay_ms / 1000)
                     # final status/error/assertions come from the last attempt
                     sr.duration_ms = int((time.time() - t0) * 1000)
 

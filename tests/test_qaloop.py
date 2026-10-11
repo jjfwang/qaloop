@@ -2406,6 +2406,72 @@ def test_step_retry_spec():
             os.unlink(p)
 
 
+def test_step_retry_delay_ms_spec():
+    """retry_delay_ms: parses, defaults 0; bool/negative/non-int rejected;
+    > 0 with retry == 0 or in setup/teardown rejected (silently inert
+    otherwise)."""
+    from qaloop.spec import load_spec, SpecError
+
+    def write_flow(phase, extra):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("name: retry-delay-spec\ntarget: http://x\n")
+            if phase == "steps":
+                f.write(f"steps:\n  - name: s\n    goto: /\n    {extra}\n")
+            else:
+                f.write(f"{phase}:\n  - name: s\n    goto: /\n    {extra}\n"
+                        "steps:\n  - name: t\n    expect: {noop: true}\n")
+            return f.name
+
+    p = write_flow("steps", "retry: 2\n    retry_delay_ms: 750")
+    try:
+        spec = load_spec(p)
+        check("retry_delay_ms parsed", spec.steps[0].retry_delay_ms == 750)
+    finally:
+        os.unlink(p)
+
+    p = write_flow("steps", "")
+    try:
+        spec = load_spec(p)
+        check("retry_delay_ms defaults to 0",
+              spec.steps[0].retry_delay_ms == 0)
+    finally:
+        os.unlink(p)
+
+    for bad, label in [("retry_delay_ms: -1", "negative"),
+                       ("retry_delay_ms: 1.5", "float"),
+                       ("retry_delay_ms: true", "bool"),
+                       ("retry_delay_ms: '500'", "string")]:
+        p = write_flow("steps", f"retry: 1\n    {bad}")
+        try:
+            load_spec(p)
+            check(f"retry_delay_ms {label} rejected", False, "no error raised")
+        except SpecError:
+            check(f"retry_delay_ms {label} rejected", True)
+        finally:
+            os.unlink(p)
+
+    # delay with no retries is inert -> spec error (steps phase)
+    p = write_flow("steps", "retry_delay_ms: 500")
+    try:
+        load_spec(p)
+        check("retry_delay_ms>0 without retry rejected", False, "no error")
+    except SpecError:
+        check("retry_delay_ms>0 without retry rejected", True)
+    finally:
+        os.unlink(p)
+
+    # delay outside the steps phase is rejected even with retry: 0
+    for phase in ("setup", "teardown"):
+        p = write_flow(phase, "retry_delay_ms: 500")
+        try:
+            load_spec(p)
+            check(f"retry_delay_ms in {phase} rejected", False, "no error")
+        except SpecError:
+            check(f"retry_delay_ms in {phase} rejected", True)
+        finally:
+            os.unlink(p)
+
+
 def test_step_retry_runner():
     """Real browser proof: flaky action passes with retry:2; permanent
     failure with retry:1 fails after exactly 2 attempts; retry:0 unchanged."""
@@ -2485,6 +2551,115 @@ def test_step_retry_runner():
                 rt = RunResult.from_dict(result.to_dict())
                 check("attempts survives to_dict/from_dict",
                       [s.attempts for s in rt.steps] == [3, 1, 2])
+        finally:
+            srv.terminate()
+            srv.wait()
+
+
+def test_step_retry_delay_ms_runner():
+    """Browser proof: retry_delay_ms sleeps exactly once between attempts —
+    never after the final attempt, never when the delay is 0. A recording
+    time.sleep spy (delegating to the real sleep, so timing is unchanged)
+    keeps the assertions deterministic; playwright internals use
+    asyncio.sleep, so the spy only ever records qaloop's own sleeps."""
+    import socket
+    import subprocess
+    import time
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        have_pw = True
+    except ImportError:
+        have_pw = False
+    if not have_pw or not os.path.exists(exe):
+        check("retry_delay_ms runner tests skipped (no browser)", True)
+        return
+    from qaloop.spec import load_spec
+    from qaloop.runner import run_flow
+
+    delay = 777 / 1000  # distinctive value; no other sleep matches it
+
+    def run_one(flow_body, sleeps, d):
+        flow_path = os.path.join(d, "delay-flow.yaml")
+        with open(flow_path, "w") as f:
+            f.write(flow_body)
+        spec = load_spec(flow_path)
+        orig = time.sleep
+
+        def spy(secs):
+            sleeps.append(secs)
+            return orig(secs)
+
+        time.sleep = spy
+        try:
+            with tempfile.TemporaryDirectory() as run_dir:
+                return run_flow(spec, run_dir=run_dir, executable_path=exe)
+        finally:
+            time.sleep = orig
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "index.html"), "w") as f:
+            f.write("<html><body><h1>retry delay demo</h1></body></html>")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            head = f"name: retry-delay-demo\ntarget: http://127.0.0.1:{port}\n"
+            # Case 1: fail once then pass — one delay between the 2 attempts.
+            sleeps = []
+            result = run_one(head + (
+                "steps:\n"
+                "  - name: flaky script succeeds on second try\n"
+                "    retry: 1\n"
+                "    retry_delay_ms: 777\n"
+                "    script: {js: 'window.__n = (window.__n || 0) + 1; "
+                "if (window.__n < 2) throw new Error(\"flaky \" + window.__n); \"ok\"'}\n"
+                "    expect: {noop: true}\n"), sleeps, d)
+            step = result.steps[0]
+            check("delayed step passes on retry", step.status == "passed",
+                  step.status)
+            check("delayed step used 2 attempts", step.attempts == 2,
+                  str(step.attempts))
+            check("exactly one delay between attempts", sleeps == [delay],
+                  str(sleeps))
+            check("delay counts in step duration", step.duration_ms >= 750,
+                  str(step.duration_ms))
+            # Case 2: always fails — one delay, none after the final attempt.
+            sleeps = []
+            result = run_one(head + (
+                "steps:\n"
+                "  - name: permanent failure\n"
+                "    retry: 1\n"
+                "    retry_delay_ms: 777\n"
+                "    timeout_ms: 500\n"
+                "    expect: {visible: \"#never-there\"}\n"), sleeps, d)
+            step = result.steps[0]
+            check("failing step fails after 2 attempts",
+                  step.status == "failed" and step.attempts == 2,
+                  f"{step.status} attempts={step.attempts}")
+            check("no delay after final attempt", sleeps == [delay],
+                  str(sleeps))
+            # Case 3: retry without a delay — no sleep at all.
+            sleeps = []
+            result = run_one(head + (
+                "steps:\n"
+                "  - name: flaky script, no delay\n"
+                "    retry: 1\n"
+                "    script: {js: 'window.__m = (window.__m || 0) + 1; "
+                "if (window.__m < 2) throw new Error(\"flaky\"); \"ok\"'}\n"
+                "    expect: {noop: true}\n"), sleeps, d)
+            step = result.steps[0]
+            check("undelayed step passes on retry", step.status == "passed",
+                  step.status)
+            check("no sleep when retry_delay_ms is 0", sleeps == [],
+                  str(sleeps))
         finally:
             srv.terminate()
             srv.wait()
