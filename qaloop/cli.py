@@ -85,9 +85,14 @@ def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
     target = args.target or spec.target
     print(f"run dir: {run_dir}")
     print(f"target:  {target}")
+    # Flag wins over env (the resolve_keep_runs convention); uploads are
+    # fail-closed in the runner when neither is declared (issue #76).
+    from qaloop.env import resolve_upload_dir
+    upload_dir = resolve_upload_dir(args.upload_dir)
     result = run_flow(spec, run_dir=run_dir, target=target,
                       headless=not args.headed,
-                      executable_path=args.executable_path)
+                      executable_path=args.executable_path,
+                      upload_dir=upload_dir)
     diagnosis = None
     if result.status != "passed" and args.investigate and spec.investigate_on_failure:
         from qaloop.investigate import investigate as run_investigation
@@ -328,6 +333,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("flow", help="path to flow YAML")
     r.add_argument("--target", help="override spec target URL")
     r.add_argument("--headed", action="store_true", help="show the browser")
+    r.add_argument("--upload-dir", default=None,
+                   help="directory file uploads are restricted to "
+                        "(env QALOOP_UPLOAD_DIR; fail-closed if neither "
+                        "is declared)")
+
     r.add_argument("--executable-path", default=None,
                    help="chromium executable (default: playwright's)")
     r.add_argument("--investigate", action="store_true",

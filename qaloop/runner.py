@@ -234,7 +234,8 @@ def _do_mock(page, params: dict, mock_hits: dict) -> None:
     page.route(url, handler)
 
 
-def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
+def _do_action(page, step: Step, target: str, mock_hits: dict,
+               upload_dir: str | None = None) -> None:
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
     if op == "goto":
@@ -265,6 +266,17 @@ def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
         page.uncheck(p, timeout=t)
     elif op == "select":
         page.select_option(p["target"], p["value"], timeout=t)
+    elif op == "upload":
+        # Issue #76: file upload via the runner, guarded like perform.
+        # Fail-closed: the upload dir must be declared via
+        # verify --upload-dir or the QALOOP_UPLOAD_DIR env var.
+        if not upload_dir:
+            raise RuntimeError(
+                "upload needs a declared upload dir: pass --upload-dir or "
+                "set QALOOP_UPLOAD_DIR")
+        from qaloop.upload import check_upload_path
+        checked = check_upload_path(p["path"], upload_dir)
+        page.locator(p["target"]).set_input_files(checked, timeout=t)
     elif op == "wait":
         params = p or {}
         sel = params.get("target")
@@ -558,6 +570,7 @@ def _screenshot_policy(spec: FlowSpec) -> str:
 def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
              headless: bool = True, executable_path: str | None = None,
              baseline_update: bool = False,
+             upload_dir: str | None = None,
              ) -> RunResult:
     """Execute the flow. Never raises for flow failures; raises only on harness errors.
 
@@ -632,7 +645,8 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         sr.error = ""
                         try:
                             if step.op:
-                                _do_action(page, step, target, mock_hits)
+                                _do_action(page, step, target, mock_hits,
+                                           upload_dir=upload_dir)
                             sr.assertions = _check_assertions(
                                 page, step, collectors,
                                 baseline_dir=baseline_dir,

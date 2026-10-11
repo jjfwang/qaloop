@@ -86,6 +86,7 @@ and previously booted services are stopped.
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
 | `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
+| `upload` | `{target, path}` | `locator.set_input_files` on a file input; `path` must be absolute and inside the declared upload dir (`verify --upload-dir` or `QALOOP_UPLOAD_DIR` env) — undeclared dir or violation fails the step |
 | `mock` | `{url, json?|body?|path?, status?, method?, headers?, times?, delay_ms?}` | register a network mock before navigation (see below) |
 | `script` | `{js: "..."}` | `page.evaluate`; result ignored |
 
