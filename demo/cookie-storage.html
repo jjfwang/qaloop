@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cookie/storage demo</title>
+</head>
+<body>
+<h1>Login</h1>
+<button id="login">Log in</button>
+<p id="status">logged out</p>
+<script>
+document.getElementById("login").addEventListener("click", () => {
+  // Simulate an async login round-trip: state is written a tick later,
+  // so assertions must poll rather than read once.
+  setTimeout(() => {
+    document.cookie = "session=abc123; path=/";
+    localStorage.setItem("consent", "accepted");
+    sessionStorage.setItem("flag", "beta");
+    document.getElementById("status").textContent = "logged in";
+  }, 400);
+});
+</script>
+</body>
+</html>

@@ -557,6 +557,55 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"{sel}: focused={actual}"))
+            elif key == "cookie":
+                # Assert a cookie's value (issue #82). Read from the browser
+                # context: cookies set async (e.g. by a login request) need
+                # polling, so this polls like attribute/value. A missing
+                # cookie (name not in context.cookies()) never matches — even
+                # for contains. Name-only (no comparator) asserts presence:
+                # "the login cookie is set". Failure detail names the final
+                # observed value, not the desired one.
+                name = val["name"]
+                def read_cookie():
+                    for c in page.context.cookies():
+                        if c.get("name") == name:
+                            return c.get("value")
+                    return None
+                if "equals" in val:
+                    match, want = (lambda a: a == val["equals"],
+                                   f"={val['equals']!r}")
+                elif "contains" in val:
+                    match, want = (lambda a: a is not None and
+                                   val["contains"] in a,
+                                   f"contains {val['contains']!r}")
+                else:
+                    match, want = (lambda a: a is not None, "present")
+                ok, actual = _poll_value_match(
+                    read_cookie, match, time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"cookie {name!r}={actual!r} want {want}"))
+            elif key == "storage":
+                # Assert a web-storage value (issue #82). Page-level: storage
+                # is keyed on the main page's origin, not the step's frame
+                # scope. The key is passed as a JS arg, never interpolated
+                # into the script, so quoting in keys can't break or inject.
+                # Polled like the other async-set state; a missing key
+                # (getItem -> null) never matches. Key-only asserts presence.
+                kind, skey = val["kind"], val["key"]
+                script = ("(a) => { const s = a.kind === 'local' "
+                          "? localStorage : sessionStorage; "
+                          "return s.getItem(a.key); }")
+                if "equals" in val:
+                    match, want = (lambda a: a == val["equals"],
+                                   f"={val['equals']!r}")
+                else:
+                    match, want = (lambda a: a is not None, "present")
+                ok, actual = _poll_value_match(
+                    lambda: page.evaluate(script, {"kind": kind, "key": skey}),
+                    match, time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"storage {kind}.{skey}="
+                                           f"{actual!r} want {want}"))
             elif key == "mock_calls":
                 # Assert how often a mocked route was served (issue #43).
                 # observed comes from the run's mock_hits dict, keyed by the
