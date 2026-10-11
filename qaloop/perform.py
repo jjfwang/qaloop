@@ -206,16 +206,10 @@ class Performer:
 
     def _check_upload_path(self, path: str) -> str:
         # Only absolute paths under the declared upload dir may be uploaded.
-        # Rejects relative paths and `..` escapes; raises ValueError so a
-        # rejected upload surfaces as a FAILED action observation.
-        if not isinstance(path, str) or not os.path.isabs(path):
-            raise ValueError("upload path must be an absolute path")
-        allowed = os.path.abspath(self.upload_dir or "")
-        want = os.path.abspath(path)
-        if os.path.commonpath([want, allowed]) != allowed:
-            raise ValueError(
-                f"upload path {path!r} is outside the upload dir {allowed!r}")
-        return want
+        # Shared with the verify runner (issue #76): qaloop.upload
+        # holds the guard so both code paths reject the same violations.
+        from qaloop.upload import check_upload_path
+        return check_upload_path(path, self.upload_dir)
 
     def act(self, action: dict) -> str:
         """Execute one model action; return the observation string."""

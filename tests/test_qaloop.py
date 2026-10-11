@@ -3586,6 +3586,162 @@ def test_scroll_op():
           run_step({"pixels": 300}) == [("wheel", 0, 300)])
 
 
+
+def test_upload_op():
+    """upload op (issue #76): spec validation ({target, path} required),
+    the shared qaloop.upload.check_upload_path guard, and the runner
+    calling locator.set_input_files with the guarded absolute path."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+    from qaloop.upload import check_upload_path
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: u\n    upload: PARAMS\n")
+    good = '{target: "#resume", path: "/tmp/resume.txt"}'
+    s = load(base.replace("PARAMS", good))
+    check("upload with {target, path} parses",
+          s.steps[1].op == "upload"
+          and s.steps[1].params["target"] == "#resume"
+          and s.steps[1].params["path"] == "/tmp/resume.txt")
+    for bad, label in [
+        ("'#resume'", "bare string (needs {target, path})"),
+        ("{}", "empty mapping"),
+        ("{target: '#resume'}", "missing path"),
+        ("{path: '/tmp/resume.txt'}", "missing target"),
+        ("{target: '', path: '/tmp/resume.txt'}", "empty target"),
+        ("{target: '#resume', path: ''}", "empty path"),
+        ("{target: 42, path: '/tmp/resume.txt'}", "non-string target"),
+        ("{target: '#resume', path: 42}", "non-string path"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad upload rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad upload rejected ({label})", True)
+
+    # Shared guard (same violations as the perform guard): inside-dir
+    # absolute passes; relative, `..` escape, absolute-outside rejected.
+    with tempfile.TemporaryDirectory() as d:
+        inside = os.path.join(d, "resume.txt")
+        check("guard: absolute path inside dir passes",
+              check_upload_path(inside, d) == os.path.abspath(inside))
+        for name, bad in [
+            ("guard: relative path rejected", "resume.txt"),
+            ("guard: .. escape rejected",
+             os.path.join(d, "..", "escape.txt")),
+            ("guard: absolute path outside rejected", "/etc/hostname"),
+            ("guard: sibling dir via .. rejected",
+             os.path.join(d, "sub", "..", "..", "other")),
+        ]:
+            try:
+                check_upload_path(bad, d)
+                check(name, False, bad)
+            except ValueError:
+                check(name, True)
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+        def set_input_files(self, files, timeout=None):
+            self.page.calls.append(("set_input_files", self.selector,
+                                    files, timeout))
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+    def run_step(params, upload_dir, timeout_ms=None):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="u", op="upload",
+                    params=params, expect={}, expect_items=[],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+        _do_action(page, step, "http://x", {}, upload_dir=upload_dir)
+        return page
+
+    with tempfile.TemporaryDirectory() as d:
+        want = os.path.abspath(os.path.join(d, "resume.txt"))
+        page = run_step({"target": "#resume", "path": want}, d)
+        check("upload calls set_input_files with guarded abspath",
+              page.calls == [("set_input_files", "#resume", want, 15000)],
+              str(page.calls))
+        page = run_step({"target": "#resume", "path": want}, d,
+                        timeout_ms=5000)
+        check("upload honors step timeout_ms",
+              page.calls == [("set_input_files", "#resume", want, 5000)],
+              str(page.calls))
+
+        # Guard violation: raises (the step fails) and set_input_files
+        # is never called.
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="u", op="upload",
+                    params={"target": "#resume", "path": "/etc/hostname"},
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=None, raw={})
+        try:
+            _do_action(page, step, "http://x", {}, upload_dir=d)
+            check("upload guard violation fails the step", False, "no error")
+        except ValueError:
+            check("upload guard violation fails the step", True)
+        check("guard violation never touches set_input_files",
+              page.calls == [], str(page.calls))
+
+        # Fail-closed: no declared upload dir at all.
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="u", op="upload",
+                    params={"target": "#resume", "path": want},
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=None, raw={})
+        try:
+            _do_action(page, step, "http://x", {}, upload_dir=None)
+            check("undeclared upload dir fails the step", False, "no error")
+        except RuntimeError as e:
+            check("undeclared upload dir fails the step", True)
+            check("undeclared-dir error names both sources",
+                  "--upload-dir" in str(e) and "QALOOP_UPLOAD_DIR" in str(e),
+                  str(e))
+        check("undeclared dir never touches set_input_files",
+              page.calls == [], str(page.calls))
+
+
+def test_resolve_upload_dir():
+    """resolve_upload_dir: --upload-dir flag wins over QALOOP_UPLOAD_DIR;
+    None when neither is declared (fail-closed in the runner, issue #76)."""
+    from qaloop.env import resolve_upload_dir
+
+    def setenv(value):
+        if value is None:
+            os.environ.pop("QALOOP_UPLOAD_DIR", None)
+        else:
+            os.environ["QALOOP_UPLOAD_DIR"] = value
+
+    try:
+        setenv(None)
+        check("no flag, no env → None", resolve_upload_dir(None) is None)
+        setenv("/srv/up")
+        check("env alone wins over nothing",
+              resolve_upload_dir(None) == "/srv/up")
+        check("flag beats env",
+              resolve_upload_dir("/flag/dir") == "/flag/dir")
+        setenv(None)
+        check("flag alone → flag",
+              resolve_upload_dir("/flag/dir") == "/flag/dir")
+    finally:
+        os.environ.pop("QALOOP_UPLOAD_DIR", None)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
@@ -3596,3 +3752,4 @@ if __name__ == "__main__":
             print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
+

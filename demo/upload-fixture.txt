@@ -1,0 +1,5 @@
+Laowang
+laowang@local
++65 8000 0000
+
+This is a fixture resume for the qaloop upload action demo (issue #76).

@@ -75,6 +75,14 @@ def resolve_keep_runs(flag_value: int | None = None) -> int:
     return keep
 
 
+def resolve_upload_dir(flag_value: str | None = None) -> str | None:
+    """Resolve the upload-dir allowlist: --upload-dir flag wins over
+    QALOOP_UPLOAD_DIR. Returns None when neither is declared; the runner
+    treats None as fail-closed (issue #76).
+    """
+    return flag_value or os.environ.get("QALOOP_UPLOAD_DIR") or None
+
+
 @dataclass
 class ProcTarget:
     """A booted target: static server or long-running command."""
