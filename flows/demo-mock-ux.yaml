@@ -1,5 +1,6 @@
 version: 1
 name: demo-mock-ux
+tags: [smoke]
 description: >-
   Self-contained demo of qaloop's data-mocking and UX assertions: the
   /api/greeting endpoint is mocked (no backend), the button click renders

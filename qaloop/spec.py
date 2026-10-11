@@ -122,9 +122,45 @@ class FlowSpec:
     matrix: list[dict] = field(default_factory=list)  # issue #88 —
     # data-driven combinations: each dict is one combination's variable
     # map, expanded from the `matrix:` block by _validate_matrix
+    tags: list[str] = field(default_factory=list)  # issue #89 —
+    # batch selection labels, validated by _validate_tags
     # Issue #83: opt-in request-body recording. Default False keeps the
     # network_log schema and privacy posture unchanged (SPEC.md).
     record_bodies: bool = False
+
+
+# Issue #89: flow tags for batch selection. A tag starts with an
+# alphanumeric and may then contain alphanumerics, _, ., - — shell-safe
+# and slug-safe.
+_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _validate_tags(raw: Any, where: str) -> list[str]:
+    """Validate the top-level `tags:` block (issue #89).
+
+    A list of non-empty strings matching ^[A-Za-z0-9][A-Za-z0-9_.-]*$,
+    no duplicates. There is no unknown-top-level-key guard, so tags
+    must be explicitly validated here — unknown keys are otherwise
+    silently ignored.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise SpecError(f"{where}: `tags` must be a list of tag strings, "
+                        f"got {type(raw).__name__}")
+    seen = set()
+    for i, tag in enumerate(raw):
+        w = f"{where}: tags[{i}]"
+        if not isinstance(tag, str) or not tag:
+            raise SpecError(
+                f"{w}: tag must be a non-empty string, got {tag!r}")
+        if not _TAG.match(tag):
+            raise SpecError(
+                f"{w}: tag {tag!r} must match ^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+        if tag in seen:
+            raise SpecError(f"{w}: duplicate tag {tag!r}")
+        seen.add(tag)
+    return list(raw)
 
 
 _SERVICE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
@@ -190,10 +226,16 @@ def load_services_light(path: str) -> tuple[str, list[dict]]:
 
     Used to boot services BEFORE the full spec load, so that service URLs
     are available as ${QALOOP_SERVICE_<NAME>_URL} during env substitution.
-    Never boots anything itself.
+    Never boots anything itself. Raises SpecError when the file cannot
+    be parsed (issue #89: the batch path records this as an INVALID-SPEC
+    failure instead of crashing).
     """
     with open(path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+        text = f.read()
+    try:
+        raw = yaml.safe_load(text)
+    except Exception as e:
+        raise SpecError(f"spec {path}: cannot parse YAML ({e})")
     where = f"spec {path}"
     if not isinstance(raw, dict):
         raise SpecError(f"{where}: top level must be a mapping")
@@ -1024,7 +1066,13 @@ def _parse_steps(raw: Any, phase: str, default_timeout_ms: int,
 def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     """Load and validate a flow-spec YAML file. Raises SpecError on problems."""
     with open(path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+        text = f.read()
+    try:
+        raw = yaml.safe_load(text)
+    except Exception as e:
+        # Issue #89: unparsable YAML is an invalid spec, not a crash —
+        # the batch path records it as an INVALID-SPEC failure.
+        raise SpecError(f"spec {path}: cannot parse YAML ({e})")
     where = f"spec {path}"
     if not isinstance(raw, dict):
         raise SpecError(f"{where}: top level must be a mapping")
@@ -1052,6 +1100,9 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     if not isinstance(record_bodies, bool):
         raise SpecError(
             f"{where}: record_bodies must be a bool, got {record_bodies!r}")
+    # Issue #89: flow tags for batch selection (validated explicitly —
+    # there is no unknown-top-level-key guard).
+    tags = _validate_tags(raw.get("tags"), where)
     # Issue #86: expand include steps on the RAW step lists, before
     # _parse_steps — so include/with entries never reach _parse_step's
     # unknown-keys guard, and any ${var} the with: map did not substitute
@@ -1105,4 +1156,5 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         services=_validate_services(raw.get("services"), where),
         record_bodies=record_bodies,
         matrix=matrix,
+        tags=tags,
     )
