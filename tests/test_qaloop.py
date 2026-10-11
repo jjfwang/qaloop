@@ -7069,6 +7069,179 @@ def test_issue_90_video_recording():
     check("verify --video defaults off", a.video is False, str(a.video))
 
 
+def test_issue_122_browser_context():
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.runner import run_flow
+    import playwright.sync_api as pw_sync
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def mkflow(browser_block):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name, "name: b\ntarget: http://h\n" + browser_block +
+                  "artifacts: {screenshot: none, trace: false}\n"
+                  "steps:\n  - name: s\n    wait_ms: 1\n")
+            spec = load_spec(f.name)
+            os.unlink(f.name)
+        return spec
+
+    def mkbad(browser_block):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name, "name: b\ntarget: http://h\n" + browser_block +
+                  "steps:\n  - name: s\n    wait_ms: 1\n")
+            try:
+                load_spec(f.name)
+                bad = None
+            except SpecError as e:
+                bad = str(e)
+            finally:
+                os.unlink(f.name)
+        return bad
+
+    # --- loader: defaults ---
+    spec_none = mkflow("")
+    check("no browser: key yields {}", spec_none.browser == {},
+          str(spec_none.browser))
+    check("viewport still 1280x800",
+          spec_none.viewport == {"width": 1280, "height": 800},
+          str(spec_none.viewport))
+
+    # --- loader: valid block accepted ---
+    spec_ok = mkflow("browser:\n  color_scheme: dark\n  is_mobile: true\n"
+                     "  has_touch: false\n  locale: en-US\n"
+                     "  timezone_id: America/New_York\n"
+                     "  user_agent: test-ua\n  device_scale_factor: 2\n")
+    check("full valid browser block accepted",
+          spec_ok.browser == {"color_scheme": "dark", "is_mobile": True,
+                              "has_touch": False, "locale": "en-US",
+                              "timezone_id": "America/New_York",
+                              "user_agent": "test-ua",
+                              "device_scale_factor": 2},
+          str(spec_ok.browser))
+
+    # --- loader: rejections name the offending key ---
+    bad = mkbad("browser: {color_scheme: sepia}\n")
+    check("bad color_scheme enum rejected",
+          bad is not None and "browser.color_scheme" in bad, str(bad))
+    bad = mkbad("browser: {frobnicate: 1}\n")
+    check("unknown browser key rejected",
+          bad is not None and "browser.frobnicate" in bad, str(bad))
+    bad = mkbad("browser: {is_mobile: \"yes\"}\n")
+    check("is_mobile 'yes' rejected",
+          bad is not None and "browser.is_mobile" in bad, str(bad))
+    bad = mkbad("browser: [dark]\n")
+    check("browser not-a-mapping rejected",
+          bad is not None and "browser must be a mapping" in bad, str(bad))
+    bad = mkbad("browser: {device_scale_factor: 0}\n")
+    check("device_scale_factor 0 rejected",
+          bad is not None and "browser.device_scale_factor" in bad, str(bad))
+    bad = mkbad("browser: {locale: 5}\n")
+    check("locale non-string rejected",
+          bad is not None and "browser.locale" in bad, str(bad))
+
+    # --- faked browser: pass-through ---
+    ctx_kwargs = []
+    page_holder = {}
+
+    class FakePage:
+        def on(self, event, handler):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeCtx:
+        def new_page(self):
+            return page_holder["page"]
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            ctx_kwargs.append(kw)
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        # declared keys reach new_context, video recording kwargs intact
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page_holder["page"] = page
+            ctx_kwargs.clear()
+            result = run_flow(spec_ok, run_dir=run_dir, video=True)
+            kw = ctx_kwargs[-1]
+            check("video run with browser opts passes",
+                  result.status == "passed", result.status)
+            check("color_scheme reaches new_context",
+                  kw.get("color_scheme") == "dark", str(kw))
+            check("is_mobile reaches new_context",
+                  kw.get("is_mobile") is True, str(kw))
+            check("locale reaches new_context",
+                  kw.get("locale") == "en-US", str(kw))
+            check("timezone_id reaches new_context",
+                  kw.get("timezone_id") == "America/New_York", str(kw))
+            check("user_agent reaches new_context",
+                  kw.get("user_agent") == "test-ua", str(kw))
+            check("device_scale_factor reaches new_context",
+                  kw.get("device_scale_factor") == 2, str(kw))
+            check("video recording kwargs kept with browser opts",
+                  kw.get("record_video_dir")
+                  == os.path.join(run_dir, "video")
+                  and kw.get("record_video_size")
+                  == {"width": 1280, "height": 800}
+                  and kw.get("viewport")
+                  == {"width": 1280, "height": 800}, str(kw))
+
+        # non-video path also forwards the declared keys
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page_holder["page"] = page
+            ctx_kwargs.clear()
+            result = run_flow(spec_ok, run_dir=run_dir)
+            check("non-video run with browser opts passes",
+                  result.status == "passed", result.status)
+            check("non-video path forwards color_scheme",
+                  ctx_kwargs[-1].get("color_scheme") == "dark",
+                  str(ctx_kwargs[-1]))
+
+        # absent block: nothing extra passed (acceptance #3)
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page_holder["page"] = page
+            ctx_kwargs.clear()
+            result = run_flow(spec_none, run_dir=run_dir)
+            check("absent browser block run passes",
+                  result.status == "passed", result.status)
+            check("absent block passes only viewport",
+                  ctx_kwargs[-1] == {"viewport": {"width": 1280,
+                                                  "height": 800}},
+                  str(ctx_kwargs[-1]))
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+
 def _syn_step_91(name, status, dur_ms):
     return {"index": 0, "name": name, "phase": "steps", "op": "goto",
             "status": status, "duration_ms": dur_ms, "attempts": 1}
