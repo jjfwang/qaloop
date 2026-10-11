@@ -91,7 +91,7 @@ alongside the feature. Conventions:
 | command | what it does |
 |---|---|
 | `validate <flow>` | check spec structure (env vars not required) |
-| `verify <flow> [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once, print card, write `runs/<id>/REPORT.md` + `junit.xml` |
+| `verify <flow\|dir> [--tag T] [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once (or a whole directory), print card, write `runs/<id>/REPORT.md` + `junit.xml` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
 | `perform --task "..." --target URL [--executable-path PATH]` | natural-language browser agent: performs the task like a person (see below) |
 | `evaluate --claim "..." --run <dir> --diff <file\|range> [--repo DIR]` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
@@ -119,6 +119,12 @@ alongside the feature. Conventions:
 - `--max-actions N` (on `investigate`, default 20) caps the investigator's
   ReAct-loop action budget — when the budget is exhausted the investigator is
   told to finish with its best diagnosis.
+- `--tag T` (on `verify`, repeatable) selects flows by their top-level
+  `tags:` (OR semantics, exact case-sensitive match). `verify <dir>`
+  runs every `*.yaml`/`*.yml` in a directory (non-recursive, sorted) in
+  per-flow subdirs with a combined parent `REPORT.md` + `batch.json`;
+  exit 0 iff every flow passed, 1 on any failure. An empty selection
+  exits 2 — a batch never silently passes. See SPEC.md.
 
 ## Demo: mock + UX in one flow
 

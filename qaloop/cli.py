@@ -45,6 +45,64 @@ def _service_ctx(flow_path: str, services: list, run_dir: str):
     return flow_services(services, base_dir, run_dir)
 
 
+class BatchSelectionError(Exception):
+    """Raised when a batch (directory) verify run selects no flows."""
+
+
+def _read_flow_tags(path: str) -> list[str]:
+    """Light-parse a flow file's tags, without env substitution (issue #89).
+
+    Used for --tag selection, before services boot or the full spec
+    load. Raises SpecError when the file cannot be parsed or the tags
+    block is invalid.
+    """
+    import yaml
+    from qaloop.spec import _validate_tags
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except Exception as e:
+        raise SpecError(f"spec {path}: cannot parse YAML ({e})")
+    where = f"spec {path}"
+    if not isinstance(raw, dict):
+        raise SpecError(f"{where}: top level must be a mapping")
+    return _validate_tags(raw.get("tags"), where)
+
+
+def _select_flows(flow_dir: str, tags: list[str] | None) -> list[str]:
+    """Select the flow files in a directory for a batch verify run.
+
+    Non-recursive: *.yaml/*.yml files only, sorted by name. When tags
+    are given, keep flows carrying at least one of them (OR semantics,
+    exact case-sensitive match). A flow whose tags cannot be read is
+    kept — it surfaces as an INVALID-SPEC failure at run time rather
+    than a silent skip. Raises BatchSelectionError when nothing is
+    selected: a batch must never silently pass.
+    """
+    wanted = tags or []
+    selected = []
+    for name in sorted(os.listdir(flow_dir)):
+        if not name.endswith((".yaml", ".yml")):
+            continue
+        path = os.path.join(flow_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if wanted:
+            try:
+                flow_tags = _read_flow_tags(path)
+            except SpecError:
+                selected.append(path)
+                continue
+            if not any(t in flow_tags for t in wanted):
+                continue
+        selected.append(path)
+    if not selected:
+        detail = (f"no flows in {flow_dir} carry tag(s) {wanted}"
+                  if wanted else f"no flow YAML files in {flow_dir}")
+        raise BatchSelectionError(detail)
+    return selected
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     from qaloop import ledger
     from qaloop.env import resolve_keep_runs
@@ -55,15 +113,38 @@ def cmd_verify(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"ERROR: {e}")
         return 2
+    flow_arg = args.flow
+    if os.path.isdir(flow_arg):
+        # Issue #89: a directory positional verifies every flow YAML in it.
+        if args.investigate:
+            print("note: --investigate is not applied in batch mode")
+        try:
+            return _cmd_verify_batch(args, flow_arg, ledger, runs_root,
+                                     keep_runs)
+        except BatchSelectionError as e:
+            print(f"ERROR: {e}")
+            return 2
+    if args.tag:
+        # Issue #89: single file + --tag runs iff the flow carries the tag.
+        try:
+            flow_tags = _read_flow_tags(flow_arg)
+        except SpecError as e:
+            print(f"INVALID SPEC: {e}")
+            return 2
+        missing = [t for t in args.tag if t not in flow_tags]
+        if missing:
+            print(f"SKIP: {flow_arg} does not carry tag(s) {missing} "
+                  f"(flow tags: {flow_tags or 'none'})")
+            return 2
     try:
-        flow_name, services = _flow_services_info(args.flow)
+        flow_name, services = _flow_services_info(flow_arg)
     except SpecError as e:
         print(f"INVALID SPEC: {e}")
         return 2
     run_dir = new_run_dir(runs_root, flow_name)
     # Enter the services context explicitly so boot failures (and only boot
     # failures) are reported as such; the flow run itself manages its errors.
-    ctx = _service_ctx(args.flow, services, run_dir)
+    ctx = _service_ctx(flow_arg, services, run_dir)
     try:
         ctx.__enter__()
     except (TimeoutError, RuntimeError, ValueError) as e:
@@ -76,31 +157,56 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
-                    runs_root: str, keep_runs: int) -> int:
+                    runs_root: str, keep_runs: int, prune: bool = True) -> int:
+    """Single-flow verify path. The batch path (issue #89) reuses
+    _run_single_flow for the same behavior."""
+    from qaloop.env import resolve_upload_dir
+    # Flag wins over env (the resolve_keep_runs convention); uploads are
+    # fail-closed in the runner when neither is declared (issue #76).
+    upload_dir = resolve_upload_dir(args.upload_dir)
+    rec = _run_single_flow(args, args.flow, run_dir, ledger, upload_dir,
+                           batch_mode=False, runs_root=runs_root,
+                           keep_runs=keep_runs, prune=prune)
+    if rec["error"] and "INVALID SPEC" in rec["error"]:
+        return 2
+    return 0 if rec["status"] == "passed" else 1
+
+
+def _run_single_flow(args, flow_path: str, run_dir: str, ledger, upload_dir,
+                     batch_mode: bool, runs_root: str, keep_runs: int,
+                     prune: bool = True) -> dict:
+    """Run one flow file end to end in run_dir (issue #89).
+
+    The full single-flow verify path: spec load, matrix dispatch,
+    run_flow, write_report, ledger entry. Returns a batch-summary record
+    dict: file, status, duration_ms, steps_passed, steps_total, subdir,
+    error. --investigate is not applied in batch_mode (same carve-out
+    as matrix mode).
+    """
+    rec = {"file": os.path.basename(flow_path), "status": "failed",
+           "duration_ms": 0, "steps_passed": 0, "steps_total": 0,
+           "subdir": run_dir, "error": None}
     try:
-        spec = load_spec(args.flow)
+        spec = load_spec(flow_path)
     except SpecError as e:
         print(f"INVALID SPEC: {e}")
-        return 2
+        rec["error"] = f"INVALID SPEC: {e}"
+        return rec
     target = args.target or spec.target
     print(f"run dir: {run_dir}")
     print(f"target:  {target}")
-    # Flag wins over env (the resolve_keep_runs convention); uploads are
-    # fail-closed in the runner when neither is declared (issue #76).
-    from qaloop.env import resolve_upload_dir
-    upload_dir = resolve_upload_dir(args.upload_dir)
-    # Issue #88: a spec with `matrix:` runs the flow once per combination,
-    # each in its own run dir under <run_dir>/matrix/, with a combined
-    # summary in the parent REPORT.md.
     if spec.matrix:
-        return _cmd_verify_matrix(args, spec, run_dir, ledger, runs_root,
-                                  keep_runs, upload_dir)
+        _, mrec = _cmd_verify_matrix(args, spec, run_dir, ledger, runs_root,
+                                     keep_runs, upload_dir, prune=prune)
+        rec.update(mrec)
+        return rec
     result = run_flow(spec, run_dir=run_dir, target=target,
                       headless=not args.headed,
                       executable_path=args.executable_path,
                       upload_dir=upload_dir)
     diagnosis = None
-    if result.status != "passed" and args.investigate and spec.investigate_on_failure:
+    if (not batch_mode and result.status != "passed" and args.investigate
+            and spec.investigate_on_failure):
         from qaloop.investigate import investigate as run_investigation
         print("step failed — summoning investigator...")
         diagnosis = run_investigation(
@@ -121,10 +227,93 @@ def _cmd_verify_run(args: argparse.Namespace, run_dir: str, ledger,
     ledger.append({"kind": "scripted", "run_dir": run_dir, "flow": spec.name,
                    "status": result.status, "duration_ms": result.duration_ms,
                    "cost_usd_est": 0.0})
-    pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
+    rec.update(status=result.status, duration_ms=result.duration_ms,
+               steps_passed=sum(1 for s in result.steps
+                                if s.status == "passed"),
+               steps_total=len(result.steps),
+               error=result.error or None)
+    return rec
+
+
+def _batch_run_one(args, flow_path: str, subdir: str, ledger,
+                   upload_dir) -> dict:
+    """Run one flow of a batch in its subdir (issue #89).
+
+    The full per-flow path: services light-parse + boot/teardown,
+    run_flow, write_report, ledger entry. INVALID SPEC and SERVICE BOOT
+    FAILED are recorded as failed records — the batch continues with
+    the rest (batch resilience).
+    """
+    stem = os.path.splitext(os.path.basename(flow_path))[0]
+    rec = {"file": os.path.basename(flow_path), "status": "failed",
+           "duration_ms": 0, "steps_passed": 0, "steps_total": 0,
+           "subdir": subdir, "error": None}
+    try:
+        _, services = _flow_services_info(flow_path)
+    except SpecError as e:
+        rec["error"] = f"INVALID SPEC: {e}"
+        print(f"[{stem}] {rec['error']}")
+        return rec
+    ctx = _service_ctx(flow_path, services, subdir)
+    try:
+        ctx.__enter__()
+    except (TimeoutError, RuntimeError, ValueError) as e:
+        rec["error"] = f"SERVICE BOOT FAILED: {type(e).__name__}: {e}"
+        print(f"[{stem}] {rec['error']}")
+        return rec
+    try:
+        print(f"--- flow: {flow_path}")
+        rec.update(_run_single_flow(args, flow_path, subdir, ledger,
+                                    upload_dir, batch_mode=True,
+                                    runs_root=None, keep_runs=0,
+                                    prune=False))
+        rec["file"] = os.path.basename(flow_path)
+        rec["subdir"] = subdir
+    finally:
+        ctx.__exit__(None, None, None)
+    return rec
+
+
+def _cmd_verify_batch(args, flow_dir: str, ledger, runs_root: str,
+                      keep_runs: int) -> int:
+    """Verify every flow in a directory (issue #89).
+
+    Parent run dir <runs>/<stamp>-<dirname>-batch with per-flow subdirs
+    <parent>/flows/<stem>/, each getting the full single-flow path.
+    Exit 0 iff every flow passed; 1 if any failed (INVALID SPEC and
+    SERVICE BOOT FAILED are recorded as failed and the batch continues).
+    Selection errors (empty selection) exit 2 via BatchSelectionError.
+    --keep-runs pruning happens once, after the batch report, with the
+    parent dir as current.
+    """
+    from qaloop.env import resolve_upload_dir
+    from qaloop.report import write_batch_summary
+    selected = _select_flows(flow_dir, args.tag)  # raises BatchSelectionError
+    tags = args.tag or []
+    parent = new_run_dir(
+        runs_root, os.path.basename(os.path.abspath(flow_dir)) + "-batch")
+    flows_root = os.path.join(parent, "flows")
+    os.makedirs(flows_root, exist_ok=True)
+    upload_dir = resolve_upload_dir(args.upload_dir)
+    print(f"batch run dir: {parent}")
+    print(f"flows: {len(selected)}"
+          + (f" (tag filter: {', '.join(tags)})" if tags else ""))
+    records = []
+    for flow_path in selected:
+        stem = os.path.splitext(os.path.basename(flow_path))[0]
+        subdir = os.path.join(flows_root, stem)
+        # Mirror new_run_dir: run_flow writes step artifacts to <subdir>/steps.
+        os.makedirs(os.path.join(subdir, "steps"), exist_ok=True)
+        records.append(_batch_run_one(args, flow_path, subdir, ledger,
+                                      upload_dir))
+    report_path = write_batch_summary(records, parent)
+    passed = sum(1 for r in records if r["status"] == "passed")
+    print(f"batch: {passed}/{len(records)} flows passed")
+    print(f"report: {report_path}")
+    pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=parent)
     if pruned:
         print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
-    return 0 if result.status == "passed" else 1
+    return 0 if passed == len(records) else 1
 
 
 def _combo_slug(combo: dict, index: int) -> str:
@@ -135,7 +324,7 @@ def _combo_slug(combo: dict, index: int) -> str:
 
 
 def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
-                       keep_runs: int, upload_dir) -> int:
+                       keep_runs: int, upload_dir, prune: bool = True) -> tuple:
     """Run a matrix flow once per combination (issue #88).
 
     One parent run dir, per-combination subdirs
@@ -143,7 +332,8 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
     REPORT.md; a combined summary lands in the parent REPORT.md.
     Exit code 0 iff every combination passed. Per-combination
     investigation is not run in matrix mode (--investigate applies to
-    single runs only).
+    single runs only). Returns (exit_code, batch-summary record) for
+    issue #89's batch table.
     """
     from qaloop.report import write_matrix_summary
     matrix_dir = os.path.join(run_dir, "matrix")
@@ -170,10 +360,16 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
                    "status": "passed" if passed == len(results) else "failed",
                    "combinations": len(results), "passed": passed,
                    "cost_usd_est": 0.0})
-    pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
-    if pruned:
-        print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
-    return 0 if passed == len(results) else 1
+    if prune:
+        pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
+        if pruned:
+            print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
+    record = {"file": os.path.basename(spec.source_path),
+              "status": "passed" if passed == len(results) else "failed",
+              "duration_ms": sum(r.duration_ms for _, r, _ in results),
+              "steps_passed": passed, "steps_total": len(results),
+              "subdir": run_dir, "error": None, "matrix": True}
+    return (0 if passed == len(results) else 1), record
 
 
 def cmd_baselines(args: argparse.Namespace) -> int:
@@ -384,9 +580,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("flow", help="path to flow YAML")
     v.set_defaults(fn=cmd_validate)
 
-    r = sub.add_parser("verify", help="run a flow against a target")
-    r.add_argument("flow", help="path to flow YAML")
+    r = sub.add_parser("verify",
+                       help="run a flow (or a directory of flows) against a target")
+    r.add_argument("flow", help="path to flow YAML or directory of flow YAMLs")
     r.add_argument("--target", help="override spec target URL")
+    r.add_argument("--tag", action="append", default=None,
+                   help="only run flows carrying this tag (repeatable; OR "
+                        "semantics, exact case-sensitive match)")
     r.add_argument("--headed", action="store_true", help="show the browser")
     r.add_argument("--upload-dir", default=None,
                    help="directory file uploads are restricted to "

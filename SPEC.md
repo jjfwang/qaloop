@@ -632,6 +632,52 @@ Rules:
   subdirs). Exit code is 0 iff every combination passed. In matrix
   mode `--investigate` is not applied per combination.
 
+### Tags — labeling flows with `tags:`
+
+A top-level `tags:` labels a flow for batch selection (issue #89):
+
+```yaml
+tags: [smoke, login]
+```
+
+Rules:
+
+- `tags:` is a list of non-empty strings matching
+  `^[A-Za-z0-9][A-Za-z0-9_.-]*$` (no spaces, no duplicates); anything
+  else is a `SpecError`. Flows without `tags:` default to `[]`.
+- Tag matching is exact and case-sensitive.
+
+### Batch verification — `verify <dir>`
+
+`verify` accepts a directory of flow YAMLs (issue #89): every
+`*.yaml`/`*.yml` in the directory (non-recursive, sorted by name) runs
+in its own subdir `<run_dir>/flows/<stem>/`, each with the full
+single-flow path (services boot/teardown, `run_flow`, `REPORT.md` +
+`junit.xml`, per-flow ledger entry). A combined summary lands in the
+parent `REPORT.md` (per-flow PASS/FAIL table with report links) plus a
+machine-readable `batch.json` (`file`, `status`, `duration_ms`,
+`report`).
+
+- `--tag T` (repeatable) selects only flows carrying at least one of
+  the tags (OR semantics, exact case-sensitive match). With a single
+  flow file, `--tag` runs the flow iff it carries the tag, otherwise it
+  exits 2 naming the missing tag.
+- An empty selection (no flow files, or no tag match) exits 2 — a
+  batch never silently passes.
+- Exit code is 0 iff every flow passed, 1 if any flow failed. An
+  INVALID SPEC or SERVICE BOOT FAILED for one flow records that flow
+  as failed and the batch continues with the rest (batch resilience).
+  This deviates from single-flow's exit 2/3 codes by design.
+- `--investigate` is not applied per flow in batch mode (same carve-out
+  as matrix mode). `--keep-runs` pruning happens once after the batch
+  report, with the parent dir as current.
+- A directory run uses the same per-flow code path as single `verify`:
+  a flow with `matrix:` runs in matrix mode inside its own subdir, and
+  the batch table reports its aggregate PASS/FAIL (the steps column
+  shows combinations passed/total; per-combination detail stays in the
+  flow's own REPORT.md).
+- There is no `--all` flag — the directory positional covers it.
+
 ## Conventions
 
 - Write the spec alongside the feature; the implementer authors its own

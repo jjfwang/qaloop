@@ -181,6 +181,69 @@ def write_matrix_summary(spec: FlowSpec, combos_results: list,
     return path
 
 
+def write_batch_summary(flow_results: list, run_dir: str) -> str:
+    """Write the parent REPORT.md + batch.json for a batch run (issue #89).
+
+    flow_results: list of dicts with file, status ("passed"/"failed"),
+    duration_ms, steps_passed, steps_total, subdir, error (optional).
+    Per-flow junit.xml stays in each subdir (written by write_report);
+    the XML is not merged. Returns the REPORT.md path written.
+    """
+    passed = sum(1 for r in flow_results if r["status"] == "passed")
+    total = len(flow_results)
+    lines = [
+        f"# qaloop batch report [{passed}/{total} PASS]",
+        "",
+        f"- flows: {total}",
+        f"- passed: {passed}",
+        f"- failed: {total - passed}",
+        f"- run dir: `{run_dir}`",
+        "",
+        "## Flows",
+        "",
+        "| # | flow | status | steps | report |",
+        "|---|---|---|---|---|",
+    ]
+    for i, r in enumerate(flow_results):
+        badge = {"passed": "PASS", "failed": "FAIL"}.get(
+            r["status"], str(r["status"]).upper())
+        report_file = os.path.join(r["subdir"], "REPORT.md")
+        if os.path.isfile(report_file):
+            rel = os.path.relpath(report_file, run_dir)
+            link = f"[{os.path.basename(r['subdir'])}]({rel})"
+        else:
+            link = "—"
+        lines.append(
+            f"| {i} | `{r['file']}` | {badge} | "
+            f"{r['steps_passed']}/{r['steps_total']} | {link} |")
+    lines += [
+        "",
+        "Per-flow detail: `flows/<stem>/REPORT.md` + `run.json` under "
+        f"`{run_dir}`. For matrix flows the steps column shows combinations "
+        "passed/total; per-combination detail stays in the flow's own "
+        "REPORT.md.",
+        "",
+    ]
+    path = os.path.join(run_dir, "REPORT.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    batch = []
+    for r in flow_results:
+        report_file = os.path.join(r["subdir"], "REPORT.md")
+        batch.append({
+            "file": r["file"],
+            "status": r["status"],
+            "duration_ms": r["duration_ms"],
+            "steps_passed": r["steps_passed"],
+            "steps_total": r["steps_total"],
+            "report": (os.path.relpath(report_file, run_dir)
+                       if os.path.isfile(report_file) else None),
+            "error": r.get("error"),
+        })
+    save_json(os.path.join(run_dir, "batch.json"), batch)
+    return path
+
+
 def write_junit_xml(result: RunResult, spec: FlowSpec, path: str) -> str:
     """Write a JUnit XML report: one testsuite per flow, one testcase per step.
 

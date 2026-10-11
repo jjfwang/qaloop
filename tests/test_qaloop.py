@@ -5835,6 +5835,405 @@ def test_issue_88_matrix_flows():
         pw_sync.sync_playwright = old_pw
 
 
+def test_issue_89_flow_tags_batch():
+    """Issue #89: flow `tags` + `verify` on a directory.
+
+    Loader: tags accepted / default [] / every rejection (non-list,
+    non-string, empty, bad chars, duplicates). Selection: _select_flows
+    sorted listing incl .yml, tag OR filter, case-sensitive, unreadable
+    kept, empty/no-match -> BatchSelectionError. CLI: single file + --tag
+    mismatch -> 2, invalid tags -> 2, match runs the flow; invalid spec
+    through _cmd_verify_run -> 2. Batch: mixed pass/fail/broken/boot-
+    failure/matrix -> exit 1 with per-flow records + parent summary,
+    all-pass -> 0, tag filter selects a subset, --investigate note in
+    batch mode. Report: write_batch_summary on synthetic records.
+    """
+    import tempfile
+    from types import SimpleNamespace
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.cli import (_select_flows, BatchSelectionError,
+                            _cmd_verify_batch, _cmd_verify_run,
+                            _read_flow_tags, cmd_verify)
+    from qaloop.report import write_batch_summary
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    base = ("name: t\ntarget: http://h\nsteps:\n"
+            "  - name: s\n    wait_ms: 1\n")
+
+    # --- tags validation ---
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, base + "tags: [smoke, v2.0, a-b_c.d]\n")
+        spec = load_spec(f.name)
+        check("tags accepted",
+              spec.tags == ["smoke", "v2.0", "a-b_c.d"], str(spec.tags))
+        os.unlink(f.name)
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, base)
+        spec = load_spec(f.name)
+        check("tags default []", spec.tags == [], str(spec.tags))
+        os.unlink(f.name)
+
+    def rejects(text, label):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name, text)
+        try:
+            load_spec(f.name)
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+        finally:
+            os.unlink(f.name)
+
+    rejects(base + "tags: smoke\n", "tags non-list")
+    rejects(base + "tags: [ok, 7]\n", "tags non-string")
+    rejects(base + "tags: [ok, '']\n", "tags empty string")
+    rejects(base + "tags: ['bad tag!']\n", "tags bad chars")
+    rejects(base + "tags: ['-lead']\n", "tags leading dash")
+    rejects(base + "tags: [smoke, smoke]\n", "tags duplicates")
+
+    # --- _read_flow_tags ---
+    def read_raises(text, label):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name, text)
+        try:
+            _read_flow_tags(f.name)
+            check(label, False)
+        except SpecError:
+            check(label, True)
+        finally:
+            os.unlink(f.name)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, base + "tags: [smoke]\n")
+        check("read_flow_tags", _read_flow_tags(f.name) == ["smoke"])
+        os.unlink(f.name)
+    read_raises(base + "tags: ['bad tag!']\n",
+                "read_flow_tags invalid tags raises")
+    read_raises("just a string\n", "read_flow_tags non-mapping raises")
+    read_raises("name: [unclosed\n", "read_flow_tags bad yaml raises")
+
+    # --- _select_flows ---
+    with tempfile.TemporaryDirectory() as d:
+        write(os.path.join(d, "b.yaml"), base + "tags: [smoke]\n")
+        write(os.path.join(d, "a.yaml"), base + "tags: [smoke, night]\n")
+        write(os.path.join(d, "c.yml"), base)
+        write(os.path.join(d, "notes.txt"), "not a flow")
+        write(os.path.join(d, "broken.yaml"), base + "tags: ['bad tag!']\n")
+        os.makedirs(os.path.join(d, "z.yaml"))  # a directory, not a file
+        sub = os.path.join(d, "sub")
+        os.makedirs(sub)
+        write(os.path.join(sub, "deep.yaml"), base + "tags: [smoke]\n")
+        basenames = lambda ps: [os.path.basename(p) for p in ps]
+        check("select lists sorted incl .yml",
+              basenames(_select_flows(d, None))
+              == ["a.yaml", "b.yaml", "broken.yaml", "c.yml"])
+        check("select tag OR filter",
+              basenames(_select_flows(d, ["smoke"]))
+              == ["a.yaml", "b.yaml", "broken.yaml"])
+        check("select multiple tags OR",
+              basenames(_select_flows(d, ["smoke", "night"]))
+              == ["a.yaml", "b.yaml", "broken.yaml"])
+        check("select unreadable tags kept",
+              "broken.yaml" in basenames(_select_flows(d, ["smoke"])))
+    with tempfile.TemporaryDirectory() as clean:
+        write(os.path.join(clean, "a.yaml"), base + "tags: [smoke]\n")
+        for tags, label in [(["nope"], "no-match raises"),
+                            (["Smoke"], "case-sensitive no-match raises")]:
+            try:
+                _select_flows(clean, tags)
+                check(label, False)
+            except BatchSelectionError:
+                check(label, True)
+    with tempfile.TemporaryDirectory() as empty:
+        try:
+            _select_flows(empty, None)
+            check("empty dir raises", False)
+        except BatchSelectionError:
+            check("empty dir raises", True)
+
+    # --- single-file _cmd_verify_run: invalid spec -> 2, investigate path ---
+    import qaloop.cli as cli_mod
+    import qaloop.ledger as ledger_mod
+
+    def fake_result(status, ms=100):
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed" if status == "passed"
+                            else "failed",
+                            duration_ms=ms)]
+        return RunResult(flow_name="x", target="http://h", status=status,
+                         started=1.0, ended=1.0 + ms / 1000.0, steps=steps,
+                         failed_step=None if status == "passed" else 0,
+                         console_errors=[], page_errors=[],
+                         failed_requests=[], bad_responses=[], run_dir="")
+
+    real_run_flow = cli_mod.run_flow
+    real_append = ledger_mod.append
+    real_default_runs = cli_mod.default_runs_root
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "bad.yaml")
+        write(bad, "name: [unclosed\n")
+        args = SimpleNamespace(flow=bad, target=None, headed=True,
+                               executable_path=None, upload_dir=None,
+                               investigate=False, keep_runs=0,
+                               max_investigation_actions=None)
+        rc = _cmd_verify_run(args, os.path.join(d, "r"), FakeLedger(), d, 0)
+        check("single verify invalid spec exits 2", rc == 2, str(rc))
+        # single-flow investigate path (stubbed investigator)
+        import qaloop.investigate as inv_mod
+        real_inv = inv_mod.investigate
+        inv_calls = []
+        inv_mod.investigate = lambda **kw: inv_calls.append(kw) or {
+            "model": "fake", "tokens_in": 1, "tokens_out": 2,
+            "cost_usd_est": 0.0, "likely_cause": "x", "diagnosis": "y"}
+        cli_mod.run_flow = lambda spec, **kw: fake_result("failed")
+        try:
+            okf = os.path.join(d, "ok.yaml")
+            write(okf, base + "investigate_on_failure: true\n")
+            args_i = SimpleNamespace(flow=okf, target=None, headed=True,
+                                     executable_path=None, upload_dir=None,
+                                     investigate=True, keep_runs=0,
+                                     max_investigation_actions=None)
+            led = FakeLedger()
+            ri_dir = os.path.join(d, "ri")
+            os.makedirs(ri_dir, exist_ok=True)
+            rc = _cmd_verify_run(args_i, ri_dir, led, d, 0)
+            check("single verify investigate on failure exits 1",
+                  rc == 1, str(rc))
+            check("investigation ledger entry",
+                  [r["kind"] for r in led.rows]
+                  == ["investigation", "scripted"]
+                  and inv_calls and inv_calls[0]["run_dir"].endswith("ri"),
+                  str([r["kind"] for r in led.rows]))
+        finally:
+            inv_mod.investigate = real_inv
+            cli_mod.run_flow = real_run_flow
+
+    # --- cmd_verify: single file + --tag, and directory batch ---
+    with tempfile.TemporaryDirectory() as d:
+        ledger_mod.append = lambda row: None
+        cli_mod.default_runs_root = lambda: os.path.join(d, "runs")
+        cli_mod.run_flow = lambda spec, **kw: fake_result("passed")
+        try:
+            fp = os.path.join(d, "f.yaml")
+            write(fp, base + "tags: [smoke]\n")
+
+            def mk(**kw):
+                a = dict(flow=fp, target=None, headed=True,
+                         executable_path=None, upload_dir=None,
+                         investigate=False, keep_runs=0,
+                         max_investigation_actions=None, tag=None)
+                a.update(kw)
+                return SimpleNamespace(**a)
+
+            check("single file + --tag mismatch exits 2",
+                  cmd_verify(mk(tag=["night"])) == 2)
+            check("single file + --tag match runs",
+                  cmd_verify(mk(tag=["smoke"])) == 0)
+            bad = os.path.join(d, "bad.yaml")
+            write(bad, "name: [unclosed\n")
+            check("single file + --tag invalid spec exits 2",
+                  cmd_verify(mk(flow=bad, tag=["smoke"])) == 2)
+            badsvc = os.path.join(d, "badsvc.yaml")
+            write(badsvc, base + "tags: [smoke]\n"
+                  "services:\n  - name: '9bad'\n    command: 'x'\n"
+                  "    wait: {port: 1}\n")
+            check("single file bad services exits 2",
+                  cmd_verify(mk(flow=badsvc, tag=["smoke"])) == 2)
+            bootsvc = os.path.join(d, "bootsvc.yaml")
+            write(bootsvc, base + "tags: [smoke]\n"
+                  "services:\n  - name: s\n    command: 'sleep 30'\n"
+                  "    wait: {port: 9}\n    timeout_s: 1\n")
+            check("single file service boot failure exits 3",
+                  cmd_verify(mk(flow=bootsvc, tag=["smoke"])) == 3)
+            empty = os.path.join(d, "empty")
+            os.makedirs(empty)
+            check("empty dir batch exits 2",
+                  cmd_verify(mk(flow=empty, tag=None)) == 2)
+            bdir = os.path.join(d, "bdir")
+            os.makedirs(bdir)
+            write(os.path.join(bdir, "g.yaml"), base)
+            check("dir batch with --investigate note exits 0",
+                  cmd_verify(mk(flow=bdir, investigate=True)) == 0)
+            old_keep = os.environ.get("QALOOP_KEEP_RUNS")
+            os.environ["QALOOP_KEEP_RUNS"] = "bogus"
+            try:
+                check("bad QALOOP_KEEP_RUNS exits 2",
+                      cmd_verify(mk(flow=bdir, keep_runs=None)) == 2)
+            finally:
+                if old_keep is None:
+                    del os.environ["QALOOP_KEEP_RUNS"]
+                else:
+                    os.environ["QALOOP_KEEP_RUNS"] = old_keep
+        finally:
+            ledger_mod.append = real_append
+            cli_mod.default_runs_root = real_default_runs
+            cli_mod.run_flow = real_run_flow
+
+    # --- _cmd_verify_batch: mixed outcomes, stubbed run_flow ---
+    with tempfile.TemporaryDirectory() as d:
+        flowdir = os.path.join(d, "flows")
+        os.makedirs(flowdir)
+        write(os.path.join(flowdir, "a-pass.yaml"),
+              "name: ok-flow\ntarget: http://h\ntags: [smoke]\n"
+              "steps:\n  - name: s\n    wait_ms: 1\n")
+        write(os.path.join(flowdir, "b-fail.yaml"),
+              "name: fail-flow\ntarget: http://h\ntags: [smoke, night]\n"
+              "steps:\n  - name: s\n    wait_ms: 1\n")
+        write(os.path.join(flowdir, "c-broken.yaml"), "name: [unclosed\n")
+        write(os.path.join(flowdir, "d-svc.yaml"),
+              "name: svc-flow\ntarget: http://h\n"
+              "services:\n"
+              "  - name: s\n    command: \"sleep 30\"\n"
+              "    wait: {port: 9}\n    timeout_s: 1\n"
+              "steps:\n  - name: s\n    wait_ms: 1\n")
+        write(os.path.join(flowdir, "e-matrix.yaml"),
+              "name: mx-flow\ntarget: http://h/${t}\n"
+              "matrix:\n  t: [a, b]\n"
+              "steps:\n  - name: go\n    goto: /${t}\n")
+        runs = os.path.join(d, "runs")
+        os.makedirs(runs, exist_ok=True)
+        # stale dirs so the batch prune actually prunes (covers the log line)
+        for n in range(3):
+            os.makedirs(os.path.join(runs, f"20000101T00000{n}Z-old-{n}"))
+        ledger = FakeLedger()
+
+        def fake_run_flow(spec, **kw):
+            return fake_result("failed" if "fail" in spec.name else "passed")
+
+        cli_mod.run_flow = fake_run_flow
+        try:
+            def bargs(**kw):
+                a = dict(flow=flowdir, target=None, headed=True,
+                         executable_path=None, upload_dir=None,
+                         investigate=False, keep_runs=0,
+                         max_investigation_actions=None, tag=None)
+                a.update(kw)
+                return SimpleNamespace(**a)
+
+            rc = _cmd_verify_batch(bargs(), flowdir, ledger, runs, 2)
+            check("batch exit 1 on failures", rc == 1, str(rc))
+            parents = [p for p in os.listdir(runs) if "-flows-batch-" in p]
+            check("batch parent dir created", len(parents) == 1,
+                  str(parents))
+            parent = os.path.join(runs, parents[0])
+            body = open(os.path.join(parent, "REPORT.md")).read()
+            check("batch summary 2/5 PASS", "[2/5 PASS]" in body, body[:160])
+            check("batch summary rows",
+                  "`a-pass.yaml`" in body and "`c-broken.yaml`" in body
+                  and "FAIL" in body, body[:400])
+            kinds = [r["kind"] for r in ledger.rows]
+            check("batch per-flow ledger entries",
+                  kinds == ["scripted", "scripted", "scripted-matrix"],
+                  str(kinds))
+            bj = json.load(open(os.path.join(parent, "batch.json")))
+            check("batch.json has 5 entries", len(bj) == 5, str(len(bj)))
+            by_file = {e["file"]: e for e in bj}
+            check("batch.json pass entry",
+                  by_file["a-pass.yaml"]["status"] == "passed"
+                  and by_file["a-pass.yaml"]["steps_passed"] == 1
+                  and by_file["a-pass.yaml"]["report"]
+                  == "flows/a-pass/REPORT.md",
+                  str(by_file["a-pass.yaml"]))
+            check("batch.json fail entry",
+                  by_file["b-fail.yaml"]["status"] == "failed"
+                  and by_file["b-fail.yaml"]["error"] is None,
+                  str(by_file["b-fail.yaml"]))
+            check("batch.json invalid-spec entry",
+                  by_file["c-broken.yaml"]["status"] == "failed"
+                  and by_file["c-broken.yaml"]["error"].startswith(
+                      "INVALID SPEC")
+                  and by_file["c-broken.yaml"]["report"] is None,
+                  str(by_file["c-broken.yaml"]))
+            check("batch.json boot-failed entry",
+                  by_file["d-svc.yaml"]["error"].startswith(
+                      "SERVICE BOOT FAILED"),
+                  str(by_file["d-svc.yaml"]))
+            check("batch.json matrix aggregate",
+                  by_file["e-matrix.yaml"]["status"] == "passed"
+                  and by_file["e-matrix.yaml"]["steps_passed"] == 2
+                  and by_file["e-matrix.yaml"]["steps_total"] == 2,
+                  str(by_file["e-matrix.yaml"]))
+            check("per-flow reports written",
+                  os.path.isfile(os.path.join(parent, "flows", "a-pass",
+                                              "REPORT.md"))
+                  and os.path.isfile(os.path.join(parent, "flows",
+                                                  "e-matrix", "REPORT.md")))
+            # tag filter selects a subset
+            ledger2 = FakeLedger()
+            rc2 = _cmd_verify_batch(bargs(tag=["smoke"]), flowdir,
+                                    ledger2, runs, 0)
+            check("batch tag filter exit 1 (one fail)", rc2 == 1, str(rc2))
+            check("batch tag filter ran 2 flows", len(ledger2.rows) == 2,
+                  str(ledger2.rows))
+            # all-pass batch -> exit 0
+            fd2 = os.path.join(d, "flows2")
+            os.makedirs(fd2)
+            write(os.path.join(fd2, "only.yaml"), base)
+            rc3 = _cmd_verify_batch(bargs(), fd2, FakeLedger(),
+                                    os.path.join(d, "runs2"), 0)
+            check("batch exit 0 all pass", rc3 == 0, str(rc3))
+        finally:
+            cli_mod.run_flow = real_run_flow
+
+    # --- write_batch_summary on synthetic records ---
+    with tempfile.TemporaryDirectory() as d:
+        sub1 = os.path.join(d, "flows", "a-pass")
+        os.makedirs(sub1)
+        write(os.path.join(sub1, "REPORT.md"), "# x")
+        sub2 = os.path.join(d, "flows", "b-fail")
+        os.makedirs(sub2)
+        sub3 = os.path.join(d, "flows", "c-err")
+        os.makedirs(sub3)
+        recs = [
+            {"file": "a-pass.yaml", "status": "passed", "duration_ms": 120,
+             "steps_passed": 2, "steps_total": 2, "subdir": sub1,
+             "error": None},
+            {"file": "b-fail.yaml", "status": "failed", "duration_ms": 340,
+             "steps_passed": 1, "steps_total": 2, "subdir": sub2,
+             "error": "assertion failed"},
+            {"file": "c-err.yaml", "status": "error", "duration_ms": 10,
+             "steps_passed": 0, "steps_total": 0, "subdir": sub3,
+             "error": "boom"},
+        ]
+        path = write_batch_summary(recs, d)
+        check("batch summary path", path == os.path.join(d, "REPORT.md"))
+        body = open(path).read()
+        check("batch summary 1/3 PASS", "[1/3 PASS]" in body, body[:120])
+        check("batch summary rows",
+              "`a-pass.yaml`" in body and "FAIL" in body
+              and "ERROR" in body, body[:400])
+        check("batch summary links existing report",
+              "flows/a-pass/REPORT.md" in body, body[:600])
+        bj = json.load(open(os.path.join(d, "batch.json")))
+        check("batch.json entries",
+              [e["file"] for e in bj]
+              == ["a-pass.yaml", "b-fail.yaml", "c-err.yaml"], str(bj))
+        check("batch.json fields",
+              bj[0]["status"] == "passed"
+              and bj[0]["duration_ms"] == 120
+              and bj[0]["report"] == "flows/a-pass/REPORT.md"
+              and bj[1]["error"] == "assertion failed"
+              and bj[2]["report"] is None
+              and bj[2]["error"] == "boom",
+              str(bj[0]))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
