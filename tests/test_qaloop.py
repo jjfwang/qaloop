@@ -3494,6 +3494,101 @@ def test_hover_op():
           page2.calls == [("#tip-trigger", 5000)], str(page2.calls))
 
 
+def test_drag_op():
+    """drag op (issue #77): spec validation ({target, to} required, to is a
+    selector string or {x, y} int coords) and the runner calling
+    locator.drag_to with the right dest form and step timeout."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: d\n    drag: PARAMS\n")
+    s = load(base.replace("PARAMS", '{target: "#card", to: "#dropzone"}'))
+    check("drag with selector 'to' parses",
+          s.steps[1].op == "drag" and s.steps[1].params["to"] == "#dropzone")
+    s = load(base.replace("PARAMS", '{target: "#handle", to: {x: 390, y: 364}}'))
+    check("drag with coords 'to' parses",
+          s.steps[1].params["to"] == {"x": 390, "y": 364})
+    for bad, label in [
+        ("'#card'", "bare string (needs {target, to})"),
+        ('""', "empty string"),
+        ("{}", "empty mapping"),
+        ("{target: '#card'}", "missing to"),
+        ("{to: '#dropzone'}", "missing target"),
+        ("{target: '', to: '#dropzone'}", "empty target"),
+        ("{target: '#card', to: ''}", "empty to string"),
+        ("{target: 42, to: '#dropzone'}", "non-string target"),
+        ("{target: '#card', to: 42}", "non-mapping/non-string to"),
+        ("{target: '#card', to: {x: 1}}", "coords missing y"),
+        ("{target: '#card', to: {y: 1}}", "coords missing x"),
+        ("{target: '#card', to: {x: 1.5, y: 2}}", "non-integer x"),
+        ("{target: '#card', to: {x: 'a', y: 2}}", "string x"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad drag rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad drag rejected ({label})", True)
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+        def drag_to(self, dest, timeout=None):
+            self.page.calls.append((self.selector, dest, timeout))
+        def hover(self, timeout=None):
+            self.page.calls.append(("hover", self.selector, timeout))
+
+    class FakeMouse:
+        def __init__(self, page):
+            self.page = page
+        def down(self):
+            self.page.calls.append(("down",))
+        def move(self, x, y, steps=None):
+            self.page.calls.append(("move", x, y, steps))
+        def up(self):
+            self.page.calls.append(("up",))
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+            self.mouse = FakeMouse(self)
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+    def run_step(params, timeout_ms=None):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="d", op="drag",
+                    params=params, expect={}, expect_items=[],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+        _do_action(page, step, "http://x", {})
+        return page
+
+    page = run_step({"target": "#card", "to": "#dropzone"})
+    check("drag with selector 'to' drags to a locator of the target selector",
+          len(page.calls) == 1 and page.calls[0][0] == "#card"
+          and page.calls[0][2] == 15000
+          and isinstance(page.calls[0][1], FakeLocator)
+          and page.calls[0][1].selector == "#dropzone",
+          str(page.calls))
+    page = run_step({"target": "#handle", "to": {"x": 390, "y": 364}},
+                    timeout_ms=5000)
+    check("drag with coords 'to' drives the mouse to {x, y} and honors step timeout_ms",
+          page.calls == [("hover", "#handle", 5000), ("down",),
+                         ("move", 390, 364, 10), ("up",)],
+          str(page.calls))
+
+
 def test_scroll_op():
     """scroll op: spec validation (target/direction/pixels) and the runner
     calling scroll_into_view_if_needed for a target, or mouse.wheel with the

@@ -1,0 +1,29 @@
+name: demo-drag-drop
+description: >-
+  Browser proof for the drag action op (issue #77): drags a card onto a
+  dropzone (selector target) and drags a slider handle to fixed page
+  coordinates (coords target); the page echoes the drop into #drop-status
+  and the slider value into #vol-value.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the drag demo page
+    goto: /demo/drag-drop.html
+
+steps:
+  - name: drag the card onto the dropzone
+    drag: {target: "#card", to: "#dropzone"}
+    expect:
+      - text_contains: {selector: "#drop-status", text: "dropped: card"}
+  - name: drag the slider handle to the right end
+    drag: {target: "#handle", to: {x: 390, y: 364}}
+    expect:
+      - js:
+          script: "document.querySelector('#vol-value').textContent"
+          contains: "100"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

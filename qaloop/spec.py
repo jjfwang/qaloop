@@ -21,7 +21,7 @@ ACTION_OPS = {
     "goto", "click", "dblclick", "fill", "press", "hover", "scroll", "check",
     "uncheck",
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
-    "mock", "upload",
+    "mock", "upload", "drag",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
                  "on_dialog"}
@@ -202,6 +202,24 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
                 or not isinstance(params.get("path"), str)
                 or not params["path"]):
             raise SpecError(f"{where}: upload needs {{target, path}}")
+    elif op == "drag":
+        if (not isinstance(params, dict)
+                or not isinstance(params.get("target"), str)
+                or not params["target"]):
+            raise SpecError(f"{where}: drag needs {{target, to}}")
+        to = params.get("to")
+        if isinstance(to, str):
+            if not to:
+                raise SpecError(f"{where}: drag needs {{target, to}}")
+        elif isinstance(to, dict):
+            x, y = to.get("x"), to.get("y")
+            if not isinstance(x, int) or not isinstance(y, int):
+                raise SpecError(
+                    f"{where}: drag 'to' coords need {{x: N, y: N}} integers")
+        else:
+            raise SpecError(
+                f"{where}: drag 'to' must be a selector string or "
+                f"{{x: N, y: N}}")
     elif op == "scroll":
         if not isinstance(params, dict):
             raise SpecError(f"{where}: scroll needs a mapping")
