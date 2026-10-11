@@ -534,10 +534,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if args.concurrency < 1:
         print(f"ERROR: --concurrency must be >= 1 (got {args.concurrency})")
         return 2
+    if args.job_timeout <= 0:
+        print(f"ERROR: --job-timeout must be > 0 (got {args.job_timeout})")
+        return 2
     run_worker(flows_dir=args.flows, runs_root=default_runs_root(),
                once=args.once, poll_s=args.poll, headless=not args.headed,
                executable_path=args.executable_path, keep_runs=keep_runs,
-               concurrency=args.concurrency)
+               concurrency=args.concurrency, job_timeout_s=args.job_timeout)
     return 0
 
 
@@ -648,6 +651,10 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--poll", type=float, default=5)
     w.add_argument("--concurrency", type=int, default=1,
                    help="parallel job claims (default 1 = serial)")
+    w.add_argument("--job-timeout", type=float, default=1800,
+                   help="per-job timeout in seconds (default 1800); a job "
+                        "still running after this is recorded failed with a "
+                        "timeout note (payload 'timeout_s' overrides)")
     w.add_argument("--headed", action="store_true")
     w.add_argument("--executable-path", default=None)
     w.add_argument("--keep-runs", type=int, default=None,

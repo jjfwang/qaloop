@@ -19,6 +19,11 @@ from . import queue as q
 
 QALOOP_HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Default per-job timeout for handle_job (issue #94): a hung browser holding
+# a claimed job used to surface only at the 1h stale requeue; the timeout
+# turns that into a recorded failure in seconds.
+DEFAULT_JOB_TIMEOUT_S = 1800.0
+
 # Guard the os.environ["TARGET_URL"] set + load_spec pair in _run_one_flow.
 # spec.py expands ${TARGET_URL} from the process environment, so without the
 # lock two concurrent workers could read each other's target URL.
@@ -145,9 +150,23 @@ def _run_one_flow(flow_path: str, target: str, runs_root: str,
     return result.status, run_dir
 
 
-def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
-               executable_path: str | None, repos_config: dict,
-               keep_runs: int = 0) -> None:
+def _resolve_job_timeout(payload: dict, job_timeout_s: float) -> float:
+    """Resolve the per-job timeout in seconds: a positive numeric payload
+    'timeout_s' overrides the CLI default; anything else (missing,
+    non-positive, non-numeric) falls back to the default defensively."""
+    raw = payload.get("timeout_s")
+    if raw is None:
+        return job_timeout_s
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return job_timeout_s
+    return value if value > 0 else job_timeout_s
+
+
+def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
+                     executable_path: str | None, repos_config: dict,
+                     keep_runs: int = 0) -> None:
     payload = job["payload"]
     if isinstance(payload, str):
         import json as _json
@@ -219,24 +238,73 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
             t.stop()
 
 
+def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
+               executable_path: str | None, repos_config: dict,
+               keep_runs: int = 0,
+               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S) -> None:
+    """Handle one job with a timeout (issue #94): the job body runs in a
+    daemon thread and is joined for timeout_s. On expiry the job is recorded
+    failed via q.record_failure (so the retry budget applies exactly like any
+    other failure — requeued within budget, and a terminal timeout takes the
+    existing _notify_failure path from #92).
+
+    The hung thread stays orphaned: Playwright sync objects are not
+    thread-safe, so the timer side never touches the browser — run_flow's
+    'finally: browser.close()' reclaims it when the hung call eventually
+    returns. Documented tradeoff, not a bug (see README)."""
+    payload = job["payload"]
+    if isinstance(payload, str):
+        import json as _json
+        payload = _json.loads(payload)
+    timeout_s = _resolve_job_timeout(payload, job_timeout_s)
+    body = threading.Thread(
+        target=_handle_job_body,
+        kwargs=dict(job=job, flows_dir=flows_dir, runs_root=runs_root,
+                    headless=headless, executable_path=executable_path,
+                    repos_config=repos_config, keep_runs=keep_runs),
+        daemon=True)
+    body.start()
+    body.join(timeout_s)
+    if not body.is_alive():
+        return
+    # Hung job: surface the timeout in seconds instead of waiting for the
+    # 1h stale requeue. The orphaned thread keeps its own claim context and
+    # finishes on its own terms when the hung call returns.
+    attempts = (job.get("attempts") or 0) + 1
+    note = f"job timeout: exceeded {timeout_s:g}s"
+    outcome = q.record_failure(job["id"], note)
+    print(f"job #{job['id']} timed out after {timeout_s:g}s ({outcome})")
+    if outcome == "failed":
+        _notify_failure(job["id"], job["kind"], "",
+                        f"job timeout: exceeded {timeout_s:g}s (attempt {attempts})")
+
+
 def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
                poll_s: float = 5, headless: bool = True,
                executable_path: str | None = None,
                repos_config_path: str | None = None, keep_runs: int = 0,
-               concurrency: int = 1) -> None:
+               concurrency: int = 1,
+               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S) -> None:
     """Claim jobs and handle them, one at a time (concurrency=1) or in
     parallel via a thread pool. Each job gets its own browser: handle_job ->
     run_flow launches and closes one per invocation (Playwright sync objects
     are not thread-safe, so browsers are never shared). q.claim() is atomic
-    across threads, so parallel claims never double-claim."""
+    across threads, so parallel claims never double-claim. Each job is also
+    wrapped in handle_job's timeout (issue #94): both the serial path and the
+    --concurrency pool path get it for free, and a timed-out future still
+    completes so --once exit logic is unchanged."""
     if concurrency < 1:
         raise ValueError(f"concurrency must be >= 1 (got {concurrency!r})")
+    if job_timeout_s <= 0:
+        raise ValueError(f"job_timeout_s must be > 0 (got {job_timeout_s!r})")
     repos_config = load_repos_config(repos_config_path)
     q.requeue_stale()
-    print(f"worker up — flows={flows_dir} runs={runs_root} concurrency={concurrency}")
+    print(f"worker up — flows={flows_dir} runs={runs_root} concurrency={concurrency}"
+          f" job_timeout_s={job_timeout_s:g}")
     handle_kwargs = dict(flows_dir=flows_dir, runs_root=runs_root,
                          headless=headless, executable_path=executable_path,
-                         repos_config=repos_config, keep_runs=keep_runs)
+                         repos_config=repos_config, keep_runs=keep_runs,
+                         job_timeout_s=job_timeout_s)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         pending: set = set()
         while True:
