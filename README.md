@@ -97,7 +97,7 @@ alongside the feature. Conventions:
 | `evaluate --claim "..." --run <dir> --diff <file\|range> [--repo DIR]` | semantic judge: does the change make sense given the diff + flow evidence? writes `EVALUATION.md` |
 | `enqueue --kind verify-flow --flow F --target U` | queue a one-off verification |
 | `enqueue --kind verify-repo --payload '{"repo":"stoneage-reimagined"}'` | queue a repo run (boots env per `repos.yaml`) |
-| `worker [--once] [--poll 5] [--concurrency N] [--flows DIR] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
+| `worker [--once] [--poll 5] [--concurrency N] [--job-timeout SECS] [--flows DIR] [--executable-path PATH]` | claim jobs → boot env → run flows → report |
 | `webhook [--port 8090] [--host 127.0.0.1]` | GitHub PR webhook → queue (`/webhook/github`); manual `/enqueue` |
 | `investigate --run <dir> --flow <yaml> [--target URL] [--max-actions N] [--headed] [--executable-path PATH]` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
@@ -121,6 +121,21 @@ alongside the feature. Conventions:
   jobs are done. Each job gets its own browser, because every handler launches
   and closes one per invocation (Playwright browser objects are not
   thread-safe, so they are never shared).
+- `--job-timeout SECS` (on `worker`, default 1800) caps how long one job may
+  run: a job still running when the timeout expires is recorded failed with a
+  note like "job timeout: exceeded 1800s" (issue #94). This turns a hung
+  browser — previously invisible until the 1-hour stale-claim requeue — into
+  a failure in seconds. A payload `timeout_s` value overrides the CLI default
+  per job (non-positive or non-numeric values fall back to the default). The
+  timeout goes through the normal retry policy: within budget the job is
+  requeued, and a terminal timeout fires the failure webhook exactly like any
+  other terminal failure. The timeout lives inside `handle_job`, so the
+  serial path and the `--concurrency` pool path both get it, and a timed-out
+  future still completes so `--once` exit logic is unchanged. Tradeoff: the
+  hung browser is NOT torn down by the timer — Playwright sync objects are
+  not thread-safe across threads, so the timed-out thread is left orphaned
+  and `run_flow`'s `finally: browser.close()` reclaims the browser when the
+  hung call eventually returns.
 - `--repo DIR` (on `evaluate`, default: the current directory) is the repo root
   qaloop runs `git diff <range>` in when `--diff` is a git range rather than a
   diff file.
@@ -272,6 +287,13 @@ flows, writes reports, appends to the ledger, and marks the job done/failed.
 failure (default 0 = today's behavior: one failure and the job is terminal).
 A job with `--max-retries 2` that fails twice then passes finishes with
 3 claims; one that fails three times ends `failed` with attempts=3.
+
+A job that is still running after its timeout (`--job-timeout SECS` on
+`worker`, default 1800; per-job payload `timeout_s` overrides) is recorded
+failed with a "job timeout" note instead of holding its claim until the
+hourly stale requeue. The timeout uses the same retry budget as any other
+failure, and a terminal timeout sends the failure webhook like any other
+terminal failure (see `QALOOP_NOTIFY_URL` above).
 
 ## Investigator
 

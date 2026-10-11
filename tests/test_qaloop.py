@@ -432,7 +432,7 @@ def test_worker_concurrency_rejects_invalid():
     check("run_worker concurrency=0 raises ValueError", raised)
     bad = argparse.Namespace(flows="/tmp/flows", once=True, poll=5.0,
                              headed=False, executable_path=None,
-                             keep_runs=None, concurrency=0)
+                             keep_runs=None, concurrency=0, job_timeout=1800)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = cmd_worker(bad)
@@ -440,13 +440,147 @@ def test_worker_concurrency_rejects_invalid():
           f"rc={rc}")
     good = argparse.Namespace(flows="/tmp/flows", once=True, poll=0.01,
                               headed=False, executable_path=None,
-                              keep_runs=None, concurrency=2)
+                              keep_runs=None, concurrency=2, job_timeout=1800)
     with temp_db():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = cmd_worker(good)
     check("CLI --concurrency 2 passes through and exits 0 on empty queue",
           rc == 0, f"rc={rc}")
+
+
+@contextlib.contextmanager
+def _stub_run_one_flow_blocking(release):
+    """Stub _run_one_flow with a fake hung browser: blocks on an Event,
+    recording the body thread so the test can release it for cleanup."""
+    import threading
+    from qaloop import worker
+    real = worker._run_one_flow
+    threads = []
+
+    def fake(flow_path, target, runs_root, headless, executable_path,
+             do_investigate, keep_runs=0):
+        threads.append(threading.current_thread())
+        release.wait(15)  # hung: never returns before the test releases it
+        return ("passed", "/tmp/runs/hung")
+
+    worker._run_one_flow = fake
+    try:
+        yield threads
+    finally:
+        worker._run_one_flow = real
+
+
+def _release_threads(release, threads):
+    """Let orphaned (timed-out) body threads finish cleanly on the live db."""
+    release.set()
+    for t in threads:
+        t.join(5)
+
+
+def test_worker_job_timeout_hung_job_surfaced():
+    """Payload timeout_s=0.5 overrides the CLI default 1800: a hung job is
+    surfaced in ~0.5s instead of at the 1h stale requeue (issue #94)."""
+    import io
+    import threading
+    import time
+    from qaloop import queue, worker
+    with temp_db():
+        release = threading.Event()
+        with _stub_run_one_flow_blocking(release) as threads:
+            jid = queue.enqueue("verify-flow",
+                                {"flow": "x.yaml", "target": "http://x",
+                                 "timeout_s": 0.5})
+            start = time.monotonic()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+            elapsed = time.monotonic() - start
+            row = _job_row(jid)
+            _release_threads(release, threads)
+        check("hung job: handle_job returns promptly on payload timeout_s=0.5",
+              elapsed < 5, f"elapsed={elapsed:.2f}s")
+        check("hung job: terminal (max_retries=0) ends failed",
+              row["status"] == "failed", row["status"])
+        check("hung job: note contains 'timeout'",
+              "timeout" in (row["note"] or ""), (row["note"] or "")[:80])
+        check("hung job: one attempt recorded", row["attempts"] == 1,
+              str(row["attempts"]))
+        check("hung job: printed a timeout message",
+              "timed out" in buf.getvalue(),
+              buf.getvalue().strip() or "(no output)")
+
+
+def test_worker_job_timeout_requeues_within_retry_budget():
+    """A timed-out job follows the normal retry policy: requeued within
+    budget, and the timeout note survives the requeue."""
+    import threading
+    from qaloop import queue, worker
+    with temp_db():
+        release = threading.Event()
+        with _stub_run_one_flow_blocking(release) as threads:
+            jid = queue.enqueue("verify-flow",
+                                {"flow": "x.yaml", "target": "http://x",
+                                 "timeout_s": 0.5},
+                                max_retries=1)
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+            row = _job_row(jid)
+            _release_threads(release, threads)
+        check("timeout failure requeues within retry budget",
+              row["status"] == "pending", row["status"])
+        check("timeout counts one attempt", row["attempts"] == 1,
+              str(row["attempts"]))
+        check("timeout note kept on requeue",
+              "timeout" in (row["note"] or ""), (row["note"] or "")[:100])
+
+
+def test_worker_job_timeout_default_and_payload_coercion():
+    """No payload timeout_s -> the CLI default applies and a fast job passes
+    normally (no regression); non-positive/non-numeric payload timeout_s
+    coerces to the default instead of erroring."""
+    from qaloop import queue, worker
+    with temp_db():
+        j1 = queue.enqueue("verify-flow", {"flow": "x.yaml", "target": "http://x"})
+        with _stub_run_one_flow(("passed", "/tmp/runs/ok")):
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+        check("no payload timeout: fast job passes normally",
+              _job_row(j1)["status"] == "done", _job_row(j1)["status"])
+        for bad in (0, -5, "nonsense"):
+            j = queue.enqueue("verify-flow",
+                              {"flow": "x.yaml", "target": "http://x",
+                               "timeout_s": bad})
+            with _stub_run_one_flow(("passed", "/tmp/runs/ok")):
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+            check(f"payload timeout_s={bad!r} coerces to default, job passes",
+                  _job_row(j)["status"] == "done", f"timeout_s={bad!r}")
+
+
+def test_worker_job_timeout_cli_validation():
+    import argparse
+    import io
+    from qaloop import worker
+    from qaloop.cli import build_parser, cmd_worker
+    raised = False
+    try:
+        worker.run_worker(flows_dir="/tmp/flows", runs_root="/tmp/runs",
+                          once=True, poll_s=0.01, job_timeout_s=0)
+    except ValueError:
+        raised = True
+    check("run_worker job_timeout_s=0 raises ValueError", raised)
+    bad = argparse.Namespace(flows="/tmp/flows", once=True, poll=5.0,
+                             headed=False, executable_path=None,
+                             keep_runs=None, concurrency=2, job_timeout=0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_worker(bad)
+    check("CLI --job-timeout 0 errors", rc == 2 and "ERROR" in buf.getvalue(),
+          f"rc={rc}")
+    try:
+        build_parser().parse_args(["worker", "--job-timeout", "abc"])
+        rejected = False
+    except SystemExit as e:
+        rejected = e.code == 2
+    check("CLI --job-timeout abc rejected by argparse", rejected)
 
 
 def test_worker_target_url_isolation_under_threads():
