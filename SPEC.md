@@ -13,6 +13,15 @@ target: ${TARGET_URL}            # $VAR / ${VAR} expanded; missing var = error
 
 viewport: {width: 1280, height: 800}
 
+browser:                         # optional; only declared keys reach
+  color_scheme: dark             # dark | light | no-preference
+  is_mobile: true                # real bool
+  has_touch: true                # real bool
+  locale: en-US                  # string, e.g. navigator.language
+  timezone_id: America/New_York  # string, IANA timezone
+  user_agent: "Mozilla/5.0 ..."  # string
+  device_scale_factor: 2         # number > 0 (int or float)
+
 setup:                          # abort the run if any setup step fails
   - name: known state
     seed: {js: "localStorage.clear()"}

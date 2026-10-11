@@ -144,6 +144,54 @@ class FlowSpec:
     # the privacy-by-default posture (videos are large). Saved as
     # <run_dir>/video.webm (see SPEC.md).
     video: bool = False
+    # Issue #122: optional browser context options (color_scheme, device
+    # emulation, locale/timezone, user agent). Default {} keeps the
+    # no-browser-key behavior byte-identical: only declared keys reach
+    # Playwright's new_context — never empty-string defaults.
+    browser: dict = field(default_factory=dict)
+
+
+def _validate_browser(raw: Any, where: str) -> dict:
+    """Validate the top-level `browser:` block (issue #122).
+
+    Allowed keys are the Playwright new_context options this runner
+    forwards: color_scheme, is_mobile, has_touch, locale, timezone_id,
+    user_agent, device_scale_factor. A typo is not consent: unknown keys
+    raise SpecError naming the key (same posture as record_bodies).
+    Returns only the declared keys, {} when the block is absent.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise SpecError(f"{where}: browser must be a mapping, got {raw!r}")
+    known = {"color_scheme", "is_mobile", "has_touch", "locale",
+             "timezone_id", "user_agent", "device_scale_factor"}
+    out: dict = {}
+    for key, value in raw.items():
+        if key not in known:
+            raise SpecError(f"{where}: browser.{key} unknown")
+        if key == "color_scheme":
+            if not isinstance(value, str) or value not in {
+                    "dark", "light", "no-preference"}:
+                raise SpecError(
+                    f"{where}: browser.color_scheme must be dark|light|"
+                    f"no-preference, got {value!r}")
+        elif key in ("is_mobile", "has_touch"):
+            if not isinstance(value, bool):
+                raise SpecError(
+                    f"{where}: browser.{key} must be a bool, got {value!r}")
+        elif key in ("locale", "timezone_id", "user_agent"):
+            if not isinstance(value, str):
+                raise SpecError(
+                    f"{where}: browser.{key} must be a string, got {value!r}")
+        elif key == "device_scale_factor":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or value <= 0:
+                raise SpecError(
+                    f"{where}: browser.device_scale_factor must be a number "
+                    f"> 0, got {value!r}")
+        out[key] = value
+    return out
 
 
 # Issue #89: flow tags for batch selection. A tag starts with an
@@ -1154,6 +1202,9 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     # Issue #89: flow tags for batch selection (validated explicitly —
     # there is no unknown-top-level-key guard).
     tags = _validate_tags(raw.get("tags"), where)
+    # Issue #122: optional browser context options (validated
+    # explicitly — typos are rejected, not silently ignored).
+    browser = _validate_browser(raw.get("browser"), where)
     # Issue #86: expand include steps on the RAW step lists, before
     # _parse_steps — so include/with entries never reach _parse_step's
     # unknown-keys guard, and any ${var} the with: map did not substitute
@@ -1207,6 +1258,7 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         services=_validate_services(raw.get("services"), where),
         record_bodies=record_bodies,
         video=video,
+        browser=browser,
         matrix=matrix,
         tags=tags,
     )

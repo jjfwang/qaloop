@@ -1062,9 +1062,12 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                 ctx = browser.new_context(
                     viewport=spec.viewport,
                     record_video_dir=os.path.join(run_dir, "video"),
-                    record_video_size=spec.viewport)
+                    record_video_size=spec.viewport,
+                    **spec.browser)  # issue #122: declared context options
             else:
-                ctx = browser.new_context(viewport=spec.viewport)
+                ctx = browser.new_context(
+                    viewport=spec.viewport,
+                    **spec.browser)  # issue #122: declared context options
             if spec.artifacts.get("trace"):
                 ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
             page = ctx.new_page()
