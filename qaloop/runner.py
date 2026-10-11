@@ -511,6 +511,52 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                     time.monotonic() + t / 1000.0)
                 out.append(AssertionResult(key, ok,
                                            f"{sel}: count={n} want {want}"))
+            elif key == "attribute":
+                # Assert an element's attribute value (issue #81). A missing
+                # attribute (get_attribute -> None) never matches — even for
+                # contains, a guard is needed because `s in None` raises.
+                # Polls like text_contains/count: failure detail names the
+                # final observed value, not a re-read after the poll.
+                sel, name = val["selector"], val["name"]
+                scope.wait_for_selector(sel, state="attached", timeout=t)
+                if "equals" in val:
+                    match, want = (lambda a: a == val["equals"],
+                                   f"={val['equals']!r}")
+                else:
+                    match, want = (lambda a: a is not None and
+                                   val["contains"] in a,
+                                   f"contains {val['contains']!r}")
+                ok, actual = _poll_value_match(
+                    lambda: scope.locator(sel).get_attribute(name), match,
+                    time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"{sel}: {name}={actual!r} want {want}"))
+            elif key == "value":
+                # Assert an input's live value after fill/type (issue #81);
+                # polled so the framework's value-write has time to settle.
+                sel = val["selector"]
+                scope.wait_for_selector(sel, state="attached", timeout=t)
+                ok, actual = _poll_value_match(
+                    lambda: scope.locator(sel).input_value(),
+                    lambda a: a == val["equals"],
+                    time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"{sel}: value={actual!r} want "
+                                           f"{val['equals']!r}"))
+            elif key == "focused":
+                # Assert document.activeElement is the element (issue #81).
+                # Playwright has no is_focused(), so compare identity via
+                # locator.evaluate; polled so a preceding focus/click takes
+                # effect before the deadline.
+                sel = val["selector"]
+                scope.wait_for_selector(sel, state="attached", timeout=t)
+                ok, actual = _poll_value_match(
+                    lambda: scope.locator(sel).evaluate(
+                        "el => document.activeElement === el"),
+                    lambda a: a is True,
+                    time.monotonic() + t / 1000.0)
+                out.append(AssertionResult(key, ok,
+                                           f"{sel}: focused={actual}"))
             elif key == "mock_calls":
                 # Assert how often a mocked route was served (issue #43).
                 # observed comes from the run's mock_hits dict, keyed by the

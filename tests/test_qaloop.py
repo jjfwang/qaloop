@@ -4339,6 +4339,169 @@ def test_frame_scoping():
         del _os2.environ["F"]
 
 
+def test_element_state_assertions():
+    """Issue #81: attribute / value / focused assertions.
+
+    Validation: attribute needs {selector, name, exactly-one of
+    equals|contains (a string)}; value needs {selector, equals (a string)};
+    focused needs {selector}. Runner: attribute reads via get_attribute (a
+    missing attribute never matches, even for contains), value via
+    input_value, focused via document.activeElement identity; all three
+    poll until the step deadline like text_contains/count.
+    """
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step, SpecError, _validate_expect
+
+    def rejects(expect, label):
+        try:
+            _validate_expect(expect, "steps[0]")
+            check(f"rejected: {label}", False)
+        except SpecError:
+            check(f"rejected: {label}", True)
+
+    rejects({"attribute": {"name": "x", "equals": "y"}}, "attribute missing selector")
+    rejects({"attribute": {"selector": "#a", "equals": "y"}}, "attribute missing name")
+    rejects({"attribute": {"selector": "#a", "name": "x"}},
+            "attribute needs equals|contains")
+    rejects({"attribute": {"selector": "#a", "name": "x",
+                           "equals": "y", "contains": "z"}},
+            "attribute rejects both equals and contains")
+    rejects({"attribute": {"selector": "#a", "name": "x", "equals": True}},
+            "attribute equals must be a string")
+    ok = _validate_expect(
+        {"attribute": {"selector": "#a", "name": "x", "contains": "z"}}, "steps[0]")
+    check("attribute valid form accepted",
+          ok == [("attribute", {"selector": "#a", "name": "x", "contains": "z"})],
+          str(ok))
+    rejects({"value": {"selector": "#i"}}, "value missing equals")
+    rejects({"value": {"selector": "#i", "equals": 3}}, "value equals must be a string")
+    check("value valid form accepted",
+          _validate_expect({"value": {"selector": "#i", "equals": "x"}},
+                           "steps[0]") == [("value", {"selector": "#i", "equals": "x"})])
+    rejects({"focused": "#i"}, "focused must be a mapping")
+    rejects({"focused": {}}, "focused needs selector")
+    check("focused valid form accepted",
+          _validate_expect({"focused": {"selector": "#i"}},
+                           "steps[0]") == [("focused", {"selector": "#i"})])
+
+    class FakeELL:
+        def __init__(self, scope, sel):
+            self.scope = scope
+            self.sel = sel
+        def get_attribute(self, name):
+            n = self.scope.reads.get(("attr", self.sel, name), 0)
+            self.scope.reads[("attr", self.sel, name)] = n + 1
+            seq = self.scope.attr_seq.get((self.sel, name))
+            if seq is not None:
+                return seq[min(n, len(seq) - 1)]
+            return self.scope.attrs.get((self.sel, name))
+        def input_value(self):
+            n = self.scope.reads.get(("val", self.sel), 0)
+            self.scope.reads[("val", self.sel)] = n + 1
+            seq = self.scope.value_seq.get(self.sel)
+            if seq is not None:
+                return seq[min(n, len(seq) - 1)]
+            return self.scope.values.get(self.sel, "")
+        def evaluate(self, expr):
+            self.scope.calls.append(("evaluate", self.sel, expr))
+            n = self.scope.reads.get(("focus", self.sel), 0)
+            self.scope.reads[("focus", self.sel)] = n + 1
+            seq = self.scope.focus_seq.get(self.sel)
+            focused = seq[min(n, len(seq) - 1)] if seq is not None else self.scope.focused
+            return expr == "el => document.activeElement === el" and focused == self.sel
+
+    class FakeScope:
+        def __init__(self):
+            self.calls = []
+            self.reads = {}
+            self.attrs = {}
+            self.attr_seq = {}
+            self.values = {}
+            self.value_seq = {}
+            self.focused = None
+            self.focus_seq = {}
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("wait", selector, state))
+        def locator(self, sel):
+            return FakeELL(self, sel)
+
+    def run(expect_items, scope, timeout_ms=5000):
+        step = Step(index=0, phase="steps", name="e", op=None, params=None,
+                    expect={}, expect_items=expect_items,
+                    continue_on_fail=False, timeout_ms=timeout_ms,
+                    frame=None, raw={})
+        return _check_assertions(scope, step, None)
+
+    # attribute equals: pass, fail, detail names final observed value
+    sc = FakeScope()
+    sc.attrs[("#btn", "data-state")] = "ready"
+    res = run([("attribute", {"selector": "#btn", "name": "data-state",
+                              "equals": "ready"})], sc)
+    check("attribute equals passes", res[0].passed, res[0].detail)
+    res = run([("attribute", {"selector": "#btn", "name": "data-state",
+                              "equals": "idle"})], sc, timeout_ms=300)
+    check("attribute equals fails", not res[0].passed, res[0].detail)
+    check("attribute detail names observed value",
+          "'ready'" in res[0].detail and "want ='idle'" in res[0].detail,
+          res[0].detail)
+    # attribute contains: pass, fail
+    res = run([("attribute", {"selector": "#btn", "name": "data-state",
+                              "contains": "ead"})], sc)
+    check("attribute contains passes", res[0].passed, res[0].detail)
+    res = run([("attribute", {"selector": "#btn", "name": "data-state",
+                              "contains": "nope"})], sc, timeout_ms=300)
+    check("attribute contains fails", not res[0].passed, res[0].detail)
+    # missing attribute (get_attribute -> None) never matches either form
+    res = run([("attribute", {"selector": "#gone", "name": "data-state",
+                              "equals": "x"})], sc, timeout_ms=300)
+    check("missing attribute never matches equals", not res[0].passed,
+          res[0].detail)
+    res = run([("attribute", {"selector": "#gone", "name": "data-state",
+                              "contains": "x"})], sc, timeout_ms=300)
+    check("missing attribute never matches contains", not res[0].passed,
+          res[0].detail)
+    check("missing attribute detail shows None", "None" in res[0].detail,
+          res[0].detail)
+    # attribute polls: value flips to the wanted one on the second read
+    sc2 = FakeScope()
+    sc2.attr_seq[("#p", "data-x")] = ["loading", "done"]
+    res = run([("attribute", {"selector": "#p", "name": "data-x",
+                              "equals": "done"})], sc2)
+    check("attribute polls until match", res[0].passed, res[0].detail)
+    # value: pass, fail, polling
+    sc3 = FakeScope()
+    sc3.values["#email"] = "qa@example.com"
+    res = run([("value", {"selector": "#email",
+                          "equals": "qa@example.com"})], sc3)
+    check("value passes", res[0].passed, res[0].detail)
+    res = run([("value", {"selector": "#email",
+                          "equals": "other@example.com"})], sc3, timeout_ms=300)
+    check("value fails", not res[0].passed, res[0].detail)
+    check("value detail names observed value",
+          "'qa@example.com'" in res[0].detail, res[0].detail)
+    sc4 = FakeScope()
+    sc4.value_seq["#email"] = ["", "qa@example.com"]
+    res = run([("value", {"selector": "#email",
+                          "equals": "qa@example.com"})], sc4)
+    check("value polls until match", res[0].passed, res[0].detail)
+    # focused: pass, fail, polling
+    sc5 = FakeScope()
+    sc5.focused = "#search"
+    res = run([("focused", {"selector": "#search"})], sc5)
+    check("focused passes", res[0].passed, res[0].detail)
+    res = run([("focused", {"selector": "#other"})], sc5, timeout_ms=300)
+    check("focused fails", not res[0].passed, res[0].detail)
+    check("focused detail names observed focus",
+          "focused=False" in res[0].detail, res[0].detail)
+    sc6 = FakeScope()
+    sc6.focus_seq["#search"] = [None, "#search"]
+    res = run([("focused", {"selector": "#search"})], sc6)
+    check("focused polls until match", res[0].passed, res[0].detail)
+    # selector assertion attaches before reading, like text_contains
+    check("wait_for_selector attached first",
+          sc.calls[0] == ("wait", "#btn", "attached"), str(sc.calls[:2]))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
