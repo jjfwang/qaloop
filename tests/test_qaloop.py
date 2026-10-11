@@ -4663,6 +4663,187 @@ def test_issue_82_cookie_storage_assertions():
           script)
 
 
+def test_request_body_issue_83():
+    """Issue #83: opt-in request-body recording + `request_body` assertion.
+
+    - spec validation: `record_bodies` must be a real bool (default False);
+      `request_body` needs {url, exactly one of contains|equals (a string)}
+    - collectors: body recorded only when enabled, capped at 5000 chars,
+      key absent when off (privacy default)
+    - runner: contains/equals evaluation over network_log, one-shot;
+      fail-closed detail names the record_bodies requirement
+    """
+    from qaloop.artifacts import Collectors
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(yaml_body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(yaml_body)
+            path = f.name
+        try:
+            return load_spec(path)
+        finally:
+            os.unlink(path)
+
+    def expect_reject(yaml_body, name):
+        try:
+            load(yaml_body)
+        except SpecError:
+            check(name, True)
+        else:
+            check(name, False, "SpecError not raised")
+
+    base = ("name: rb\ntarget: http://x\nsteps:\n"
+            "  - name: s\n"
+            "    wait: {response: \"/x\"}\n"
+            "    expect: [%s]\n%s")
+    spec = load(base % ("request_body: {url: \"/api/save\", contains: 'x'}",
+                        "record_bodies: true"))
+    check("request_body valid spec + record_bodies True",
+          spec.record_bodies is True
+          and spec.steps[0].expect_items[0][0] == "request_body",
+          str(spec.steps[0].expect_items))
+    spec2 = load(base % ("request_body: {url: \"/api/save\", equals: 'x'}",
+                         ""))
+    check("record_bodies defaults to False", spec2.record_bodies is False)
+    expect_reject(base % ("request_body: {contains: 'x'}", ""),
+                  "request_body rejects missing url")
+    expect_reject(base % ("request_body: {url: \"\"}", ""),
+                  "request_body rejects empty url")
+    expect_reject(base % ("request_body: {url: \"/api\"}", ""),
+                  "request_body rejects missing contains/equals")
+    expect_reject(base % ("request_body: {url: \"/api\", contains: 'a', "
+                          "equals: 'b'}", ""),
+                  "request_body rejects both contains+equals")
+    expect_reject(base % ("request_body: {url: \"/api\", contains: 5}", ""),
+                  "request_body rejects non-string contains")
+    expect_reject(base % ("request_body: {url: \"/api\", equals: 'x'}",
+                          "record_bodies: \"yes\""),
+                  "record_bodies rejects quoted-string non-bool")
+    expect_reject(base % ("request_body: {url: \"/api\", equals: 'x'}",
+                          "record_bodies: 1"),
+                  "record_bodies rejects int 1")
+
+    class FakeRequest:
+        def __init__(self, method, url, post_data=None, timing=None,
+                     failure=None, boom=False):
+            self.method = method
+            self.url = url
+            self._post_data = post_data
+            self.boom = boom
+            self.timing = timing if timing is not None else {}
+            self.failure = failure
+
+        @property
+        def post_data(self):
+            if self.boom:
+                raise RuntimeError("boom")
+            return self._post_data
+
+    class FakeResponse:
+        def __init__(self, status, request, url):
+            self.status = status
+            self.request = request
+            self.url = url
+
+    def respond(c, req, url, status=200):
+        c._on_response(FakeResponse(status, req, url))
+
+    c = Collectors()
+    respond(c, FakeRequest("POST", "http://x/api/save",
+                           post_data='{"pet":"fluffy"}'),
+            "http://x/api/save")
+    check("body key absent when record_bodies off (privacy default)",
+          "body" not in c.network_log[0], str(c.network_log[0]))
+    c2 = Collectors(record_bodies=True)
+    respond(c2, FakeRequest("POST", "http://x/api/save",
+                            post_data='{"pet":"fluffy"}'),
+            "http://x/api/save")
+    check("body recorded when record_bodies=True",
+          c2.network_log[0].get("body") == '{"pet":"fluffy"}',
+          str(c2.network_log[0]))
+    c3 = Collectors(record_bodies=True)
+    respond(c3, FakeRequest("POST", "http://x/a", post_data="x" * 6000),
+            "http://x/a")
+    check("body capped at 5000 chars",
+          len(c3.network_log[0]["body"]) == 5000
+          and c3.network_log[0]["body"] == "x" * 5000)
+    c3b = Collectors(record_bodies=True)
+    respond(c3b, FakeRequest("POST", "http://x/a", post_data="y" * 5000),
+            "http://x/a")
+    check("body of exactly 5000 kept whole",
+          len(c3b.network_log[0]["body"]) == 5000)
+    c4 = Collectors(record_bodies=True)
+    respond(c4, FakeRequest("GET", "http://x/a"), "http://x/a")
+    check("GET with no post data records body=None (key present)",
+          c4.network_log[0].get("body") is None
+          and "body" in c4.network_log[0], str(c4.network_log[0]))
+    c5 = Collectors(record_bodies=True)
+    c5._on_requestfailed(FakeRequest("POST", "http://x/a", post_data="p=1",
+                                     failure="net::ERR_ABORTED"))
+    check("requestfailed records body when enabled",
+          c5.network_log[0].get("body") == "p=1", str(c5.network_log[0]))
+    c5b = Collectors()
+    c5b._on_requestfailed(FakeRequest("POST", "http://x/a", post_data="p=1",
+                                      failure="net::ERR_ABORTED"))
+    check("requestfailed omits body when off",
+          "body" not in c5b.network_log[0])
+    c6 = Collectors(record_bodies=True)
+    respond(c6, FakeRequest("POST", "http://x/a", boom=True), "http://x/a")
+    check("post_data raising degrades to None body, no crash",
+          c6.network_log[0].get("body") is None)
+
+    class FakePage:
+        pass
+
+    def run(params, log):
+        step = Step(index=0, phase="steps", name="s", op=None, params=None,
+                    expect={}, expect_items=[("request_body", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+        return _check_assertions(FakePage(), step, None, network_log=log)[0]
+
+    def entry(url, body=None, has_body_key=True, status=200):
+        e = {"ts": 1.0, "method": "POST", "url": url,
+             "status": status, "ms": 5.0}
+        if has_body_key:
+            e["body"] = body
+        return e
+
+    log = [entry("http://x/api/save", body='{"pet":"fluffy","hp":42}'),
+           entry("http://x/api/other", body='{"pet":"fluffy"}'),
+           entry("http://x/api/save", body='{"pet":"spot"}')]
+    r = run({"url": "/api/save", "contains": '"pet":"fluffy"'}, log)
+    check("request_body contains hit passes", r.passed, r.detail)
+    r = run({"url": "/api/save", "contains": '"pet":"rex"'}, log)
+    check("request_body contains miss fails", not r.passed, r.detail)
+    check("contains-miss detail names matching-entry count",
+          "2 matching entries" in r.detail and "record_bodies" not in r.detail,
+          r.detail)
+    r = run({"url": "/api/save", "equals": '{"pet":"fluffy","hp":42}'}, log)
+    check("request_body equals exact match passes", r.passed, r.detail)
+    r = run({"url": "/api/save", "equals": '{"pet":"fluffy"}'}, log)
+    check("request_body equals mismatch fails", not r.passed, r.detail)
+    r = run({"url": "/nope", "contains": "x"}, log)
+    check("request_body no url match fails", not r.passed, r.detail)
+    check("no-match detail names zero count",
+          "0 matching entries" in r.detail, r.detail)
+    r = run({"url": "/api/save", "contains": '"pet":"fluffy"'}, [])
+    check("request_body empty log fails", not r.passed, r.detail)
+    log2 = [entry("http://x/api/save", has_body_key=False)]
+    r = run({"url": "/api/save", "contains": "x"}, log2)
+    check("request_body without any recorded body fails", not r.passed,
+          r.detail)
+    check("missing-body detail names count + record_bodies requirement",
+          "1 matching entries" in r.detail
+          and "record_bodies: true" in r.detail, r.detail)
+    log3 = [entry("http://x/api/save", body=None)]
+    r = run({"url": "/api/save", "equals": ""}, log3)
+    check("recorded None body counts as empty string for equals",
+          r.passed, r.detail)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

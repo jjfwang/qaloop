@@ -649,6 +649,40 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 else:
                     ok, detail = n <= val["lte"], f"network_calls={n} want <={val['lte']}{status_desc}"
                 out.append(AssertionResult(key, ok, f"{url}: {detail}"))
+            elif key == "request_body":
+                # Issue #83: assert on a recorded request body (opt-in via
+                # top-level `record_bodies: true`). One-shot, consistent with
+                # network_calls: entries whose url contains the substring;
+                # PASS iff at least one such entry carries a recorded body
+                # matching contains (substring) or equals (exact). Fail-closed:
+                # with no recorded body the assertion fails rather than
+                # silently passing.
+                url = val["url"]
+                matched = [e for e in (network_log or [])
+                           if url in e.get("url", "")]
+                recorded = [e for e in matched if "body" in e]
+                if "contains" in val:
+                    want = val["contains"]
+                    hit = any(want in (e.get("body") or "") for e in recorded)
+                    mode = f"contains {want!r}"
+                else:
+                    want = val["equals"]
+                    hit = any((e.get("body") or "") == want for e in recorded)
+                    mode = f"equals {want!r}"
+                if hit:
+                    ok, detail = True, (f"{url}: {len(matched)} matching "
+                                       f"entries, {len(recorded)} with a "
+                                       f"recorded body; {mode} matched")
+                elif recorded:
+                    ok, detail = False, (f"{url}: {len(matched)} matching "
+                                        f"entries, {len(recorded)} with a "
+                                        f"recorded body; none {mode}")
+                else:
+                    ok, detail = False, (f"{url}: {len(matched)} matching "
+                                        f"entries, none with a recorded body; "
+                                        f"set record_bodies: true to record "
+                                        f"request bodies")
+                out.append(AssertionResult(key, ok, detail))
             elif key == "url_contains":
                 # Poll page.url until the substring appears or the step
                 # deadline expires (issue #51); detail names the final
@@ -764,7 +798,7 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     baseline_dir = os.path.dirname(os.path.abspath(spec.source_path or ""))
     started = time.time()
     steps: list[StepResult] = []
-    collectors = Collectors()
+    collectors = Collectors(spec.record_bodies)
     # Per-run mock hit counts (issue #43): mock routes served since run
     # start, keyed by url pattern. Reset each run; mocks registered in
     # setup thread through here, and mock_calls assertions read it.

@@ -227,6 +227,7 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `count` | `{selector, equals: n}` / `{selector, gte: n}` / `{selector, lte: n}` |
 | `mock_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` — how often a mocked route was served (see `mock`) |
 | `network_calls` | `{url, equals: n}` / `{url, gte: n}` / `{url, lte: n}` / `{url, status: {equals: 200}, equals: n}` — how many entries in `network.jsonl` whose url contains the given substring, optionally filtered by response `status` (`equals`/`gte`/`lte`; never matches `status: null` failed requests) (see `network.jsonl`) |
+| `request_body` | `{url, contains: s}` / `{url, equals: s}` — at least one `network.jsonl` entry whose url contains the given substring carries a recorded request body matching `contains` (substring) / `equals` (exact). Requires the flow to opt in with top-level `record_bodies: true` (see `network.jsonl`); fails when no matching entry has a recorded body |
 | `url_contains` / `title_contains` | string |
 | `noop` | `true` — documents an intentionally dead control |
 | `console_clean` | `true` — no new console/page errors since the step started |
@@ -376,6 +377,30 @@ detail names the final observed value (e.g. `cookie 'session'=None want
 interpolated into the script. Storage reads the main page, not the
 step's `frame:` scope: storage is keyed on the page origin.
 
+### Request bodies — `request_body`
+
+An assertion on what the page *sent*, for contracts like "the save
+request carried the right payload":
+
+```yaml
+record_bodies: true          # top level; default false (privacy by default)
+steps:
+  - name: the save request carried the payload
+    expect:
+      - request_body: {url: "/api/save", contains: '"pet":"fluffy"'}
+```
+
+`request_body` needs a non-empty `url` (a substring matched against
+`network.jsonl` entry urls, like `network_calls`) and exactly one of
+`contains` / `equals` as a string. It passes iff at least one matching
+entry carries a recorded body that matches: `contains` is a substring
+test, `equals` is exact. The assertion is fail-closed — with no recorded
+body on any matching entry it fails (the detail says `record_bodies:
+true` is required), never silently passes. The `network_calls`
+"matching on request bodies is out of scope" note stays valid:
+`network_calls` still counts urls only; `request_body` is the separate
+assertion for body matching.
+
 ## Conventions
 
 - Write the spec alongside the feature; the implementer authors its own
@@ -397,7 +422,12 @@ Every `verify`/`worker` run writes into `runs/<id>/`:
   order. Line schema: `{ts, method, url, status, ms}`; failed requests
   (no response event) get `status: null, ms: null, failure: <reason>` instead.
   `url` is capped at 500 chars; response bodies are never recorded
-  (privacy by default).
+  (privacy by default). Request bodies are opt-in only: a flow sets the
+  top-level `record_bodies: true` (must be a bool, default `false`), and
+  then each network entry gains a `body` key with the raw request body
+  capped at 5000 chars (`null` when the request had no body). The key is
+  absent entirely when `record_bodies` is not `true`, so the default log
+  schema is unchanged.
 
   `network_calls` (assertion) counts entries in this log whose `url` contains
   the given url substring — including mock-served responses, which appear in

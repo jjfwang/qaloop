@@ -50,10 +50,31 @@ def prune_old_runs(runs_root: str, keep: int,
     return deleted
 
 
+def _request_body(request) -> str | None:
+    """Raw request body for opt-in body recording (issue #83).
+
+    Returns the POST data capped at 5000 chars, or None when the request
+    has no body. Never raises: a read failure degrades to None rather
+    than breaking the collector.
+    """
+    try:
+        body = request.post_data
+    except Exception:
+        return None
+    if not isinstance(body, str):
+        return None
+    return body[:5000]
+
+
 class Collectors:
     """Console / page-error / network-failure collectors attached to a page."""
 
-    def __init__(self) -> None:
+    def __init__(self, record_bodies: bool = False) -> None:
+        # Issue #83: opt-in request-body recording. When True, the raw
+        # request body (capped at 5000 chars) is captured into each
+        # network_log entry under the "body" key. Default False: the key is
+        # absent and the log schema/privacy posture is unchanged.
+        self.record_bodies = record_bodies
         self.console_errors: list[dict] = []
         self.page_errors: list[dict] = []
         self.failed_requests: list[dict] = []
@@ -130,11 +151,14 @@ class Collectors:
         })
         # A failed request produces no response event, so it gets its own
         # network_log line: no status, no timing, failure recorded.
-        self.network_log.append({
+        entry: dict = {
             "ts": time.time(), "method": request.method,
             "url": request.url[:500], "status": None,
             "failure": str(failure)[:300] if failure else None, "ms": None,
-        })
+        }
+        if self.record_bodies:
+            entry["body"] = _request_body(request)
+        self.network_log.append(entry)
 
     def _on_response(self, response) -> None:
         try:
@@ -152,10 +176,13 @@ class Collectors:
             ms = round(hdr - start, 1) if start >= 0 and hdr >= 0 else None
         except Exception:
             ms = None
-        self.network_log.append({
+        entry: dict = {
             "ts": time.time(), "method": response.request.method,
             "url": response.url[:500], "status": status, "ms": ms,
-        })
+        }
+        if self.record_bodies:
+            entry["body"] = _request_body(response.request)
+        self.network_log.append(entry)
         if status >= 400:
             self.bad_responses.append({
                 "ts": time.time(), "method": response.request.method,
