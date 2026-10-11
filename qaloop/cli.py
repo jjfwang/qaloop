@@ -550,6 +550,25 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Diff two runs: status change, per-step outcomes, duration deltas.
+
+    Exit 0 when the runs are identical, 1 when they differ (like diff),
+    2 on error (missing/corrupt run dir, ambiguous run id)."""
+    from qaloop.compare import (CompareError, compare_runs, render_text,
+                                resolve_run)
+    runs_root = default_runs_root()
+    try:
+        a_dir = resolve_run(args.runA, runs_root)
+        b_dir = resolve_run(args.runB, runs_root)
+        diff = compare_runs(a_dir, b_dir)
+    except CompareError as e:
+        print(f"ERROR: {e}")
+        return 2
+    print(render_text(diff))
+    return 0 if diff["identical"] else 1
+
+
 def cmd_ledger(args: argparse.Namespace) -> int:
     from qaloop import ledger
     import json as _json
@@ -638,6 +657,14 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("dashboard", help="regenerate the static dashboard")
     d.add_argument("--out", default=os.path.join(QALOOP_HOME, "dashboard"))
     d.set_defaults(fn=cmd_dashboard)
+
+    c = sub.add_parser("compare",
+                       help="diff two runs: step outcomes + durations")
+    c.add_argument("runA", help="run dir, or a run-id prefix matched "
+                   "inside runs/")
+    c.add_argument("runB", help="run dir, or a run-id prefix matched "
+                   "inside runs/")
+    c.set_defaults(fn=cmd_compare)
 
     lg = sub.add_parser("ledger", help="print the cost ledger summary")
     lg.set_defaults(fn=cmd_ledger)
