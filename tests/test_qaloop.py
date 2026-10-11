@@ -613,6 +613,124 @@ def test_wait_runner_defaults():
     check("target-ful hidden passes through", calls == [("selector", "#x", "hidden")], str(calls))
 
 
+def test_wait_js_response_validation():
+    """wait gains two new disjoint forms: {js: <expr>} polls a JS expression
+    until truthy; {response: <substr>} waits for a network response whose URL
+    contains the substring. Both reject target/state/text, each other, and
+    bad timeout_ms (issue #79)."""
+    from qaloop.spec import load_spec, SpecError
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: w\n    wait: PARAMS\n")
+    def params(inner):
+        return base.replace("PARAMS", "{" + inner + "}")
+
+    s = load(params('js: "window.dataLoaded === true"'))
+    check("js form accepted", s.steps[1].params.get("js") == "window.dataLoaded === true")
+    s = load(params('response: "/api/waitdata"'))
+    check("response form accepted", s.steps[1].params.get("response") == "/api/waitdata")
+    s = load(params('js: "window.x", timeout_ms: 5000'))
+    check("js with valid timeout_ms accepted",
+          s.steps[1].params.get("timeout_ms") == 5000, s.steps[1].params)
+    s = load(params('response: "/api/x", timeout_ms: 0'))
+    check("response with timeout_ms 0 accepted",
+          s.steps[1].params.get("timeout_ms") == 0, s.steps[1].params)
+
+    for inner, label in [
+        ('js: "window.x", target: "#x"', "js+target"),
+        ('js: "window.x", state: "load"', "js+state"),
+        ('js: "window.x", text: "hi"', "js+text"),
+        ('js: "window.x", response: "/api/x"', "js+response"),
+        ('response: "/api/x", target: "#x"', "response+target"),
+        ('response: "/api/x", state: "visible"', "response+state"),
+        ('response: "/api/x", text: "hi"', "response+text"),
+        ("js: 42", "js non-string"),
+        ('js: ""', "js empty"),
+        ("response: 42", "response non-string"),
+        ('response: ""', "response empty"),
+        ('js: "window.x", timeout_ms: "5000"', "js timeout_ms str"),
+        ('js: "window.x", timeout_ms: -1', "js timeout_ms negative"),
+        ('js: "window.x", timeout_ms: true', "js timeout_ms bool"),
+        ('js: "window.x", timeout_ms: 1.5', "js timeout_ms float"),
+        ('response: "/api/x", timeout_ms: -1', "response timeout_ms negative"),
+        ("timeout_ms: -1", "bare targetless timeout_ms negative"),
+    ]:
+        try:
+            load(params(inner))
+            check(f"bad wait rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad wait rejected ({label})", True)
+
+
+def test_wait_js_response_runner():
+    """Runner: the js form calls page.wait_for_function with the expression;
+    the response form calls page.wait_for_event("response", ...) with a
+    URL-substring predicate; both honor timeout_ms or fall back to the step
+    timeout (issue #79)."""
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.url = url
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def wait_for_function(self, expression, timeout=None):
+            self.calls.append(("function", expression, timeout))
+        def wait_for_event(self, event, predicate=None, timeout=None):
+            self.calls.append(("event", event, predicate, timeout))
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append(("selector", selector, state, timeout))
+        def wait_for_load_state(self, state=None, timeout=None):
+            self.calls.append(("load_state", state, timeout))
+
+    def run(params, step_timeout=None):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="w", op="wait", params=params,
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=step_timeout, raw={})
+        _do_action(page, step, "http://x", {})
+        return page.calls
+
+    calls = run({"js": "window.dataLoaded === true"})
+    check("js form -> wait_for_function with step timeout",
+          calls == [("function", "window.dataLoaded === true", 15000)], str(calls))
+    calls = run({"js": "window.x", "timeout_ms": 2000})
+    check("js timeout_ms passes through",
+          calls == [("function", "window.x", 2000)], str(calls))
+
+    calls = run({"response": "/api/waitdata"})
+    check("response form waits for the response event", len(calls) == 1
+          and calls[0][0] == "event" and calls[0][1] == "response"
+          and calls[0][3] == 15000, str(calls))
+    pred = calls[0][2]
+    check("response predicate matches URL substring",
+          pred(FakeResponse("http://127.0.0.1:8123/api/waitdata?fresh=1")) is True)
+    check("response predicate rejects other URLs",
+          pred(FakeResponse("http://127.0.0.1:8123/api/other")) is False)
+    calls = run({"response": "/api/x", "timeout_ms": 3000})
+    check("response timeout_ms passes through",
+          calls[0][0] == "event" and calls[0][3] == 3000, str(calls))
+    calls = run({"response": "/api/x"}, step_timeout=9000)
+    check("response falls back to step timeout_ms",
+          calls[0][3] == 9000, str(calls))
+    calls = run({"js": "window.x"}, step_timeout=9000)
+    check("js falls back to step timeout_ms",
+          calls == [("function", "window.x", 9000)], str(calls))
+    calls = run({"target": "#x"})
+    check("existing selector form unchanged",
+          calls == [("selector", "#x", "visible", 15000)], str(calls))
+
+
 def test_mock_delay_ms_runner():
     """Real browser proof: a mock with delay_ms=250 holds the response ~250ms;
     delay_ms absent still responds instantly (no timing regression)."""

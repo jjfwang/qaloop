@@ -310,7 +310,22 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
         state = params.get("state", "load" if not sel else "visible")
         wt = params.get("timeout_ms", t)
         text = params.get("text")
-        if sel:
+        js_expr = params.get("js")
+        resp_substr = params.get("response")
+        if js_expr is not None:
+            # Polls the JS expression in the page until it evaluates truthy
+            # (issue #79). wait_for_function already polls and raises on
+            # timeout, so no manual loop is needed.
+            page.wait_for_function(js_expr, timeout=wt)
+        elif resp_substr is not None:
+            # Playwright 1.63's Page has no wait_for_response; wait_for_event
+            # "response" has the same headers-received semantics (issue #79):
+            # the body may still be streaming, so follow with text_contains
+            # when body content matters.
+            page.wait_for_event("response",
+                                lambda r, _s=resp_substr: _s in r.url,
+                                timeout=wt)
+        elif sel:
             if text:
                 page.locator(sel, has_text=text).wait_for(state=state, timeout=wt)
             else:

@@ -261,11 +261,31 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
             params = {}
         if not isinstance(params, dict):
             raise SpecError(f"{where}: wait needs a mapping")
-        # Two forms, disjoint state sets (Playwright's wait_for_selector does
-        # not accept load states): target-ful waits watch a selector;
-        # targetless waits watch a page load state the runner already
-        # implements via wait_for_load_state.
-        if params.get("target"):
+        # Four disjoint forms (Playwright's wait_for_selector does not accept
+        # load states): target-ful waits watch a selector; targetless waits
+        # watch a page load state the runner already implements via
+        # wait_for_load_state; js waits poll a JS expression until truthy
+        # (issue #79); response waits watch for a network response whose URL
+        # contains the substring (issue #79). The js/response forms take no
+        # target/state/text, and js and response never combine.
+        js = params.get("js")
+        response = params.get("response")
+        if js is not None and response is not None:
+            raise SpecError(f"{where}: wait: js and response are mutually exclusive")
+        if js is not None:
+            if not isinstance(js, str) or not js:
+                raise SpecError(f"{where}: wait.js must be a non-empty string")
+            for k in ("target", "state", "text"):
+                if params.get(k) is not None:
+                    raise SpecError(f"{where}: wait.js cannot be combined with {k}")
+        elif response is not None:
+            if not isinstance(response, str) or not response:
+                raise SpecError(
+                    f"{where}: wait.response must be a non-empty string (URL substring)")
+            for k in ("target", "state", "text"):
+                if params.get(k) is not None:
+                    raise SpecError(f"{where}: wait.response cannot be combined with {k}")
+        elif params.get("target"):
             state = params.get("state", "visible")
             if state not in {"visible", "hidden", "attached", "detached"}:
                 raise SpecError(f"{where}: wait with target: state must be visible|hidden|attached|detached")
@@ -273,6 +293,14 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
             state = params.get("state", "load")
             if state not in {"load", "domcontentloaded", "networkidle"}:
                 raise SpecError(f"{where}: wait without target: state must be load|domcontentloaded|networkidle")
+        # timeout_ms applies to all four forms.
+        timeout_ms = params.get("timeout_ms")
+        # bools are ints in Python; timeout_ms: true is always a typo
+        if (timeout_ms is not None
+                and (isinstance(timeout_ms, bool)
+                     or not isinstance(timeout_ms, int)
+                     or timeout_ms < 0)):
+            raise SpecError(f"{where}: wait.timeout_ms must be a non-negative int")
     elif op == "wait_ms":
         if not isinstance(params, int) or params < 0:
             raise SpecError(f"{where}: wait_ms needs a non-negative integer")

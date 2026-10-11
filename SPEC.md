@@ -84,7 +84,7 @@ and previously booted services are stopped.
 | `scroll` | `{target? , direction?: up\|down\|left\|right, pixels?: N}` | with `target`: `locator.scroll_into_view_if_needed` (step timeout); without `target`: `mouse.wheel` — down/up scroll ±pixels vertically, left/right horizontally (default `pixels` 600); drives lazy/infinite-scroll content deterministically |
 | `check` / `uncheck` | selector | checkboxes |
 | `select` | `{target, value}` | `<select>` value |
-| `wait` | `{target?, state?, text?, timeout_ms?}` | two forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load) |
+| `wait` | `{target?, state?, text?, js?, response?, timeout_ms?}` | four disjoint forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load); `js`: poll a JS expression until truthy; `response`: wait for a network response whose URL contains the substring (`js`/`response` take no `target`/`state`/`text`, and never both at once — see below) |
 | `wait_ms` | int | fixed pause (prefer `wait`) |
 | `reload` / `back` | `true` | navigation |
 | `seed` | `{http: {url, method?, json?}}` or `{js: "..."}` | test-data / state setup |
@@ -100,6 +100,44 @@ up to `retry` more times, first success wins; attempts run back-to-back
 with no delay; out of scope: cross-step retry, retrying setup-phase mocks),
 `on_dialog` (`accept`|`dismiss`, default `dismiss` — what the runner does
 with a JS dialog raised while the step's action runs; see `dialog`).
+
+### `wait`: `js` and `response` forms
+
+Two more `wait` forms for conditions no selector or load state can express:
+
+```yaml
+- name: data arrived before rendering
+  click: "#load"
+- wait: {response: "/api/waitdata", timeout_ms: 10000}
+- wait: {js: "window.dataLoaded === true"}
+- name: rendered content
+  expect:
+    - text_contains: {selector: "#out", text: "done"}
+```
+
+`js` polls the expression inside the page (via Playwright's
+`wait_for_function`) until it evaluates to a truthy value, then the step
+passes. Use it for app state the DOM doesn't expose yet — flags like
+`window.dataLoaded`, values set by framework hydration, canvas/WebGL
+readiness — anywhere a selector can't tell you "done".
+
+`response` waits for a network response whose URL contains the given
+substring (via Playwright's `response` event — Playwright 1.63 has no
+`wait_for_response` on `Page`; the event has the same semantics). The
+predicate matches the URL only, so `"/api/waitdata"` also matches
+`"/api/waitdata?fresh=1"`.
+
+Headers-vs-body caveat: the `response` event fires when the response
+**headers** arrive (TTFB), not when the body is fully received. The JS
+may therefore not have the payload yet when the step passes — this is
+the run-55 TTFB-vs-`responseEnd` lesson encoded as a contract. When body
+content matters, follow the `response` wait with the `js` form
+(`window.dataLoaded === true` set in the fetch's `.then`, or directly
+with `text_contains` on the rendered element), which polls until the
+page actually shows it.
+
+`timeout_ms` (optional non-negative int) applies to all four `wait`
+forms; when absent the step timeout applies.
 
 ### `mock` — deterministic data without a backend
 
