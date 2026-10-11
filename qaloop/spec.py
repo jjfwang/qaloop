@@ -32,6 +32,7 @@ ASSERTION_KEYS = {
     "network_calls",
     "url_contains", "title_contains", "noop", "console_clean", "js",
     "screenshot_matches", "ax", "dialog",
+    "attribute", "value", "focused",  # issue #81 — element state
 }
 
 # Step-level dialog policy: what the runner does when the page raises a JS
@@ -410,6 +411,40 @@ def _validate_expect(expect: dict[str, Any] | list, where: str) -> list[tuple[st
                     or not any(k in val for k in ("equals", "gte", "lte"))):
                 raise SpecError(
                     f"{where}: assertion count needs {{selector, equals|gte|lte}}")
+        elif key == "attribute":
+            # Issue #81: element attribute value. Exactly one of
+            # equals|contains (same exactly-one guard as mock_calls'
+            # equals|gte|lte); a missing attribute never matches at runtime.
+            if (not isinstance(val, dict)
+                    or not isinstance(val.get("selector"), str)
+                    or not val["selector"]
+                    or not isinstance(val.get("name"), str)
+                    or not val["name"]):
+                raise SpecError(
+                    f"{where}: assertion attribute needs "
+                    f"{{selector, name, equals|contains}}")
+            if (sum(k in val for k in ("equals", "contains")) != 1
+                    or not isinstance(val.get("equals",
+                                              val.get("contains")), str)):
+                raise SpecError(
+                    f"{where}: assertion attribute needs exactly one of "
+                    f"equals|contains, as a string")
+        elif key == "value":
+            # Issue #81: input value (after fill/type).
+            if (not isinstance(val, dict)
+                    or not isinstance(val.get("selector"), str)
+                    or not val["selector"]
+                    or not isinstance(val.get("equals"), str)):
+                raise SpecError(
+                    f"{where}: assertion value needs "
+                    f"{{selector, equals}} (equals must be a string)")
+        elif key == "focused":
+            # Issue #81: document.activeElement === the element.
+            if (not isinstance(val, dict)
+                    or not isinstance(val.get("selector"), str)
+                    or not val["selector"]):
+                raise SpecError(
+                    f"{where}: assertion focused needs {{selector}}")
         elif key in {"url_contains", "title_contains"}:
             if not isinstance(val, str):
                 raise SpecError(f"{where}: assertion {key} needs a string")

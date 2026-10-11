@@ -234,14 +234,20 @@ with no registered mock — or no hits yet — evaluates as 0, so
 | `screenshot_matches` | `{baseline, selector?, max_diff?}` — visual pinning (see below) |
 | `ax` | `{role, name?, state?}` — accessibility-contract assertion (see below) |
 | `dialog` | `{type?, text?}` — a JS dialog appeared since the step started (see below) |
+| `attribute` | `{selector, name, equals: v}` / `{selector, name, contains: s}` — element attribute value (see below) |
+| `value` | `{selector, equals: v}` — live value of an input after `fill`/`type` |
+| `focused` | `{selector}` — `document.activeElement` is the element |
 
-`text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, and `count`
+`text_contains`, `text_matches`, `url_contains`, `title_contains`, `js`, `count`,
+`attribute`, `value`, and `focused`
 all poll until the value matches or the step deadline expires, because
 async-rendered state races a one-shot read: element text is re-read via
 `text_content` (after `wait_for_selector` attaches), `page.url` /
 `page.title()` are re-read directly, `page.evaluate(script)` output is
-re-read directly, and locator `count()` is re-read
-against the comparator (`equals` > `gte` > `lte`), every 0.15s against
+re-read directly, locator `count()` is re-read
+against the comparator (`equals` > `gte` > `lte`), the attribute is re-read via
+`get_attribute`, the input value via `input_value`, and focus via
+`document.activeElement === el` (Playwright has no `is_focused()`), every 0.15s against
 `min(step.timeout_ms or 15000, 8000)`. On timeout the failure detail names the
 final observed value, not the desired value alone.
 
@@ -316,6 +322,28 @@ assertion matches against dialogs raised since the step started:
 the dialog message. Either may be omitted to match any dialog. All dialogs
 are listed in the run report and `run.json` under `dialogs`. Note: `prompt()`
 is accepted with empty input — typed prompt input is out of scope.
+
+### Element state — `attribute`, `value`, `focused`
+
+Three assertions on an element's runtime state, for contracts like "the
+control reflects its model after the interaction":
+
+```yaml
+expect:
+  - attribute: {selector: "#submit", name: "aria-disabled", equals: "false"}
+  - attribute: {selector: "#badge", name: "class", contains: "active"}
+  - value: {selector: "#email", equals: "qa@example.com"}
+  - focused: {selector: "#search"}
+```
+
+`attribute` needs `selector`, `name`, and exactly one of `equals` /
+`contains`; `value` needs `selector` and `equals`; `focused` needs only
+`selector`. `get_attribute` returning `None` (missing attribute) never
+matches — not even `contains`. Like the other polling assertions these
+re-read every 0.15s until the step deadline and the failure detail names
+the final observed value (e.g. `#badge: class='chip idle' want contains 'active'`).
+All three resolve inside the step's `frame:` scope like other selector
+assertions.
 
 ## Conventions
 
