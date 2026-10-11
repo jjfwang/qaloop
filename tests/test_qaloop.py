@@ -5507,6 +5507,334 @@ def test_issue_87_flow_variables():
     check("empty store is a no-op", variables["a"] == "bye")
 
 
+def test_issue_88_matrix_flows():
+    """Issue #88: data-driven `matrix:` flows.
+
+    Loader: expand_matrix cross-product ordering + list-of-maps
+    passthrough + every validation rejection; matrix names survive
+    load-time strict envsubst (step params and target:), undeclared
+    names still fail, matrix refs are exempt from use-before-store,
+    matrix/store name collision rejected.
+    Runner: run_flow(initial_vars=...) seeds the table from the
+    combination (copy, not alias), interpolates matrix refs in step
+    params and in the target.
+    CLI/report: per-combination subdirs, combined parent REPORT.md,
+    exit 0 iff all combinations passed.
+    """
+    import tempfile
+    from types import SimpleNamespace
+    from qaloop.spec import (load_spec, SpecError, expand_matrix,
+                             _check_variable_ordering, Step)
+    from qaloop.runner import run_flow, _interpolate_target
+    from qaloop.report import write_matrix_summary
+    from qaloop.cli import _cmd_verify_run, _combo_slug
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    # --- expand_matrix: cross-product ordering ---
+    combos = expand_matrix({"a": [1, 2], "b": ["x", "y"]})
+    check("cross product ordering",
+          combos == [{"a": "1", "b": "x"}, {"a": "1", "b": "y"},
+                     {"a": "2", "b": "x"}, {"a": "2", "b": "y"}],
+          str(combos))
+    # scalar stringification incl. bool/None
+    combos = expand_matrix({"a": [True, None, 1.5]})
+    check("scalars stringified via str()",
+          combos == [{"a": "True"}, {"a": "None"}, {"a": "1.5"}],
+          str(combos))
+    # --- expand_matrix: list-of-maps passthrough ---
+    combos = expand_matrix([{"u": "ada", "n": 3}, {"u": "bob"}])
+    check("list-of-maps passthrough",
+          combos == [{"u": "ada", "n": "3"}, {"u": "bob"}], str(combos))
+    # single combination
+    check("single combination", expand_matrix([{"u": "ada"}]) == [{"u": "ada"}])
+
+    # --- expand_matrix: all rejections ---
+    bad = ["x", 42, [], {}, [{}], ["x"], [1],
+           {"9lives": [1]}, {"a": "scalar-not-list"}, {"a": []},
+           {"a": [{"b": 1}]}, {"a": [1, {"b": 2}]},
+           [{"ok": 1}, {"bad-name!": 2}], [{"a": [1, 2], "b": {}}]]
+    n_bad = 0
+    for i, matrix in enumerate(bad):
+        try:
+            expand_matrix(matrix)
+            check(f"rejected matrix shape {i}", False, repr(matrix))
+        except SpecError:
+            n_bad += 1
+    check("all invalid matrix shapes rejected", n_bad == len(bad),
+          f"{n_bad}/{len(bad)}")
+
+    base = "name: m\ntarget: http://t\nsteps:\n"
+
+    def rejects(text, label, needle=""):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(text)
+        try:
+            load_spec(f.name)
+            check(f"rejected: {label}", False)
+        except SpecError as e:
+            ok = not needle or needle in str(e)
+            check(f"rejected: {label}", ok, str(e) if not ok else "")
+        finally:
+            os.unlink(f.name)
+
+    # --- matrix/store name collision rejected ---
+    rejects(base + "  - name: s\n    click: \"#b\"\n"
+            "    store: {v: {js: \"1\"}}\n"
+            "matrix:\n  v: [1, 2]\n",
+            "matrix/store name collision", "also declared by a `store` step")
+    # --- matrix refs pass load-time validation ---
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name,
+              "name: m\ntarget: http://h/${tenant}\n"
+              "matrix:\n  tenant: [t1, t2]\n"
+              "steps:\n"
+              "  - name: go\n    goto: /p/${tenant}\n")
+        spec = load_spec(f.name)
+        check("matrix spec parses", spec.matrix == [{"tenant": "t1"},
+                                                    {"tenant": "t2"}],
+              str(spec.matrix))
+        check("matrix ref survives in target",
+              spec.target == "http://h/${tenant}", spec.target)
+        check("matrix ref survives in step params",
+              spec.steps[0].params == "/p/${tenant}",
+              str(spec.steps[0].params))
+        os.unlink(f.name)
+    # --- undeclared names still fail at load ---
+    if "ISSUE88_PROBE" in os.environ:
+        del os.environ["ISSUE88_PROBE"]
+    rejects(base + "  - name: s\n    click: \".x${ISSUE88_PROBE}\"\n"
+            "matrix:\n  v: [1]\n",
+            "undeclared var still rejected", "is not set")
+    # --- matrix names exempt from use-before-store (incl. first step) ---
+    st = Step(index=0, phase="steps", name="s", op="click",
+              params=".x${mvar}", expect={}, expect_items=[],
+              continue_on_fail=False, timeout_ms=1000, raw={})
+    try:
+        _check_variable_ordering([], [st], [], {"mvar"}, "spec x",
+                                 {"mvar"})
+        check("matrix name exempt from ordering", True)
+    except SpecError as e:
+        check("matrix name exempt from ordering", False, str(e))
+    # non-matrix declared name still errors via the same call
+    try:
+        _check_variable_ordering([], [st], [], {"mvar"}, "spec x")
+        check("non-matrix ordering still enforced", False)
+    except SpecError as e:
+        check("non-matrix ordering still enforced",
+              "never stored" in str(e), str(e))
+
+    # --- _interpolate_target ---
+    check("target: combo ref substituted",
+          _interpolate_target("http://h/${t}/x", {"t": "T1"})
+          == "http://h/T1/x")
+    check("target: unknown ref left alone",
+          _interpolate_target("http://h/${t}/${LEFT}", {"t": "T1"})
+          == "http://h/T1/${LEFT}")
+    check("target: no refs unchanged",
+          _interpolate_target("http://h/x", {"t": "T1"}) == "http://h/x")
+
+    # --- _combo_slug ---
+    check("combo slug", _combo_slug({"u": "a b", "p": "x/y"}, 0) == "u-a-b-p-x-y",
+          _combo_slug({"u": "a b", "p": "x/y"}, 0))
+    check("combo slug fallback", _combo_slug({}, 3) == "combo-03")
+
+    # --- run_flow with initial_vars, faked browser ---
+    import playwright.sync_api as pw_sync
+
+    gotos = []
+    evaluated = []
+
+    class FakePage:
+        def on(self, event, handler):
+            pass
+
+        def evaluate(self, js):
+            evaluated.append(js)
+            return "CAPTURED"
+
+        def goto(self, url, **kw):
+            gotos.append(url)
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeCtx:
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name,
+                  "name: m\ntarget: http://h/${tenant}\n"
+                  "matrix:\n  tenant: [t1]\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /p/${tenant}\n"
+                  "  - name: recapture the matrix var\n"
+                  "    wait_ms: 1\n"
+                  "    store: {other: {js: \"'x'\"}}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n")
+            spec = load_spec(f.name)
+            os.unlink(f.name)
+        with tempfile.TemporaryDirectory() as run_dir:
+            combo = {"tenant": "t1"}
+            result = run_flow(spec, run_dir=run_dir, initial_vars=combo)
+            check("run_flow passes with seeded vars",
+                  result.status == "passed", result.status)
+            check("target interpolated from combination",
+                  result.target == "http://h/t1", result.target)
+            check("step params interpolated from combination",
+                  gotos == ["http://h/t1/p/t1"], str(gotos))
+            check("store still captures alongside seeds",
+                  evaluated == ["'x'"], str(evaluated))
+            check("combination map not aliased by the run",
+                  combo == {"tenant": "t1"}, str(combo))
+        # re-storing a matrix name inside the run must not touch the
+        # caller's map either (copy, not alias)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name,
+                  "name: m\ntarget: http://h\n"
+                  "matrix:\n  v: [orig]\n"
+                  "steps:\n"
+                  "  - name: overwrite\n"
+                  "    wait_ms: 1\n"
+                  "    store: {other: {js: \"'x'\"}}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n")
+            spec2 = load_spec(f.name)
+            os.unlink(f.name)
+        with tempfile.TemporaryDirectory() as run_dir:
+            combo = {"v": "orig"}
+            result = run_flow(spec2, run_dir=run_dir, initial_vars=combo)
+            check("run never mutates caller combination",
+                  combo == {"v": "orig"} and result.status == "passed",
+                  str(combo))
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+    # --- write_matrix_summary ---
+    import playwright.sync_api as pw_sync2  # noqa: F401 (reuse fakes above)
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name,
+                  "name: m\ntarget: http://h/${t}\n"
+                  "matrix:\n  t: [a, b]\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /${t}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n")
+            spec3 = load_spec(f.name)
+            os.unlink(f.name)
+        with tempfile.TemporaryDirectory() as run_dir:
+            results = []
+            for i, combo in enumerate(spec3.matrix):
+                subdir = os.path.join(run_dir, "matrix",
+                                      f"{i:02d}-{_combo_slug(combo, i)}")
+                os.makedirs(subdir, exist_ok=True)
+                result = run_flow(spec3, run_dir=subdir, initial_vars=combo)
+                results.append((combo, result, subdir))
+            path = write_matrix_summary(spec3, results, run_dir)
+            with open(path) as fh:
+                body = fh.read()
+            check("matrix summary 2/2 PASS", "[2/2 PASS]" in body, body[:200])
+            check("matrix summary lists combos",
+                  "`t=a`" in body and "`t=b`" in body, body[:400])
+            check("matrix summary links subdirs",
+                  "matrix/00-t-a/REPORT.md" in body, body[:600])
+            check("matrix summary written to parent",
+                  path == os.path.join(run_dir, "REPORT.md"))
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+    # --- _cmd_verify_run dispatches to the matrix branch ---
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name,
+                  "name: cli-matrix\ntarget: http://h/${t}\n"
+                  "matrix:\n  t: [a, b]\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /${t}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n"
+                  "investigate_on_failure: false\n")
+            flow_path = f.name
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "run1")
+            os.makedirs(run_dir)
+            # stale dirs so prune_old_runs actually prunes (covers the log line)
+            for n in range(6):
+                os.makedirs(os.path.join(root, f"z-old-{n}"))
+            ledger = FakeLedger()
+            args = SimpleNamespace(flow=flow_path, target=None, headed=True,
+                                   executable_path=None, upload_dir=None,
+                                   investigate=False, keep_runs=5,
+                                   max_investigation_actions=None)
+            rc = _cmd_verify_run(args, run_dir, ledger, root, 5)
+            check("matrix verify exit 0 when all pass", rc == 0, str(rc))
+            parent = os.path.join(run_dir, "REPORT.md")
+            check("parent REPORT.md written", os.path.exists(parent))
+            with open(parent) as fh:
+                body = fh.read()
+            check("parent report combined summary",
+                  "[2/2 PASS]" in body and "matrix/01-t-b/REPORT.md" in body,
+                  body[:400])
+            check("per-combo REPORT.md written",
+                  os.path.exists(os.path.join(run_dir, "matrix",
+                                              "00-t-a", "REPORT.md")))
+            kinds = [r["kind"] for r in ledger.rows]
+            check("ledger records matrix run", kinds == ["scripted-matrix"],
+                  str(kinds))
+            check("ledger records combo counts",
+                  ledger.rows[0]["combinations"] == 2
+                  and ledger.rows[0]["passed"] == 2, str(ledger.rows[0]))
+        os.unlink(flow_path)
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

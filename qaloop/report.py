@@ -138,6 +138,49 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
             "network_jsonl": network_jsonl_path}
 
 
+def write_matrix_summary(spec: FlowSpec, combos_results: list,
+                         run_dir: str) -> str:
+    """Write the parent REPORT.md for a matrix run (issue #88).
+
+    combos_results: list of (combination dict, RunResult, subdir). Each
+    combination keeps its own run.json/REPORT.md in its subdir; this
+    writes the combined summary: combination count, per-combo PASS/FAIL,
+    and links to the per-combination reports. Returns the path written.
+    """
+    passed = sum(1 for _, r, _ in combos_results if r.status == "passed")
+    total = len(combos_results)
+    lines = [
+        f"# qaloop matrix report — {spec.name} [{passed}/{total} PASS]",
+        "",
+        f"- combinations: {total}",
+        f"- passed: {passed}",
+        f"- run dir: `{run_dir}`",
+        "",
+        "## Combinations",
+        "",
+        "| # | variables | status | steps | report |",
+        "|---|---|---|---|---|",
+    ]
+    for i, (combo, result, subdir) in enumerate(combos_results):
+        badge = {"passed": "PASS", "failed": "FAIL", "error": "ERROR"}[result.status]
+        combo_str = ", ".join(f"{k}={v}" for k, v in combo.items())
+        rel_report = os.path.relpath(os.path.join(subdir, "REPORT.md"), run_dir)
+        ok = sum(1 for s in result.steps if s.status == "passed")
+        lines.append(
+            f"| {i} | `{combo_str}` | {badge} | {ok}/{len(result.steps)} "
+            f"| [{os.path.basename(subdir)}]({rel_report}) |")
+    lines += [
+        "",
+        f"Per-combination detail: `matrix/<combo>/REPORT.md` + `run.json` "
+        f"under `{run_dir}`.",
+        "",
+    ]
+    path = os.path.join(run_dir, "REPORT.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+
 def write_junit_xml(result: RunResult, spec: FlowSpec, path: str) -> str:
     """Write a JUnit XML report: one testsuite per flow, one testcase per step.
 

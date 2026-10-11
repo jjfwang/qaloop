@@ -585,6 +585,53 @@ Rules:
   the `store` step was skipped) fails the step with an error naming
   the variable.
 
+### Matrix — data-driven flows with `matrix:`
+
+A top-level `matrix:` runs the whole flow once per data combination
+(issue #88). Each combination's variable map seeds the run-scoped
+variable table from #87, so `${name}` works in every step without any
+`store` step.
+
+```yaml
+matrix:
+  user: [ada, bob]        # cross product: 2 x 2 = 4 combinations
+  plan: [pro, free]
+```
+
+Two forms:
+
+- **Map of name to value list** (above): expanded as the cross product
+  in key insertion order — deterministic. Every value list must be
+  non-empty; every value a scalar (string, number, boolean, null),
+  stringified via `str()` exactly like `store` captures.
+- **List of maps**: each map is one combination verbatim.
+  ```yaml
+  matrix:
+    - {user: ada, plan: pro}
+    - {user: bob, plan: free}
+  ```
+
+Rules:
+
+- `matrix:` must be a non-empty list or map; names match
+  `[A-Za-z_][A-Za-z0-9_]*`; a name also declared by a `store` step is a
+  `SpecError` (a variable is seeded by the matrix or captured — never
+  both).
+- Matrix names count as **pre-initialized variables**: they survive
+  load-time `$ENV` expansion everywhere (step params *and* `target:`),
+  and they are exempt from the use-before-store static check — the
+  matrix seeds them before the first step, and they are visible to all
+  phases (`setup`, `steps`, `teardown`).
+- A `${name}` in `target:` that matches a matrix name is interpolated
+  from each combination's map at run time, so one flow can sweep
+  multiple base URLs.
+- `verify` creates one parent run dir with per-combination subdirs
+  (`<run_dir>/matrix/<NN>-<combo-slug>/`), each with its own
+  `run.json`/`REPORT.md`, plus a combined summary in the parent
+  `REPORT.md` (combination count, per-combo PASS/FAIL, links to the
+  subdirs). Exit code is 0 iff every combination passed. In matrix
+  mode `--investigate` is not applied per combination.
+
 ## Conventions
 
 - Write the spec alongside the feature; the implementer authors its own
