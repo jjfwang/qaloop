@@ -3589,6 +3589,147 @@ def test_drag_op():
           str(page.calls))
 
 
+def test_type_op():
+    """type op (issue #78): spec validation ({target, text} required, text a
+    string, delay_ms optional non-negative int) and the runner calling
+    locator.press_sequentially with the text, the delay, and the step
+    timeout."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: ty\n    type: PARAMS\n")
+    s = load(base.replace("PARAMS", '{target: "#q", text: "hello"}'))
+    check("type with {target, text} parses",
+          s.steps[1].op == "type" and s.steps[1].params["text"] == "hello")
+    s = load(base.replace("PARAMS", '{target: "#q", text: "hi", delay_ms: 60}'))
+    check("type with delay_ms parses",
+          s.steps[1].params["delay_ms"] == 60)
+    s = load(base.replace("PARAMS", '{target: "#q", text: ""}'))
+    check("type with empty text parses (clear-typing)",
+          s.steps[1].params["text"] == "")
+    for bad, label in [
+        ("'#q'", "bare string (needs {target, text})"),
+        ('""', "empty string"),
+        ("{}", "empty mapping"),
+        ("{text: 'hi'}", "missing target"),
+        ("{target: '#q'}", "missing text"),
+        ("{target: '', text: 'hi'}", "empty target"),
+        ("{target: 42, text: 'hi'}", "non-string target"),
+        ("{target: '#q', text: 42}", "non-string text"),
+        ("{target: '#q', text: 'hi', delay_ms: -1}", "negative delay_ms"),
+        ("{target: '#q', text: 'hi', delay_ms: 1.5}", "non-integer delay_ms"),
+        ("{target: '#q', text: 'hi', delay_ms: 'fast'}", "string delay_ms"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad type rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad type rejected ({label})", True)
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+        def press_sequentially(self, text, delay=None, timeout=None):
+            self.page.calls.append((self.selector, text, delay, timeout))
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+    def run_step(params, timeout_ms=None):
+        page = FakePage()
+        step = Step(index=0, phase="steps", name="ty", op="type",
+                    params=params, expect={}, expect_items=[],
+                    continue_on_fail=False, timeout_ms=timeout_ms, raw={})
+        _do_action(page, step, "http://x", {})
+        return page
+
+    page = run_step({"target": "#q", "text": "hello", "delay_ms": 60})
+    check("type calls press_sequentially with text, delay, and default timeout",
+          page.calls == [("#q", "hello", 60, 15000)], str(page.calls))
+    page = run_step({"target": "#q", "text": "hi"}, timeout_ms=5000)
+    check("type defaults delay_ms to 0 and honors step timeout_ms",
+          page.calls == [("#q", "hi", 0, 5000)], str(page.calls))
+
+
+def test_focus_op():
+    """focus op (issue #78): spec validation ({target} required) and the
+    runner calling locator.focus with the step timeout."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: f\n    focus: PARAMS\n")
+    s = load(base.replace("PARAMS", '{target: "#ok"}'))
+    check("focus with {target} parses",
+          s.steps[1].op == "focus" and s.steps[1].params["target"] == "#ok")
+    for bad, label in [
+        ("'#ok'", "bare string (needs {target})"),
+        ('""', "empty string"),
+        ("{}", "empty mapping"),
+        ("{target: ''}", "empty target"),
+        ("{target: 42}", "non-string target"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad focus rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad focus rejected ({label})", True)
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+        def focus(self, timeout=None):
+            self.page.calls.append((self.selector, timeout))
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+    page = FakePage()
+    step = Step(index=0, phase="steps", name="f", op="focus",
+                params={"target": "#ok"}, expect={}, expect_items=[],
+                continue_on_fail=False, timeout_ms=None, raw={})
+    _do_action(page, step, "http://x", {})
+    check("focus calls locator.focus with default timeout",
+          page.calls == [("#ok", 15000)], str(page.calls))
+
+    page2 = FakePage()
+    step2 = Step(index=0, phase="steps", name="f", op="focus",
+                 params={"target": "#ok"}, expect={}, expect_items=[],
+                 continue_on_fail=False, timeout_ms=5000, raw={})
+    _do_action(page2, step2, "http://x", {})
+    check("focus honors step timeout_ms",
+          page2.calls == [("#ok", 5000)], str(page2.calls))
+
+
 def test_scroll_op():
     """scroll op: spec validation (target/direction/pixels) and the runner
     calling scroll_into_view_if_needed for a target, or mouse.wheel with the

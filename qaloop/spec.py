@@ -21,7 +21,7 @@ ACTION_OPS = {
     "goto", "click", "dblclick", "fill", "press", "hover", "scroll", "check",
     "uncheck",
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
-    "mock", "upload", "drag",
+    "mock", "upload", "drag", "type", "focus",
 }
 STEP_META_KEYS = {"name", "expect", "continue_on_fail", "timeout_ms", "retry",
                  "on_dialog"}
@@ -191,6 +191,23 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
     elif op == "press":
         if not isinstance(params, dict) or "target" not in params or "key" not in params:
             raise SpecError(f"{where}: press needs {{target, key}}")
+    elif op == "type":
+        # Issue #78: per-keystroke typing with an optional inter-keystroke
+        # pause. text may be the empty string (clear-typing); delay_ms, when
+        # given, must be a non-negative integer (milliseconds).
+        if (not isinstance(params, dict)
+                or not isinstance(params.get("target"), str)
+                or not params["target"]
+                or not isinstance(params.get("text"), str)):
+            raise SpecError(f"{where}: type needs {{target, text}}")
+        delay = params.get("delay_ms")
+        if delay is not None and (not isinstance(delay, int) or delay < 0):
+            raise SpecError(
+                f"{where}: type delay_ms must be a non-negative integer")
+    elif op == "focus":
+        if (not isinstance(params, dict) or not isinstance(params.get("target"), str)
+                or not params["target"]):
+            raise SpecError(f"{where}: focus needs {{target}}")
     elif op == "hover":
         if (not isinstance(params, dict) or not isinstance(params.get("target"), str)
                 or not params["target"]):

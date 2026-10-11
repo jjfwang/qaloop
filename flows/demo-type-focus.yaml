@@ -1,0 +1,29 @@
+name: demo-type-focus
+description: >-
+  Browser proof for the type and focus action ops (issue #78): types a query
+  keystroke-by-keystroke into a debounced search input (delay_ms 60ms) and
+  the debounced suggestion list renders; then focuses a button and reads
+  document.activeElement.id back.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the type/focus demo page
+    goto: /demo/type-debounce.html
+
+steps:
+  - name: type a query keystroke by keystroke
+    type: {target: "#q", text: "ap", delay_ms: 60}
+    expect:
+      - text_contains: {selector: "#suggestions", text: "apple"}
+  - name: focus the button
+    focus: {target: "#ok"}
+    expect:
+      - js:
+          script: "document.activeElement.id"
+          contains: "ok"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

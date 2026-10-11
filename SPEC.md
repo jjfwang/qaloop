@@ -78,6 +78,8 @@ and previously booted services are stopped.
 | `click` / `dblclick` | selector | CSS, `text=`, `role=` all work |
 | `fill` | `{target, text}` | clears first |
 | `press` | `{target, key}` | e.g. `{target: "#q", key: "Enter"}` |
+| `type` | `{target, text, delay_ms?}` | keystroke-by-keystroke typing via `locator.press_sequentially` — fires keydown/keypress/input events per character, so debounced search and autocomplete can be exercised; `delay_ms` is the pause in ms between keystrokes |
+| `focus` | `{target}` | `locator.focus()` — focuses an element with no other interaction |
 | `hover` | `{target}` | mouse hover on the selector — drives CSS `:hover` states, tooltips, and hover menus |
 | `scroll` | `{target? , direction?: up\|down\|left\|right, pixels?: N}` | with `target`: `locator.scroll_into_view_if_needed` (step timeout); without `target`: `mouse.wheel` — down/up scroll ±pixels vertically, left/right horizontally (default `pixels` 600); drives lazy/infinite-scroll content deterministically |
 | `check` / `uncheck` | selector | checkboxes |
