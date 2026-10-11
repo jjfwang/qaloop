@@ -531,9 +531,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"ERROR: {e}")
         return 2
+    if args.concurrency < 1:
+        print(f"ERROR: --concurrency must be >= 1 (got {args.concurrency})")
+        return 2
     run_worker(flows_dir=args.flows, runs_root=default_runs_root(),
                once=args.once, poll_s=args.poll, headless=not args.headed,
-               executable_path=args.executable_path, keep_runs=keep_runs)
+               executable_path=args.executable_path, keep_runs=keep_runs,
+               concurrency=args.concurrency)
     return 0
 
 
@@ -642,6 +646,8 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--flows", default=os.path.join(QALOOP_HOME, "flows"))
     w.add_argument("--once", action="store_true", help="exit when queue is empty")
     w.add_argument("--poll", type=float, default=5)
+    w.add_argument("--concurrency", type=int, default=1,
+                   help="parallel job claims (default 1 = serial)")
     w.add_argument("--headed", action="store_true")
     w.add_argument("--executable-path", default=None)
     w.add_argument("--keep-runs", type=int, default=None,
