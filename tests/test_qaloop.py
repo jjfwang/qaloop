@@ -4128,6 +4128,18 @@ def test_frame_scoping():
             self.texts = {}
         def click(self, sel, timeout=None):
             self.calls.append(("click", sel, timeout))
+        def dblclick(self, sel, timeout=None):
+            self.calls.append(("dblclick", sel, timeout))
+        def fill(self, sel, text, timeout=None):
+            self.calls.append(("fill", sel, text, timeout))
+        def press(self, sel, key, timeout=None):
+            self.calls.append(("press", sel, key, timeout))
+        def check(self, sel, timeout=None):
+            self.calls.append(("check", sel, timeout))
+        def uncheck(self, sel, timeout=None):
+            self.calls.append(("uncheck", sel, timeout))
+        def select_option(self, sel, value, timeout=None):
+            self.calls.append(("select", sel, value, timeout))
         def locator(self, sel, has_text=None):
             self.calls.append(("locator", sel, has_text))
             return FakeLocator(self, sel)
@@ -4192,6 +4204,40 @@ def test_frame_scoping():
                "http://x", {})
     check("click with frame: url substring -> frame.click",
           url_fr.calls == [("click", "#b", 5000)], str(url_fr.calls))
+    # every other frame-scoped action path also lands on the frame
+    fr.calls.clear()
+    _do_action(page, mkstep("dblclick", "#d", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("fill", {"target": "#t", "text": "hi"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("press", {"target": "#k", "key": "Enter"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page, mkstep("check", "#c", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page, mkstep("uncheck", "#u", frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("select", {"target": "#s", "value": "v"},
+                      frame="demo-frame"),
+               "http://x", {})
+    _do_action(page,
+               mkstep("wait", {"target": "#w", "text": "go"},
+                      frame="demo-frame"),
+               "http://x", {})
+    check("frame-scoped dblclick/fill/press/check/uncheck/select/wait-text land on the frame",
+          fr.calls == [("dblclick", "#d", 5000),
+                       ("fill", "#t", "hi", 5000),
+                       ("press", "#k", "Enter", 5000),
+                       ("check", "#c", 5000),
+                       ("uncheck", "#u", 5000),
+                       ("select", "#s", "v", 5000),
+                       ("locator", "#w", "go"),
+                       ("loc_wait", "#w", "visible", 5000)],
+          str(fr.calls))
     # missing frame: action raises RuntimeError with clear detail
     # (short timeout — the lookup polls, so a real timeout is slow)
     try:
