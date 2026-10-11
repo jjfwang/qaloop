@@ -18,7 +18,7 @@ SPEC_VERSION = 1
 _ENV_VAR = re.compile(r"\$(\w+|\{[^}]+\})")
 
 ACTION_OPS = {
-    "goto", "click", "dblclick", "fill", "press", "check", "uncheck",
+    "goto", "click", "dblclick", "fill", "press", "hover", "check", "uncheck",
     "select", "wait", "wait_ms", "reload", "back", "seed", "script",
     "mock",
 }
@@ -190,6 +190,10 @@ def _validate_op_params(op: str | None, params: Any, where: str) -> None:
     elif op == "press":
         if not isinstance(params, dict) or "target" not in params or "key" not in params:
             raise SpecError(f"{where}: press needs {{target, key}}")
+    elif op == "hover":
+        if (not isinstance(params, dict) or not isinstance(params.get("target"), str)
+                or not params["target"]):
+            raise SpecError(f"{where}: hover needs {{target}}")
     elif op == "select":
         if not isinstance(params, dict) or "target" not in params or "value" not in params:
             raise SpecError(f"{where}: select needs {{target, value}}")

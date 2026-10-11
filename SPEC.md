@@ -78,6 +78,7 @@ and previously booted services are stopped.
 | `click` / `dblclick` | selector | CSS, `text=`, `role=` all work |
 | `fill` | `{target, text}` | clears first |
 | `press` | `{target, key}` | e.g. `{target: "#q", key: "Enter"}` |
+| `hover` | `{target}` | mouse hover on the selector — drives CSS `:hover` states, tooltips, and hover menus |
 | `check` / `uncheck` | selector | checkboxes |
 | `select` | `{target, value}` | `<select>` value |
 | `wait` | `{target?, state?, text?, timeout_ms?}` | two forms — with `target`: state visible\|hidden\|attached\|detached (`text` waits for the selector to contain the text); without `target`: state load\|domcontentloaded\|networkidle (page load state, default load) |
