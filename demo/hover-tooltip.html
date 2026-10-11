@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hover tooltip demo</title>
+<style>
+  body { font-family: sans-serif; padding: 120px; }
+  .tipwrap { position: relative; display: inline-block; }
+  #tip {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: #101720;
+    color: #f7f5ef;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+  .tipwrap:hover #tip { display: block; }
+</style>
+</head>
+<body>
+  <div class="tipwrap">
+    <button id="tip-trigger" type="button">Hover me</button>
+    <div id="tip" role="tooltip">tooltip: revealed on hover</div>
+  </div>
+</body>
+</html>

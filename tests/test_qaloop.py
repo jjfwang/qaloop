@@ -3437,6 +3437,63 @@ def test_dialog_support():
           res2[0].detail)
 
 
+def test_hover_op():
+    """hover op: spec validation ({target} required) and the runner calling
+    page.hover with the selector and step timeout (issue #74)."""
+    import tempfile
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step, load_spec, SpecError
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n  - {goto: /}\n"
+            "  - name: h\n    hover: PARAMS\n")
+    s = load(base.replace("PARAMS", '{target: "#tip-trigger"}'))
+    check("hover with {target} parses",
+          s.steps[1].op == "hover" and s.steps[1].params["target"] == "#tip-trigger")
+    for bad, label in [
+        ("'#tip-trigger'", "bare string (needs {target})"),
+        ('""', "empty string"),
+        ("{}", "empty mapping"),
+        ("{target: ''}", "empty target"),
+        ("{target: 42}", "non-string target"),
+    ]:
+        try:
+            load(base.replace("PARAMS", bad))
+            check(f"bad hover rejected ({label})", False, "no error")
+        except SpecError:
+            check(f"bad hover rejected ({label})", True)
+
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+        def hover(self, selector, timeout=None):
+            self.calls.append((selector, timeout))
+
+    page = FakePage()
+    step = Step(index=0, phase="steps", name="h", op="hover",
+                params={"target": "#tip-trigger"}, expect={}, expect_items=[],
+                continue_on_fail=False, timeout_ms=None, raw={})
+    _do_action(page, step, "http://x", {})
+    check("hover calls page.hover with selector and default timeout",
+          page.calls == [("#tip-trigger", 15000)], str(page.calls))
+
+    page2 = FakePage()
+    step2 = Step(index=0, phase="steps", name="h", op="hover",
+                 params={"target": "#tip-trigger"}, expect={}, expect_items=[],
+                 continue_on_fail=False, timeout_ms=5000, raw={})
+    _do_action(page2, step2, "http://x", {})
+    check("hover honors step timeout_ms",
+          page2.calls == [("#tip-trigger", 5000)], str(page2.calls))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

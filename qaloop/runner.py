@@ -247,6 +247,8 @@ def _do_action(page, step: Step, target: str, mock_hits: dict) -> None:
         page.fill(p["target"], p["text"], timeout=t)
     elif op == "press":
         page.press(p["target"], p["key"], timeout=t)
+    elif op == "hover":
+        page.hover(p["target"], timeout=t)
     elif op == "check":
         page.check(p, timeout=t)
     elif op == "uncheck":

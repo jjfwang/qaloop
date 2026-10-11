@@ -1,0 +1,27 @@
+name: demo-hover-tooltip
+description: >-
+  Browser proof for the hover action op (issue #74): a CSS :hover tooltip is
+  hidden by default, becomes visible after hovering the trigger, and carries
+  the expected text.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the tooltip demo page
+    goto: /demo/hover-tooltip.html
+
+steps:
+  - name: tooltip is hidden before hover
+    expect:
+      - hidden: "#tip"
+
+  - name: hover the trigger reveals the tooltip
+    hover: {target: "#tip-trigger"}
+    expect:
+      - visible: "#tip"
+      - text_contains: {selector: "#tip", text: "revealed on hover"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
