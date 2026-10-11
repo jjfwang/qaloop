@@ -203,7 +203,8 @@ def _run_single_flow(args, flow_path: str, run_dir: str, ledger, upload_dir,
     result = run_flow(spec, run_dir=run_dir, target=target,
                       headless=not args.headed,
                       executable_path=args.executable_path,
-                      upload_dir=upload_dir)
+                      upload_dir=upload_dir,
+                      video=getattr(args, "video", False) or None)
     diagnosis = None
     if (not batch_mode and result.status != "passed" and args.investigate
             and spec.investigate_on_failure):
@@ -347,7 +348,8 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
                           target=args.target or spec.target,
                           headless=not args.headed,
                           executable_path=args.executable_path,
-                          upload_dir=upload_dir, initial_vars=combo)
+                          upload_dir=upload_dir, initial_vars=combo,
+                          video=getattr(args, "video", False) or None)
         write_report(result, spec, subdir)
         results.append((combo, result, subdir))
         print_summary(result)
@@ -598,6 +600,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--investigate", action="store_true",
                    help="summon the agentic investigator on failure")
     r.add_argument("--max-investigation-actions", type=int, default=None)
+    r.add_argument("--video", action="store_true",
+                   help="record the run as video.webm in the run dir "
+                        "(issue #90; opt-in, default off)")
     r.add_argument("--keep-runs", type=int, default=None,
                    help="keep at most N newest run dirs (env QALOOP_KEEP_RUNS; "
                         "default 0 = keep everything)")

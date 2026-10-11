@@ -57,6 +57,10 @@ class RunResult:
     error: str = ""
     network_log: list[dict] = field(default_factory=list)
     dialogs: list[dict] = field(default_factory=list)
+    # Issue #90: path of the recorded run video (<run_dir>/video.webm),
+    # "" when video recording was off or failed (a video failure never
+    # fails the run, per the diff-artifact convention in SPEC.md).
+    video_path: str = ""
 
     @property
     def duration_ms(self) -> int:
@@ -85,7 +89,8 @@ class RunResult:
                    bad_responses=d.get("bad_responses", []),
                    network_log=d.get("network_log", []),
                    dialogs=d.get("dialogs", []),
-                   run_dir=d.get("run_dir", ""), error=d.get("error", ""))
+                   run_dir=d.get("run_dir", ""), error=d.get("error", ""),
+                   video_path=d.get("video_path", ""))
 
     def to_dict(self) -> dict:
         return {
@@ -119,6 +124,7 @@ class RunResult:
             "network_log": self.network_log,
             "dialogs": self.dialogs,
             "run_dir": self.run_dir,
+            "video_path": self.video_path,
         }
 
 
@@ -960,6 +966,7 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
              baseline_update: bool = False,
              upload_dir: str | None = None,
              initial_vars: dict | None = None,
+             video: bool | None = None,
              ) -> RunResult:
     """Execute the flow. Never raises for flow failures; raises only on harness errors.
 
@@ -968,6 +975,8 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     initial_vars: issue #88 — seed map for the run-scoped variable table
     (one matrix combination); copied, never aliased. A ${name} ref in the
     target matching a seed name is interpolated from the combination.
+    video: issue #90 — record the run as video.webm in run_dir. True/False
+    forces on/off; None (default) takes the spec's `video:` top-level.
     """
     from playwright.sync_api import sync_playwright
 
@@ -990,6 +999,9 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
     # the run must never mutate the caller's combination map).
     variables: dict = dict(initial_vars) if initial_vars else {}
     status, failed_step, run_error = "passed", None, ""
+    # Issue #90: CLI --video overrides the spec's `video:` top-level.
+    record_video = spec.video if video is None else video
+    video_path = ""
     shot_policy = _screenshot_policy(spec)
     ax_on_failure = spec.artifacts.get("ax_snapshot", "on-failure") == "on-failure"
     deadline = started + spec.timeouts.get("run_ms", 300000) / 1000
@@ -1006,7 +1018,13 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
             launch_kw["executable_path"] = executable_path
         browser = pw.chromium.launch(**launch_kw)
         try:
-            ctx = browser.new_context(viewport=spec.viewport)
+            if record_video:
+                ctx = browser.new_context(
+                    viewport=spec.viewport,
+                    record_video_dir=os.path.join(run_dir, "video"),
+                    record_video_size=spec.viewport)
+            else:
+                ctx = browser.new_context(viewport=spec.viewport)
             if spec.artifacts.get("trace"):
                 ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
             page = ctx.new_page()
@@ -1112,6 +1130,18 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
             if spec.artifacts.get("trace"):
                 ctx.tracing.stop(path=os.path.join(run_dir, "trace.zip"))
             ctx.close()
+            # Issue #90: collect the recorded video (page.video is saved
+            # only once the context closes). A video failure must never
+            # fail the run — the diff-artifact convention in SPEC.md.
+            if record_video:
+                try:
+                    src = page.video.path() if page.video else None
+                    if src:
+                        dst = os.path.join(run_dir, "video.webm")
+                        os.replace(src, dst)
+                        video_path = dst
+                except Exception:
+                    pass
         finally:
             browser.close()
 
@@ -1126,7 +1156,8 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                         bad_responses=collectors.bad_responses,
                         network_log=collectors.network_log,
                         dialogs=collectors.dialogs,
-                        run_dir=run_dir, error=run_error).to_dict())
+                        run_dir=run_dir, error=run_error,
+                        video_path=video_path).to_dict())
     return RunResult(flow_name=spec.name, target=target, status=status,
                      started=started, ended=ended, steps=steps,
                      failed_step=failed_step,
@@ -1136,4 +1167,5 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                      bad_responses=collectors.bad_responses,
                      network_log=collectors.network_log,
                      dialogs=collectors.dialogs,
-                     run_dir=run_dir, error=run_error)
+                     run_dir=run_dir, error=run_error,
+                     video_path=video_path)

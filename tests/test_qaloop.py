@@ -6234,6 +6234,213 @@ def test_issue_89_flow_tags_batch():
               str(bj[0]))
 
 
+def test_issue_90_video_recording():
+    """Issue #90: video recording per run.
+
+    Loader: video: true accepted, default False, non-bool rejected with
+    SpecError. run_flow: new_context gets record_video_dir/record_video_size
+    when enabled, not when off; the fake page.video file is moved to
+    <run_dir>/video.webm and result.video_path is set; a video failure
+    never fails the run. to_dict/from_dict round-trip keeps video_path.
+    CLI: verify --video parses. Report: header and failing-step sections
+    link the video.
+    """
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.runner import run_flow, RunResult, StepResult
+    from qaloop.report import write_report
+    import playwright.sync_api as pw_sync
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def mkflow(video_line):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            write(f.name,
+                  "name: v\ntarget: http://h\n" + video_line +
+                  "artifacts: {screenshot: none, trace: false}\n"
+                  "steps:\n  - name: s\n    wait_ms: 1\n")
+            spec = load_spec(f.name)
+            os.unlink(f.name)
+        return spec
+
+    # --- loader ---
+    spec_v = mkflow("video: true\n")
+    check("video: true accepted", spec_v.video is True, str(spec_v.video))
+    spec_no = mkflow("")
+    check("video defaults to False", spec_no.video is False,
+          str(spec_no.video))
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                     delete=False) as f:
+        write(f.name, "name: v\ntarget: http://h\nvideo: \"yes\"\n"
+                      "steps:\n  - name: s\n    wait_ms: 1\n")
+        try:
+            load_spec(f.name)
+            bad = None
+        except SpecError as e:
+            bad = str(e)
+        finally:
+            os.unlink(f.name)
+    check("video: 'yes' rejected with SpecError",
+          bad is not None and "video must be a bool" in bad, str(bad))
+
+    # --- faked browser ---
+    ctx_kwargs = []
+    page_holder = {}
+
+    class FakeVideo:
+        def __init__(self, path):
+            self._path = path
+
+        def path(self):
+            return self._path
+
+    class BrokenVideo:
+        def path(self):
+            raise RuntimeError("video gone")
+
+    class FakePage:
+        def on(self, event, handler):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeCtx:
+        def new_page(self):
+            return page_holder["page"]
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            ctx_kwargs.append(kw)
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        # video on: recording kwargs passed, file collected
+        with tempfile.TemporaryDirectory() as run_dir:
+            os.makedirs(os.path.join(run_dir, "video"))
+            src = os.path.join(run_dir, "video", "fake.webm")
+            with open(src, "wb") as f:
+                f.write(b"FAKEVIDEO")
+            page = FakePage()
+            page.video = FakeVideo(src)
+            page_holder["page"] = page
+            result = run_flow(spec_v, run_dir=run_dir, video=True)
+            check("video run passes", result.status == "passed",
+                  result.status)
+            check("record_video_dir passed to new_context",
+                  ctx_kwargs[-1].get("record_video_dir")
+                  == os.path.join(run_dir, "video"),
+                  str(ctx_kwargs[-1]))
+            check("record_video_size passed to new_context",
+                  ctx_kwargs[-1].get("record_video_size")
+                  == {"width": 1280, "height": 800},
+                  str(ctx_kwargs[-1]))
+            dst = os.path.join(run_dir, "video.webm")
+            check("video.webm moved into run dir",
+                  os.path.isfile(dst)
+                  and open(dst, "rb").read() == b"FAKEVIDEO",
+                  str(os.listdir(run_dir)))
+            check("result.video_path set",
+                  result.video_path == dst, result.video_path)
+            rt = RunResult.from_dict(result.to_dict())
+            check("video_path survives to_dict/from_dict",
+                  rt.video_path == dst, rt.video_path)
+            paths = write_report(result, spec_v, run_dir)
+            body = open(paths["report_md"]).read()
+            check("report header links video",
+                  "Video: `video.webm`" in body, body[:400])
+
+        # spec video: true is honored without the kwarg (default None)
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page.video = None  # no recording happened
+            page_holder["page"] = page
+            ctx_kwargs.clear()
+            result = run_flow(spec_v, run_dir=run_dir)
+            check("spec video: true flows through",
+                  "record_video_dir" in ctx_kwargs[-1],
+                  str(ctx_kwargs[-1]))
+            check("no video file -> video_path stays empty",
+                  result.video_path == ""
+                  and not os.path.exists(
+                      os.path.join(run_dir, "video.webm")),
+                  result.video_path)
+
+        # video off: no recording kwargs
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page_holder["page"] = page
+            ctx_kwargs.clear()
+            result = run_flow(spec_no, run_dir=run_dir)
+            check("no record_video_dir when video off",
+                  "record_video_dir" not in ctx_kwargs[-1],
+                  str(ctx_kwargs[-1]))
+            check("video off -> video_path empty",
+                  result.video_path == "", result.video_path)
+
+        # a video failure never fails the run
+        with tempfile.TemporaryDirectory() as run_dir:
+            page = FakePage()
+            page.video = BrokenVideo()
+            page_holder["page"] = page
+            result = run_flow(spec_v, run_dir=run_dir, video=True)
+            check("broken video does not fail the run",
+                  result.status == "passed"
+                  and result.video_path == "",
+                  f"{result.status} {result.video_path!r}")
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+    # --- failing-step report links the video ---
+    with tempfile.TemporaryDirectory() as run_dir:
+        dst = os.path.join(run_dir, "video.webm")
+        with open(dst, "wb") as f:
+            f.write(b"FAKEVIDEO")
+        fr = RunResult(
+            flow_name="v", target="http://h", status="failed",
+            started=0.0, ended=1.0,
+            steps=[StepResult(0, "steps", "s", "goto", "failed", 5,
+                              error="boom")],
+            failed_step=0, console_errors=[], page_errors=[],
+            failed_requests=[], bad_responses=[], run_dir=run_dir,
+            video_path=dst)
+        paths = write_report(fr, spec_v, run_dir)
+        body = open(paths["report_md"]).read()
+        check("failing step section links video",
+              "## Failing step" in body
+              and "Video: `video.webm`" in body, body[-400:])
+
+    # --- CLI flag ---
+    from qaloop.cli import build_parser
+    a = build_parser().parse_args(["verify", "--video", "flows/x.yaml"])
+    check("verify --video parses", a.video is True, str(a.video))
+    a = build_parser().parse_args(["verify", "flows/x.yaml"])
+    check("verify --video defaults off", a.video is False, str(a.video))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

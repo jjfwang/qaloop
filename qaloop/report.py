@@ -48,6 +48,10 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
         f"- steps: {sum(1 for s in result.steps if s.status == 'passed')}"
         f"/{len(result.steps)} passed",
         f"- run dir: `{run_dir}`",
+    ]
+    if result.video_path:
+        lines.append(f"Video: `{_rel(run_dir, result.video_path)}`")
+    lines += [
         "",
         "## Steps",
         "",
@@ -83,6 +87,8 @@ def write_report(result: RunResult, spec: FlowSpec, run_dir: str,
             lines.append(f"Screenshot: `{_rel(run_dir, s.artifacts.screenshot)}`")
         if s.artifacts.ax_snapshot:
             lines.append(f"AX snapshot: `{_rel(run_dir, s.artifacts.ax_snapshot)}`")
+        if result.video_path:
+            lines.append(f"Video: `{_rel(run_dir, result.video_path)}`")
         lines.append("")
 
     def _section(title: str, items: list[dict], fmt) -> None:

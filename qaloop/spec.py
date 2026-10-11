@@ -127,6 +127,10 @@ class FlowSpec:
     # Issue #83: opt-in request-body recording. Default False keeps the
     # network_log schema and privacy posture unchanged (SPEC.md).
     record_bodies: bool = False
+    # Issue #90: opt-in video recording of the run. Default False keeps
+    # the privacy-by-default posture (videos are large). Saved as
+    # <run_dir>/video.webm (see SPEC.md).
+    video: bool = False
 
 
 # Issue #89: flow tags for batch selection. A tag starts with an
@@ -1100,6 +1104,11 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     if not isinstance(record_bodies, bool):
         raise SpecError(
             f"{where}: record_bodies must be a bool, got {record_bodies!r}")
+    # Issue #90: opt-in video recording. Must be a real bool (there is no
+    # unknown-top-level-key guard, so validate explicitly).
+    video = raw.get("video", False)
+    if not isinstance(video, bool):
+        raise SpecError(f"{where}: video must be a bool, got {video!r}")
     # Issue #89: flow tags for batch selection (validated explicitly —
     # there is no unknown-top-level-key guard).
     tags = _validate_tags(raw.get("tags"), where)
@@ -1155,6 +1164,7 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
         source_path=path,
         services=_validate_services(raw.get("services"), where),
         record_bodies=record_bodies,
+        video=video,
         matrix=matrix,
         tags=tags,
     )

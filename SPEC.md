@@ -705,6 +705,15 @@ Every `verify`/`worker` run writes into `runs/<id>/`:
   capped at 5000 chars (`null` when the request had no body). The key is
   absent entirely when `record_bodies` is not `true`, so the default log
   schema is unchanged.
+- `video.webm` — screen recording of the whole run (Playwright
+  `record_video`). Opt-in: recorded only when the flow sets the top-level
+  `video: true` (must be a bool, default `false`) or the run passes the
+  `--video` CLI flag (the flag forces recording on even when the spec is
+  `false`; it cannot force it off when the spec is `true`). Privacy by
+  default, like `record_bodies`: videos are large, so nothing is recorded
+  unless asked. The video is linked in `REPORT.md`'s header summary block
+  and, on failure, next to the Screenshot/AX snapshot in the "Failing
+  step" section. A video failure never fails the run by itself.
 
   `network_calls` (assertion) counts entries in this log whose `url` contains
   the given url substring — including mock-served responses, which appear in
