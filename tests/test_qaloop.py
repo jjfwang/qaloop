@@ -7512,6 +7512,175 @@ def test_seed_http_headers_and_status():
           str(d2["steps"][0].get("seed_status")))
 
 
+def test_issue_97_step_screenshot_override():
+    from qaloop.spec import load_spec, SpecError
+    from qaloop.runner import _should_screenshot, run_flow
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    base = ("name: t\ntarget: http://x\nsteps:\n"
+            "  - name: s\n    click: '#go'\n    screenshot: always\n")
+    s = load(base)
+    check("screenshot: always parses", s.steps[0].screenshot == "always",
+          s.steps[0].screenshot)
+    for val in ("never", "on-failure"):
+        got = load(base.replace("screenshot: always",
+                                f"screenshot: {val}")).steps[0].screenshot
+        check(f"screenshot: {val} parses", got == val, got)
+    plain = base.replace("    screenshot: always\n", "")
+    check("screenshot absent -> None",
+          load(plain).steps[0].screenshot is None)
+    for bad, label in [
+        (base.replace("screenshot: always", "screenshot: sometimes"),
+         "bad value"),
+        (base.replace("screenshot: always", "screenshot: true"),
+         "bool value"),
+        (base.replace("screenshot: always", "screenshot: 2"),
+         "int value"),
+        (base.replace("screenshot: always", "screenshot_typo: always"),
+         "unknown key"),
+    ]:
+        try:
+            load(bad)
+            check(f"screenshot {label} rejected", False, "no SpecError")
+        except SpecError:
+            check(f"screenshot {label} rejected", True)
+
+    # --- _should_screenshot decision table ---
+    for step_ss, policy, status, want in [
+        ("always", "on-failure", "passed", True),
+        ("always", "none", "failed", True),
+        ("never", "per-step", "passed", False),
+        ("never", "on-failure", "failed", False),
+        ("on-failure", "per-step", "passed", False),
+        ("on-failure", "per-step", "failed", True),
+        (None, "per-step", "passed", True),
+        (None, "per-step", "failed", True),
+        (None, "on-failure", "passed", False),
+        (None, "on-failure", "failed", True),
+        (None, "none", "passed", False),
+        (None, "none", "failed", False),
+    ]:
+        got = _should_screenshot(step_ss, policy, status)
+        check(f"_should_screenshot({step_ss!r},{policy},{status})={want}",
+              got is want, str(got))
+
+    # --- run_flow with a faked browser: override drives the capture ---
+    import playwright.sync_api as pw_sync
+
+    shots = []
+
+    class FakePage97:
+        def on(self, event, handler):
+            pass
+
+        def evaluate(self, js):
+            return ""
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            if selector == "#missing":
+                raise TimeoutError("selector never attached")
+
+        def screenshot(self, path):
+            shots.append(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"png")
+
+    class FakeCtx97:
+        def new_page(self):
+            return FakePage97()
+
+        def close(self):
+            pass
+
+    class FakeBrowser97:
+        def new_context(self, **kw):
+            return FakeCtx97()
+
+        def close(self):
+            pass
+
+    class FakePW97:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser97()
+
+    class FakePWCM97:
+        def __enter__(self):
+            return FakePW97()
+
+        def __exit__(self, *a):
+            return False
+
+    body = (
+        "name: s97\ntarget: http://h\n"
+        "steps:\n"
+        "  - name: always shoots on success\n"
+        "    wait_ms: 1\n"
+        "    screenshot: always\n"
+        "  - name: inherits flow policy on success\n"
+        "    wait_ms: 1\n"
+        "  - name: never suppresses on failure\n"
+        "    wait_ms: 1\n"
+        "    screenshot: never\n"
+        "    continue_on_fail: true\n"
+        "    expect:\n"
+        "      visible: '#missing'\n"
+        "  - name: on-failure shoots on failure\n"
+        "    wait_ms: 1\n"
+        "    screenshot: on-failure\n"
+        "    continue_on_fail: true\n"
+        "    expect:\n"
+        "      visible: '#missing'\n"
+        "  - name: inherits flow policy on failure\n"
+        "    wait_ms: 1\n"
+        "    continue_on_fail: true\n"
+        "    expect:\n"
+        "      visible: '#missing'\n"
+        "artifacts: {screenshot: on-failure, ax_snapshot: none, "
+        "trace: false}\n"
+    )
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM97()
+    try:
+        with tempfile.TemporaryDirectory() as run_dir:
+            spec = load(body)
+            result = run_flow(spec, run_dir=run_dir)
+            want = [os.path.join(run_dir, "steps", f"steps-0{i}.png")
+                    for i in (0, 3, 4)]
+            failed = [r for r in result.steps if r.status == "failed"]
+            check("run passes with three failed steps",
+                  result.status == "passed" and len(result.steps) == 5
+                  and len(failed) == 3,
+                  f"{result.status} {[r.status for r in result.steps]}")
+            check("always shoots on success", want[0] in shots, str(shots))
+            check("inherited policy skips success",
+                  os.path.join(run_dir, "steps", "steps-01.png") not in shots,
+                  str(shots))
+            check("never suppresses on failure",
+                  os.path.join(run_dir, "steps", "steps-02.png") not in shots,
+                  str(shots))
+            check("on-failure shoots on failure", want[1] in shots,
+                  str(shots))
+            check("inherited on-failure shoots on failure", want[2] in shots,
+                  str(shots))
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
