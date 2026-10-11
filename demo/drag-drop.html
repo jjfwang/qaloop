@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Drag demo</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  #card {
+    position: fixed; left: 100px; top: 100px; width: 120px; height: 80px;
+    background: #4f8ff7; color: #fff; border-radius: 8px; cursor: grab;
+    display: flex; align-items: center; justify-content: center;
+    user-select: none;
+  }
+  #dropzone {
+    position: fixed; left: 600px; top: 100px; width: 200px; height: 160px;
+    border: 2px dashed #888; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #drop-status { position: fixed; left: 100px; top: 220px; }
+  #track {
+    position: fixed; left: 100px; top: 360px; width: 300px; height: 8px;
+    background: #ddd; border-radius: 4px;
+  }
+  #handle {
+    position: absolute; left: 0; top: -8px; width: 20px; height: 24px;
+    background: #333; border-radius: 4px; cursor: grab; user-select: none;
+  }
+  #vol-value { position: fixed; left: 420px; top: 352px; }
+</style>
+</head>
+<body>
+  <h1>Drag demo</h1>
+  <div id="card" data-draggable>Card</div>
+  <div id="dropzone">Drop here</div>
+  <div role="status" id="drop-status"></div>
+  <div id="track"><div id="handle" data-draggable></div></div>
+  <span>Volume: <span id="vol-value">0</span></span>
+
+  <script>
+    let dragging = null;
+    document.addEventListener("mousedown", (e) => {
+      const el = e.target.closest("[data-draggable]");
+      if (!el) return;
+      e.preventDefault();
+      dragging = {el: el, dx: e.clientX - el.getBoundingClientRect().left,
+                  dy: e.clientY - el.getBoundingClientRect().top};
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      if (dragging.el.id === "handle") {
+        const r = document.getElementById("track").getBoundingClientRect();
+        let x = e.clientX - r.left - 10; // handle half-width
+        x = Math.max(0, Math.min(r.width - 20, x));
+        dragging.el.style.left = x + "px";
+        document.getElementById("vol-value").textContent =
+          Math.round(x / (r.width - 20) * 100);
+      } else {
+        dragging.el.style.left = (e.clientX - dragging.dx) + "px";
+        dragging.el.style.top = (e.clientY - dragging.dy) + "px";
+      }
+    });
+    document.addEventListener("mouseup", (e) => {
+      if (!dragging) return;
+      const el = dragging.el;
+      dragging = null;
+      if (el.id === "card") {
+        const dz = document.getElementById("dropzone").getBoundingClientRect();
+        if (e.clientX >= dz.left && e.clientX <= dz.right &&
+            e.clientY >= dz.top && e.clientY <= dz.bottom) {
+          document.getElementById("drop-status").textContent = "dropped: card";
+        }
+      }
+    });
+  </script>
+</body>
+</html>

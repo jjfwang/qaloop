@@ -277,6 +277,19 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
         from qaloop.upload import check_upload_path
         checked = check_upload_path(p["path"], upload_dir)
         page.locator(p["target"]).set_input_files(checked, timeout=t)
+    elif op == "drag":
+        src = page.locator(p["target"])
+        to = p["to"]
+        if isinstance(to, str):
+            src.drag_to(page.locator(to), timeout=t)
+        else:
+            # Playwright 1.63's drag_to takes only a Locator, so the coords
+            # form drives the mouse directly: mousedown on the source, move
+            # to the page coordinates, mouseup to drop.
+            src.hover(timeout=t)
+            page.mouse.down()
+            page.mouse.move(to["x"], to["y"], steps=10)
+            page.mouse.up()
     elif op == "wait":
         params = p or {}
         sel = params.get("target")
