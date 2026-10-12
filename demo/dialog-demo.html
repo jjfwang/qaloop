@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dialog demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <h1>JS dialog demo</h1>
+
+  <button id="alert-btn" type="button">Show alert</button>
+  <p class="result" id="alert-result"></p>
+
+  <button id="confirm-btn" type="button">Ask for confirmation</button>
+  <p class="result" id="confirm-result"></p>
+
+  <button id="prompt-btn" type="button">Ask for input</button>
+  <p class="result" id="prompt-result"></p>
+
+<script>
+document.getElementById('alert-btn').addEventListener('click', () => {
+  alert('This is a demo alert');
+  document.getElementById('alert-result').textContent = 'alert acknowledged';
+});
+document.getElementById('confirm-btn').addEventListener('click', () => {
+  const ok = confirm('Delete this item?');
+  document.getElementById('confirm-result').textContent =
+    ok ? 'confirmed' : 'cancelled';
+});
+document.getElementById('prompt-btn').addEventListener('click', () => {
+  const value = prompt('Enter your name:');
+  document.getElementById('prompt-result').textContent =
+    'prompt answered with ' + JSON.stringify(value);
+});
+</script>
+</body>
+</html>
