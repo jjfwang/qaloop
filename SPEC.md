@@ -764,6 +764,92 @@ Semantics, verified against `qaloop/cli.py` (`cmd_validate`):
   touches the network. `verify` re-validates at runtime against the real
   environment.
 
+## `qaloop verify`: the primary run command
+
+`python3 -m qaloop.cli verify <flow.yaml>` (the `qaloop verify`
+spelling used elsewhere in this spec) boots the flow's declared
+services, runs the steps against a target, and writes the run artifacts
+into a fresh run dir. It is the framework's primary entry point. The
+flow positional accepts a single flow YAML or a directory of flow
+YAMLs; directory runs are covered under [Batch verification](#batch-verification--verify-dir).
+
+Semantics, verified against `qaloop/cli.py` (`cmd_verify`):
+
+### Flags
+
+- `--target <url>`: overrides the spec's target for this run. Without
+  the flag, the flow's declared target is used.
+- `--tag T` (repeatable): only runs flows carrying the tag. OR
+  semantics, exact case-sensitive match. With a single flow file that
+  does not carry the tag, `verify` prints
+  `SKIP: <flow> does not carry tag(s) [...] (flow tags: [...])` and
+  exits 2. Batch-mode selection is documented under Batch verification.
+- `--headed`: show the browser. Default is headless.
+- `--upload-dir <dir>` (env `QALOOP_UPLOAD_DIR`): the allowlist file
+  uploads are restricted to. The flag wins when both are set; when
+  neither is declared, the runner is fail-closed (issue #76) — the same
+  shared guard (`qaloop.upload.check_upload_path`) referenced under
+  Perform's Upload-dir restriction.
+- `--executable-path <path>`: chromium executable (default:
+  playwright's bundled chromium).
+- `--investigate`: on a failed single-flow run, summon the agentic
+  investigator (`qaloop.investigate` module). Requires both the flag
+  and the flow's `investigate_on_failure: true` (the spec default). Not
+  applied in batch mode — `verify` prints
+  `note: --investigate is not applied in batch mode` — and not per
+  combination in matrix mode. A diagnosis appends a `kind: "investigation"`
+  ledger entry (model, tokens in/out, estimated cost).
+- `--max-investigation-actions N`: cap on investigator actions. Default
+  `None` — falls back to the flow's `max_investigation_actions` (spec
+  default 20).
+- `--video`: record the run as `video.webm` in the run dir (issue #90;
+  opt-in, default off).
+- `--keep-runs N` (env `QALOOP_KEEP_RUNS`): keep at most the N newest
+  run dirs; the flag wins. Default 0 = keep everything. Negative values
+  print `ERROR: ...` and exit 2. See [Run artifacts](#run-artifacts)
+  for the retention semantics. Pruning prints
+  `pruned <n> old run dir(s) (--keep-runs <N>)`.
+
+### Single-flow execution order
+
+1. `--keep-runs` resolves first; an invalid value prints `ERROR: {e}`
+   and exits 2 before anything runs.
+2. The flow's `services:` are light-parsed (no env substitution). A
+   parse failure prints `INVALID SPEC: {e}` and exits 2.
+3. A run dir `<runs>/YYYYMMDDTHHMMSSZ-<flow-name>` is created under the
+   `QALOOP_RUNS` env var, or `<repo>/runs` by default. `verify` prints
+   `run dir: <run_dir>` and `target:  <target>`.
+4. Declared services are booted and, in a `finally`, torn down. A boot
+   failure (only `TimeoutError`, `RuntimeError`, or `ValueError`) prints
+   `SERVICE BOOT FAILED: <Type>: <message>` and exits 3.
+5. A flow with `matrix:` runs in matrix mode: one combination per
+   subdir `<run_dir>/matrix/<NN>-<combo-slug>/`, each with its own
+   `run.json` and `REPORT.md`, and a combined summary in the parent
+   `REPORT.md`. Exit 0 iff every combination passed.
+6. Otherwise `run_flow` executes the steps, `write_report` writes
+   `REPORT.md` (plus `run.json`, `junit.xml`, `network.jsonl` per
+   [Run artifacts](#run-artifacts)), `verify` prints the step summary
+   and `report: <report_md>`, and a `kind: "scripted"` ledger entry is
+   appended (`cost_usd_est: 0.0`; matrix runs append
+   `kind: "scripted-matrix"`).
+7. If the run failed and both `--investigate` and
+   `investigate_on_failure` are on, `verify` prints
+   `step failed — summoning investigator...` and runs the investigation.
+
+### Exit-code contract
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | the flow passed (single, matrix, and batch modes: every flow passed) |
+| 1 | at least one step failed, or (batch) at least one flow failed |
+| 2 | `INVALID SPEC` at any stage (services light-parse or spec load), a `--tag` skip on a single file, an empty batch selection, or a bad `--keep-runs` value |
+| 3 | `SERVICE BOOT FAILED` — a declared service failed to boot |
+
+`INVALID SPEC` and `SERVICE BOOT FAILED` are exit 2/3 in single-flow
+mode, but recorded as per-flow failures (exit 1 or 0 overall) in batch
+mode — batch resilience is a deliberate deviation, see Batch
+verification.
+
 ## Run artifacts
 
 Every `verify`/`worker` run writes into `runs/<id>/`:
