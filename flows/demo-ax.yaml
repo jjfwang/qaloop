@@ -1,0 +1,42 @@
+name: demo-ax
+description: >-
+  Browser proof for the ax user-centric accessibility assertions (issue #152,
+  shipped in PR #104): role+name match on a visible control, state: hidden on
+  a hidden dialog, state change after interaction (dialog revealed, then
+  closed again), and a negative control whose wrong accessible name fails
+  with the ax assertion named in the report.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the ax demo page
+    goto: /demo/ax-demo.html
+
+steps:
+  - name: visible button matches role and accessible name
+    expect:
+      - ax: {role: button, name: "Save profile"}
+
+  - name: hidden dialog matches state hidden
+    expect:
+      - ax: {role: dialog, name: "Confirm delete", state: hidden}
+
+  - name: clicking show reveals the dialog
+    click: "#show-btn"
+    expect:
+      - ax: {role: dialog, name: "Confirm delete", state: visible}
+
+  - name: negative control with a wrong name fails naming the ax assertion
+    continue_on_fail: true
+    expect:
+      - ax: {role: button, name: "No such control"}
+
+  - name: closing hides the dialog again
+    click: "#close-btn"
+    expect:
+      - ax: {role: dialog, name: "Confirm delete", state: hidden}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
