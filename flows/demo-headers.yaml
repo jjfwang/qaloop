@@ -1,0 +1,47 @@
+name: demo-headers
+description: >-
+  Browser proof for the seed HTTP headers option and the network_calls
+  response-status filter (issue #142, shipped in PR #120): the proof server
+  records the headers of a seeded GET to /api/echo-headers, a network mock
+  overrides a response header, and the status filter narrows the recorded
+  network log by response status.
+target: ${TARGET_URL}
+
+setup:
+  - name: seed a GET with a custom header to the echo endpoint
+    seed:
+      http:
+        url: ${TARGET_URL}/api/echo-headers
+        method: GET
+        headers: {X-Tenant: t1}
+  - name: mock the greeting API with an overridden response header
+    mock: {url: "**/api/greeting", json: {greeting: "mocked hello"}, headers: {X-Mock-Header: mocked-value}}
+  - name: open the headers demo page
+    goto: /demo/header-demo.html
+
+steps:
+  - name: the page sees the header the seed request sent
+    click: "#seed-check-btn"
+    expect:
+      - text_contains: {selector: "#seed-result", text: "t1"}
+      - network_calls: {url: "/api/last-headers", status: {equals: 200}, equals: 1}
+
+  - name: the mocked response header override is honored
+    click: "#mock-check-btn"
+    expect:
+      - text_contains: {selector: "#mock-result", text: "mocked-value"}
+      - mock_calls: {url: "**/api/greeting", equals: 1}
+      - network_calls: {url: "/api/greeting", status: {equals: 200}, equals: 1}
+
+  - name: the failing endpoint is recorded with its 404 status
+    click: "#fail-btn"
+    expect:
+      - text_contains: {selector: "#fail-result", text: "got 404"}
+      - network_calls: {url: "/api/nope", status: {equals: 404}, equals: 1}
+      - network_calls: {url: "/api/nope", status: {equals: 200}, equals: 0}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
