@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Element state - qaloop demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; max-width: 560px; }
+  .row { margin: 18px 0; }
+  label { display: block; margin-bottom: 6px; font-size: 14px; color: #444; }
+  input { padding: 8px 12px; font-size: 16px; width: 280px; }
+  button { padding: 8px 16px; font-size: 15px; margin-right: 8px; }
+  .chip { display: inline-block; padding: 4px 12px; border-radius: 12px; background: #eee; }
+  .chip.active { background: #d4edda; }
+  #submit[aria-disabled="true"] { opacity: 0.5; }
+</style>
+</head>
+<body>
+  <h1>Element state demo</h1>
+
+  <div class="row">
+    <label>Submit (aria-disabled flips to false after async validation)</label>
+    <button id="submit" aria-disabled="true">Submit</button>
+    <button id="validate">Validate</button>
+    <span id="badge" class="chip idle">unvalidated</span>
+  </div>
+
+  <div class="row">
+    <label for="email">Email (mask button transforms the live value)</label>
+    <input id="email" type="text" placeholder="type an email">
+    <button id="mask">Mask</button>
+  </div>
+
+  <div class="row">
+    <label for="search">Search (press "/" anywhere to focus)</label>
+    <input id="search" type="text" placeholder="press / to focus me">
+  </div>
+
+<script>
+  // Async validation: flips aria-disabled and the badge class after 2s.
+  document.getElementById("validate").addEventListener("click", () => {
+    setTimeout(() => {
+      document.getElementById("submit").setAttribute("aria-disabled", "false");
+      const badge = document.getElementById("badge");
+      badge.className = "chip active";
+      badge.textContent = "validated";
+    }, 2000);
+  });
+
+  // Masked transform: mutates the live input value after 1.2s.
+  document.getElementById("mask").addEventListener("click", () => {
+    const email = document.getElementById("email");
+    setTimeout(() => {
+      const parts = email.value.split("@");
+      email.value = parts.length === 2 ? parts[0].charAt(0) + "***@" + parts[1] : email.value;
+    }, 1200);
+  });
+
+  // Keyboard shortcut: "/" focuses the search field after 800ms.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "/" && document.activeElement !== document.getElementById("search")) {
+      e.preventDefault();
+      setTimeout(() => document.getElementById("search").focus(), 800);
+    }
+  });
+</script>
+</body>
+</html>
