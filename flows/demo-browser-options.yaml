@@ -1,0 +1,60 @@
+name: demo-browser-options
+description: >-
+  Browser proof for the top-level browser: block (issue #148, shipped in
+  PR #123 / issue #122): the declared context options actually reach the
+  live Playwright browser context. A fixture page echoes navigator.userAgent,
+  navigator.language, the Intl time zone, window.devicePixelRatio,
+  prefers-color-scheme, and touch support; the flow declares a non-default
+  set in browser: and asserts each echoed value. is_mobile is declared
+  nowhere on purpose: navigator.userAgentData is not exposed in the headless
+  shell, so it has no stable in-page signal to assert (verified by probe).
+target: ${TARGET_URL}
+
+browser:
+  user_agent: "qaloop-browser-options-demo/1.0 context-proof"
+  locale: de-DE
+  timezone_id: America/New_York
+  device_scale_factor: 2
+  color_scheme: dark
+  has_touch: true
+
+setup:
+  - name: open the browser-options demo page
+    goto: /demo/browser-options-demo.html
+
+steps:
+  - name: user_agent reaches the context
+    click: "#ua-btn"
+    expect:
+      - text_contains: {selector: "#ua-result", text: "qaloop-browser-options-demo/1.0 context-proof"}
+
+  - name: locale reaches the context
+    click: "#locale-btn"
+    expect:
+      - text_contains: {selector: "#locale-result", text: "de-DE"}
+
+  - name: timezone_id reaches the context
+    click: "#tz-btn"
+    expect:
+      - text_contains: {selector: "#tz-result", text: "America/New_York"}
+
+  - name: device_scale_factor reaches the context
+    click: "#dsf-btn"
+    expect:
+      - text_matches: {selector: "#dsf-result", pattern: "^2$"}
+
+  - name: color_scheme dark reaches the context
+    click: "#scheme-btn"
+    expect:
+      - text_matches: {selector: "#scheme-result", pattern: "^dark$"}
+
+  - name: has_touch reaches the context
+    click: "#touch-btn"
+    expect:
+      - text_matches: {selector: "#touch-result", pattern: "^touch$"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
