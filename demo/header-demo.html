@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>header demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>HTTP headers demo</h1>
+
+  <button id="seed-check-btn" type="button">Show headers the seed request sent</button>
+  <p class="result" id="seed-result"></p>
+
+  <button id="mock-check-btn" type="button">Show the mocked response header</button>
+  <p class="result" id="mock-result"></p>
+
+  <button id="fail-btn" type="button">Request the missing endpoint</button>
+  <p class="result" id="fail-result"></p>
+
+<script>
+document.getElementById('seed-check-btn').addEventListener('click', () => {
+  fetch('/api/last-headers')
+    .then(r => r.json())
+    .then(h => { document.getElementById('seed-result').textContent = JSON.stringify(h); })
+    .catch(e => { document.getElementById('seed-result').textContent = 'error: ' + e; });
+});
+document.getElementById('mock-check-btn').addEventListener('click', () => {
+  fetch('/api/greeting')
+    .then(r => { document.getElementById('mock-result').textContent = r.headers.get('x-mock-header') || '(no x-mock-header)'; return r.json(); })
+    .catch(e => { document.getElementById('mock-result').textContent = 'error: ' + e; });
+});
+document.getElementById('fail-btn').addEventListener('click', () => {
+  fetch('/api/nope')
+    .then(r => { document.getElementById('fail-result').textContent = 'got ' + r.status; })
+    .catch(e => { document.getElementById('fail-result').textContent = 'error: ' + e; });
+});
+</script>
+</body>
+</html>
