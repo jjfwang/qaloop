@@ -1219,8 +1219,9 @@ recorded in `perform.json`, `PERFORM.md`, and the ledger.
 ### Action set and targeting
 
 Each turn the model replies with exactly one JSON action (temperature
-0.2, max_tokens 1200 per call); a non-JSON reply is re-prompted once and
-does not consume an action. The actions are:
+0.2, max_tokens 1200 per call); a non-JSON reply is re-prompted once —
+no action record is added, though the turn still counts against the
+`max_actions` loop budget. The actions are:
 
 `navigate`, `click`, `dblclick`, `fill`, `press`, `select`,
 `check`/`uncheck`, `hover`, `scroll`, `wait`, `screenshot`, `console`,
