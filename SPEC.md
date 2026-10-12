@@ -866,6 +866,37 @@ exactly `"passed"`; corrupt or fieldless entries are tolerated and
 simply count as failures. The table shows recent flakiness per flow
 without opening every report.
 
+## `qaloop doctor`: environment self-check
+
+`python3 -m qaloop.cli doctor` self-checks the environment so a run never
+fails cryptically — the same traps that keep biting this loop's own
+lessons (broken chromium install, missing ffmpeg). It takes no arguments
+and never launches a browser.
+
+The four checks run in this order, one PASS/FAIL line per check:
+
+1. `chromium` — resolves the chromium executable the same way `verify`
+   does (`runner.py`: the `QALOOP_EXECUTABLE_PATH` env var wins when set,
+   falling back to Playwright's default). When the env var is set but
+   points at a missing file, that is a FAIL. Only the `executable_path`
+   property is read — no browser process starts. A FAIL names the fix
+   (`python3 -m playwright install chromium`).
+2. `ffmpeg` — `ffmpeg` must be on PATH. A FAIL, not a warning:
+   `verify --video` records `video.webm` and cannot record without it.
+3. `python` — the `yaml` and `playwright` Python packages must be
+   importable.
+4. `demo` — the fixtures the documented demo proof needs must be present
+   in the checkout's `demo/` directory: `mock-demo.html`,
+   `demo-login.html`, `demo-a11y.html`, `cookie-storage.html`.
+
+Output: one `PASS <name>: <detail>` or `FAIL <name>: <detail>` line per
+check, then a machine-readable summary line of the form
+`doctor: chromium=PASS ffmpeg=PASS python=PASS demo=PASS`.
+
+Exit codes: 0 when every check passes, 2 on any FAIL (mirrors the
+batch-verify convention: exit 2 = broken configuration), so a broken
+environment never silently passes.
+
 ## Evaluate: the semantic judge
 
 `python3 -m qaloop.cli evaluate --claim ... --run <run-dir>

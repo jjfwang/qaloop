@@ -102,6 +102,7 @@ alongside the feature. Conventions:
 | `investigate --run <dir> --flow <yaml> [--target URL] [--max-actions N] [--headed] [--executable-path PATH]` | run the investigator on an existing run |
 | `dashboard [--out dir]` | regenerate static `index.html` |
 | `compare <runA> <runB>` | diff two runs (dir path or run-id prefix in `runs/`): status change, per-step outcomes, duration deltas with >20% regression flags; exit 0 identical / 1 differ / 2 error |
+| `doctor` | environment self-check (chromium, ffmpeg, python packages, demo fixtures); exit 0 all pass / 2 any FAIL |
 | `ledger` | cost summary JSON |
 
 - `--executable-path` is available on `verify`, `perform`, `investigate`, and
@@ -350,7 +351,8 @@ dashboard/         generated index.html
   fixtures), prints one PASS/FAIL line per check plus a machine-readable
   summary (`doctor: chromium=PASS ...`), and exits 2 on any FAIL. A missing
   ffmpeg is a FAIL, not a warning: `verify --video` records video.webm and
-  cannot run without it.
+  cannot run without it. See SPEC.md (`qaloop doctor`) for the check order,
+  output format, and the 0/2 exit-code contract.
 - **Playwright can't find a browser**: `python3 -m playwright install chromium`.
   Or point at a system build: `QALOOP_EXECUTABLE_PATH=/path/to/chrome`.
 - **This VM's bundled Chromium** (`/opt/meta-chromium/chrome`) enforces Local
