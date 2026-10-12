@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Viewport - qaloop demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  #size { display: inline-block; padding: 4px 12px; border-radius: 12px; background: #eee; }
+  #mode { display: inline-block; margin-left: 10px; padding: 4px 12px; border-radius: 12px; background: #dde6ff; }
+  body.compact #mode { background: #ffe1b3; }
+</style>
+</head>
+<body>
+  <h1>Viewport demo</h1>
+  <p>This page echoes the real window size, so a flow only passes when the
+     browser context really runs at the declared viewport (issue #162).
+     Widths up to 900px render in compact mode; wider renders wide.</p>
+  <div>
+    <span id="size">unknown</span>
+    <span id="mode">unknown</span>
+  </div>
+<script>
+  function render() {
+    document.getElementById("size").textContent = window.innerWidth + "x" + window.innerHeight;
+    var compact = window.innerWidth <= 900;
+    document.getElementById("mode").textContent = compact ? "compact" : "wide";
+    document.body.className = compact ? "compact" : "wide";
+  }
+  window.addEventListener("resize", render);
+  render();
+</script>
+</body>
+</html>
