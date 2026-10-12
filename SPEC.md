@@ -736,6 +736,34 @@ machine-readable `batch.json` (`file`, `status`, `duration_ms`,
 - Prefer `wait` with a state over `wait_ms`.
 - Keep flows to one user goal each; 5–25 steps is the sweet spot.
 
+## `qaloop validate`: flow preflight
+
+`python3 -m qaloop.cli validate <flow.yaml>` (the `qaloop validate`
+spelling used elsewhere in this spec) light-parses a flow spec without
+booting services, resolving env substitution, or launching a browser —
+the fast preflight before `verify` or `baselines`. It takes a single flow
+path (unlike `verify`, it does not accept a directory).
+
+Semantics, verified against `qaloop/cli.py` (`cmd_validate`):
+
+- The spec is loaded with `strict_env=False`, so env vars like
+  `${TARGET_URL}` are NOT resolved at validate time — the VALID line
+  shows the target exactly as written.
+- The full structural validation from `qaloop.spec` runs: required `name`
+  and `target`, step schema, and per-action argument checks.
+- Output contract, exit 0: `VALID: <name> — <n> steps (setup X, steps Y,
+  teardown Z), target <target>` — the dash is an em-dash (U+2014).
+  Example: `VALID: demo-mock-ux — 9 steps (setup 2, steps 7, teardown 0),
+  target ${TARGET_URL}`.
+- Output contract, exit 1: `INVALID: <reason>` when `load_spec` raises
+  `SpecError` (the reason names the spec path and the failing check,
+  e.g. `spec flows/x.yaml: 'name' is required`). A missing or unreadable
+  file is not a `SpecError` — it propagates as a Python traceback
+  (still exit 1).
+- Relationship to `verify`: validate checks structure only and never
+  touches the network. `verify` re-validates at runtime against the real
+  environment.
+
 ## Run artifacts
 
 Every `verify`/`worker` run writes into `runs/<id>/`:
