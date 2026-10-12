@@ -583,6 +583,100 @@ def cmd_ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+# Issue #126: demo fixtures needed by the documented demo proof
+# (GUIDANCE section 7: flows/demo-mock-ux.yaml runs against /demo/mock-demo.html
+# served from the repo root, plus the fixture pages referenced across
+# flows/tests).
+_DOCTOR_DEMO_FIXTURES = (
+    "mock-demo.html",
+    "demo-login.html",
+    "demo-a11y.html",
+    "cookie-storage.html",
+)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Issue #126: environment self-check. Prints one PASS/FAIL line per
+    check plus a machine-readable summary. Exit 0 when everything passes,
+    exit 2 on any FAIL so a broken environment never silently passes
+    (mirrors the batch-verify convention: exit 2 = broken configuration)."""
+    import shutil
+    import importlib
+
+    results: list[tuple[str, str, str]] = []  # (name, status, detail)
+
+    # 1. Chromium executable - mirrors run_flow's resolution (runner.py:1026):
+    #    QALOOP_EXECUTABLE_PATH wins; otherwise Playwright's default.
+    #    The executable_path property is only read - no browser is launched.
+    env_exe = os.environ.get("QALOOP_EXECUTABLE_PATH")
+    if env_exe:
+        if os.path.exists(env_exe):
+            results.append(("chromium", "PASS", env_exe))
+        else:
+            results.append(("chromium", "FAIL",
+                            "QALOOP_EXECUTABLE_PATH points at a missing file: "
+                            f"{env_exe}"))
+    else:
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                default_exe = pw.chromium.executable_path
+        except Exception as e:  # noqa: BLE001
+            results.append(("chromium", "FAIL",
+                            "could not resolve the Playwright chromium "
+                            f"executable: {e}"))
+        else:
+            if os.path.exists(default_exe):
+                results.append(("chromium", "PASS", default_exe))
+            else:
+                results.append(("chromium", "FAIL",
+                                "Playwright chromium executable missing: "
+                                f"{default_exe} "
+                                "(fix: python3 -m playwright install chromium)"))
+
+    # 2. ffmpeg - FAIL, not WARN: verify --video is a documented framework
+    #    capability and a missing ffmpeg breaks it cryptically.
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        results.append(("ffmpeg", "PASS", ffmpeg))
+    else:
+        results.append(("ffmpeg", "FAIL",
+                        "ffmpeg not found on PATH; verify --video cannot "
+                        "record video.webm (fix: install ffmpeg)"))
+
+    # 3. Python packages.
+    for pkg in ("yaml", "playwright"):
+        try:
+            importlib.import_module(pkg)
+        except Exception:  # noqa: BLE001
+            results.append(("python", "FAIL",
+                            f"missing Python package: {pkg}"))
+            break
+    else:
+        results.append(("python", "PASS", "yaml and playwright importable"))
+
+    # 4. demo/ fixtures at the repo root - needed by the documented demo proof.
+    demo_dir = os.path.join(QALOOP_HOME, "demo")
+    missing = [f for f in _DOCTOR_DEMO_FIXTURES
+               if not os.path.isfile(os.path.join(demo_dir, f))]
+    if os.path.isdir(demo_dir) and not missing:
+        results.append(("demo", "PASS",
+                        f"{demo_dir} "
+                        f"({len(_DOCTOR_DEMO_FIXTURES)} fixtures present)"))
+    else:
+        results.append(("demo", "FAIL",
+                        f"demo fixture dir broken: {demo_dir} "
+                        "(missing: "
+                        f"{', '.join('demo/' + f for f in missing) or 'the directory itself'}; "
+                        "needed by the documented demo proof)"))
+
+    for name, status, detail in results:
+        print(f"{status} {name}: {detail}")
+    print("doctor: " + " ".join(f"{name}={status}"
+                                for name, status, _ in results))
+    return 2 if any(status == "FAIL" for _, status, _ in results) else 0
+
+
 def cmd_investigate(args: argparse.Namespace) -> int:
     import json as _json
     from qaloop.investigate import investigate as run_investigation
@@ -681,6 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     lg = sub.add_parser("ledger", help="print the cost ledger summary")
     lg.set_defaults(fn=cmd_ledger)
+
+    dr = sub.add_parser("doctor",
+                        help="self-check the environment (chromium, ffmpeg, "
+                             "python packages, demo fixtures)")
+    dr.set_defaults(fn=cmd_doctor)
 
     iv = sub.add_parser("investigate",
                         help="run the investigator on an existing run dir")

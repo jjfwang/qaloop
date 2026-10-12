@@ -7854,6 +7854,152 @@ def test_issue_97_step_screenshot_override():
         pw_sync.sync_playwright = old_pw
 
 
+def _run_doctor():
+    """Run cmd_doctor with stdout captured. Returns (rc, output)."""
+    import io
+    from qaloop import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+    return rc, buf.getvalue()
+
+
+def test_issue_126_doctor_all_pass():
+    rc, out = _run_doctor()
+    lines = out.strip().splitlines()
+    check("doctor all-pass exits 0", rc == 0, f"rc={rc}")
+    names = [l.split()[1].rstrip(":") for l in lines
+             if l.startswith(("PASS ", "FAIL "))]
+    check("doctor prints one line per check",
+          names == ["chromium", "ffmpeg", "python", "demo"], str(names))
+    check("doctor summary line all PASS",
+          lines[-1] == "doctor: chromium=PASS ffmpeg=PASS python=PASS demo=PASS",
+          lines[-1] if lines else "")
+
+
+def test_issue_126_doctor_missing_executable():
+    old = os.environ.get("QALOOP_EXECUTABLE_PATH")
+    os.environ["QALOOP_EXECUTABLE_PATH"] = "/nonexistent/chrome-xyz"
+    try:
+        rc, out = _run_doctor()
+    finally:
+        if old is None:
+            os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        else:
+            os.environ["QALOOP_EXECUTABLE_PATH"] = old
+    check("doctor missing executable exits 2", rc == 2, f"rc={rc}")
+    check("doctor names the missing executable",
+          "/nonexistent/chrome-xyz" in out)
+    check("doctor summary marks chromium FAIL", "chromium=FAIL" in out)
+
+
+def test_issue_126_doctor_env_executable_present():
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        real = pw.chromium.executable_path
+    old = os.environ.get("QALOOP_EXECUTABLE_PATH")
+    os.environ["QALOOP_EXECUTABLE_PATH"] = real
+    try:
+        rc, out = _run_doctor()
+    finally:
+        if old is None:
+            os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        else:
+            os.environ["QALOOP_EXECUTABLE_PATH"] = old
+    check("doctor env executable present exits 0", rc == 0, f"rc={rc}")
+    check("doctor env executable reports the env path",
+          f"PASS chromium: {real}" in out, out.splitlines()[0] if out else "")
+
+
+def test_issue_126_doctor_default_executable_missing():
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        default_exe = pw.chromium.executable_path
+    real_exists = os.path.exists
+
+    def fake_exists(p):
+        return False if p == default_exe else real_exists(p)
+
+    os.path.exists = fake_exists
+    try:
+        rc, out = _run_doctor()
+    finally:
+        os.path.exists = real_exists
+    check("doctor missing default chromium exits 2", rc == 2, f"rc={rc}")
+    check("doctor summary marks chromium FAIL", "chromium=FAIL" in out)
+    check("doctor suggests the install fix",
+          "python3 -m playwright install chromium" in out)
+
+
+def test_issue_126_doctor_playwright_unresolvable():
+    from playwright import sync_api
+    real_sp = sync_api.sync_playwright
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no browsers installed")
+
+    sync_api.sync_playwright = boom
+    try:
+        rc, out = _run_doctor()
+    finally:
+        sync_api.sync_playwright = real_sp
+    check("doctor unresolvable chromium exits 2", rc == 2, f"rc={rc}")
+    check("doctor summary marks chromium FAIL", "chromium=FAIL" in out)
+
+
+def test_issue_126_doctor_ffmpeg_missing():
+    import shutil
+    real_which = shutil.which
+
+    def fake_which(cmd, *args, **kwargs):
+        return None if cmd == "ffmpeg" else real_which(cmd, *args, **kwargs)
+
+    shutil.which = fake_which
+    try:
+        rc, out = _run_doctor()
+    finally:
+        shutil.which = real_which
+    check("doctor ffmpeg-missing exits 2 (FAIL severity)", rc == 2, f"rc={rc}")
+    check("doctor summary marks ffmpeg FAIL", "ffmpeg=FAIL" in out)
+
+
+def test_issue_126_doctor_python_package_missing():
+    import importlib
+    real_import = importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("No module named 'yaml'")
+        return real_import(name, *args, **kwargs)
+
+    importlib.import_module = fake_import
+    try:
+        rc, out = _run_doctor()
+    finally:
+        importlib.import_module = real_import
+    check("doctor missing package exits 2", rc == 2, f"rc={rc}")
+    check("doctor names the missing package",
+          "missing Python package: yaml" in out)
+    check("doctor summary marks python FAIL", "python=FAIL" in out)
+
+
+def test_issue_126_doctor_demo_fixture_missing():
+    real_isfile = os.path.isfile
+
+    def fake_isfile(p):
+        return False if p.endswith("cookie-storage.html") else real_isfile(p)
+
+    os.path.isfile = fake_isfile
+    try:
+        rc, out = _run_doctor()
+    finally:
+        os.path.isfile = real_isfile
+    check("doctor missing demo fixture exits 2", rc == 2, f"rc={rc}")
+    check("doctor names the missing fixture",
+          "demo/cookie-storage.html" in out)
+    check("doctor summary marks demo FAIL", "demo=FAIL" in out)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
