@@ -1,0 +1,43 @@
+version: 1
+name: demo-mock-path
+tags: [smoke]
+description: >-
+  Browser proof for the mock path: payload form (issue #172, SPEC.md
+  mock section: exactly one of json, body, or path must be given, and
+  path: serves the bytes of a fixture file on disk). The mock for
+  /demo/path-payload.json is registered with path:
+  demo/path-fixture.json - the path resolves relative to the working
+  directory, and runs execute from the repo root, the same convention
+  other demo flows use for repo-relative fixtures. The mocked URL
+  itself does not exist on the server, so the rendered marker text
+  (which exists only inside the fixture file) can only have arrived
+  via the fixture bytes. The negative control asserts different
+  content and fails naming the observed fixture-served content.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the payload endpoint from a fixture file
+    mock: {url: "**/demo/path-payload.json", path: "demo/path-fixture.json"}
+  - name: open the path demo page
+    goto: /demo/path-demo.html
+
+steps:
+  - name: fixture-file content renders on click
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "served from fixture file PATHFIXTURE-172"}
+
+  - name: mock_calls counts the fixture-served hit
+    expect:
+      - mock_calls: {url: "**/demo/path-payload.json", equals: 1}
+
+  - name: negative control - rendered content is not an inline payload
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "inline json payload"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

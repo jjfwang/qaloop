@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop mock path demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  .slot { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  button { margin-top: 1rem; padding: .5rem 1.25rem; }
+</style>
+</head>
+<body>
+<h1>Mock path demo</h1>
+<p>The button fetches /demo/path-payload.json. That file does not exist
+on the server: the flow mocks the URL with path: pointing at
+demo/path-fixture.json, so the rendered text can only have come from
+the fixture file's bytes on disk.</p>
+<button id="fetch-btn">Fetch data</button>
+<div id="out" class="slot" role="status" aria-live="polite"></div>
+
+<script>
+document.getElementById('fetch-btn').addEventListener('click', async () => {
+  const r = await fetch('/demo/path-payload.json', {cache: 'no-store'});
+  const j = await r.json();
+  document.getElementById('out').textContent = j.message;
+});
+</script>
+</body>
+</html>
