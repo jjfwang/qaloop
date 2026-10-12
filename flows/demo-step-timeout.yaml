@@ -1,0 +1,40 @@
+name: demo-step-timeout
+description: >-
+  Browser proof for the step-level timeout_ms meta key (issue #164,
+  SPEC.md: timeout_ms overrides timeouts.step_ms; assertions poll
+  against min(step.timeout_ms or 15000, 8000) and name the final
+  observed value on timeout). The flow sets a short flow-level
+  timeouts.step_ms of 1000ms. The fixture reveals its ready state
+  4000ms after a click, so the assertion can only pass with the
+  step-level override: the negative control asserts the same state
+  without timeout_ms and fails under the 1000ms default naming the
+  observed value, then the positive step with timeout_ms: 7000
+  passes once the delayed state lands (its duration visibly exceeds
+  the flow default).
+target: ${TARGET_URL}
+
+setup:
+  - name: open the step-timeout demo page
+    goto: /demo/step-timeout-demo.html
+
+steps:
+  - name: schedule the delayed reveal
+    click: "#reveal-btn"
+    expect:
+      - text_contains: {selector: "#status", text: "scheduled"}
+
+  - name: negative control without the override fails under the flow default naming the observed value
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#status", text: "ready"}
+
+  - name: same assertion passes with a step-level timeout_ms override
+    timeout_ms: 7000
+    expect:
+      - text_contains: {selector: "#status", text: "ready"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 1000, run_ms: 120000}
+investigate_on_failure: false

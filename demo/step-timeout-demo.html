@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Step timeout - qaloop demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <h1>Step timeout demo</h1>
+  <p>Clicking the button schedules the status to become ready after
+     4000ms - longer than the demo flow's 1000ms flow-level
+     timeouts.step_ms, but well within a larger step-level timeout_ms
+     override (issue #164).</p>
+
+  <button id="reveal-btn" type="button">Reveal after a delay</button>
+  <p class="result" id="status">waiting</p>
+
+<script>
+document.getElementById('reveal-btn').addEventListener('click', () => {
+  const status = document.getElementById('status');
+  status.textContent = 'scheduled';
+  setTimeout(() => { status.textContent = 'ready'; }, 4000);
+});
+</script>
+</body>
+</html>
