@@ -345,6 +345,12 @@ dashboard/         generated index.html
 
 ## Troubleshooting
 
+- **Before a run fails cryptically**: `python3 -m qaloop.cli doctor` self-checks
+  the environment (Chromium executable, ffmpeg, Python packages, demo
+  fixtures), prints one PASS/FAIL line per check plus a machine-readable
+  summary (`doctor: chromium=PASS ...`), and exits 2 on any FAIL. A missing
+  ffmpeg is a FAIL, not a warning: `verify --video` records video.webm and
+  cannot run without it.
 - **Playwright can't find a browser**: `python3 -m playwright install chromium`.
   Or point at a system build: `QALOOP_EXECUTABLE_PATH=/path/to/chrome`.
 - **This VM's bundled Chromium** (`/opt/meta-chromium/chrome`) enforces Local
