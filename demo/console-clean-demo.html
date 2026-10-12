@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>console_clean demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>console_clean demo</h1>
+
+  <button id="clean-btn" type="button">Do a quiet DOM update</button>
+  <p class="result" id="clean-result"></p>
+
+  <button id="dirty-btn" type="button">Do a noisy update (console error + page error)</button>
+  <p class="result" id="dirty-result"></p>
+
+<script>
+document.getElementById('clean-btn').addEventListener('click', () => {
+  document.getElementById('clean-result').textContent = 'quiet update done';
+});
+document.getElementById('dirty-btn').addEventListener('click', () => {
+  document.getElementById('dirty-result').textContent = 'noisy update done';
+  console.error('demo console error: noisy control was clicked');
+  throw new Error('demo page error: noisy control threw');
+});
+</script>
+</body>
+</html>

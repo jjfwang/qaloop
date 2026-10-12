@@ -1,0 +1,31 @@
+name: demo-console-clean
+description: >-
+  Browser proof for the console_clean page-level assertion (issue #144,
+  shipped in PR #14): a fixture page raises a console error and an uncaught
+  page error on its dirty control, while the clean control performs a quiet
+  DOM update. Each positive step clicks the clean control and asserts
+  console_clean: true plus the visible consequence.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the console-clean demo page
+    goto: /demo/console-clean-demo.html
+
+steps:
+  - name: quiet DOM update leaves the console clean
+    click: "#clean-btn"
+    expect:
+      - console_clean: true
+      - text_contains: {selector: "#clean-result", text: "quiet update done"}
+
+  - name: second quiet update is also clean
+    click: "#clean-btn"
+    expect:
+      - console_clean: true
+      - text_contains: {selector: "#clean-result", text: "quiet update done"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
