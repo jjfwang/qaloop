@@ -906,6 +906,20 @@ The worker claims verification jobs from the queue and runs them to
 completion, writing the same run artifacts as `verify` (see above).
 Its flags:
 
+- `--flows DIR` (default `<install-root>/flows` — the `flows/`
+  directory inside the qaloop install root): the directory the worker
+  reads flow YAML from. A `verify-flow` job whose payload `flow` is a
+  relative path resolves it under DIR; a `verify-repo` flow entry that
+  is a bare name falls back to DIR when it exists nowhere else under
+  the install root. Absolute flow paths bypass DIR entirely.
+- `--once`: exit when the queue is empty instead of polling forever.
+  The worker still waits for in-flight jobs to finish before exiting
+  (`--once` exits only when no job is claimable AND nothing is still
+  running), so in-flight jobs are never abandoned. One-shot / CI mode.
+- `--poll SECS` (default 5): how long the worker sleeps between polls
+  when the queue is empty. Every wake-up re-attempts a claim, so a
+  lower value makes newly enqueued jobs start sooner at the cost of
+  busier polling; the default 5 seconds is the quiet middle ground.
 - `--concurrency N` (default 1): the worker claims and runs jobs in
   parallel through a thread pool of N threads. Claims are atomic
   (`BEGIN IMMEDIATE` on the queue database), so parallel workers never
