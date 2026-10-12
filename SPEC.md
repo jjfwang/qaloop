@@ -866,6 +866,138 @@ exactly `"passed"`; corrupt or fieldless entries are tolerated and
 simply count as failures. The table shows recent flakiness per flow
 without opening every report.
 
+## Queue pipeline: enqueue, webhook receiver, investigator, cost ledger
+
+The worker side is documented above; this section covers how jobs get
+INTO the queue, the standalone investigator command, and the cost
+ledger.
+
+### `qaloop enqueue`: putting jobs on the queue
+
+`qaloop enqueue` inserts one job into the sqlite queue. Its flags:
+
+- `--kind KIND` (default `verify-flow`; choices `verify-flow`,
+  `verify-repo`): the job kind.
+- `--flow FLOW` (for `verify-flow`): the flow YAML. The payload is
+  given the flow only when not already present (`setdefault`), and the
+  target only when `--target` is given.
+- `--target TARGET` (for `verify-flow`): target URL override, stored
+  in the payload when given.
+- `--payload JSON` (default `"{}"`): extra JSON payload. For
+  `verify-repo` this is the whole job payload — e.g.
+  `--payload '{"repo": "ac"}'`.
+- `--max-retries N` (int, default 0): retry the job up to N extra
+  attempts after the first failure, through the queue's normal retry
+  policy (see Worker above). The default 0 makes the first failure
+  terminal, which is the terminal-failure condition the failure
+  notifications listen for. A negative value is an error (exit 2);
+  non-integer or boolean values are rejected the same way at the
+  queue level.
+
+Exit 0 on success, printing
+`enqueued job #<id> (<kind>, max_retries=<N>)`.
+
+### Webhook receiver (`qaloop webhook`)
+
+`qaloop webhook` runs a small HTTP receiver that turns GitHub PR
+events into queued `verify-repo` jobs, plus a manual `/enqueue`
+endpoint. Its flags: `--port` (default 8090), `--host` (default
+`127.0.0.1`). Endpoints:
+
+- `GET /health` -> 200 `{"ok": true, "pending": <n>}` (pending queue
+  depth). Anything else returns 404.
+- `POST /webhook/github` — the GitHub webhook URL
+  (`http://<host>:<port>/webhook/github`, content type
+  `application/json`). The secret is the `QALOOP_WEBHOOK_SECRET`
+  environment variable: HMAC SHA-256 over the raw request body,
+  compared (constant-time) against the `X-Hub-Signature-256` header
+  (which carries the `sha256=` prefix). A mismatch returns 401
+  `{"ok": false, "error": "bad signature"}`. With no secret configured
+  the check is skipped entirely — local dev only, never in
+  production. `ping` events return 200 `{"ok": true, "msg": "pong"}`;
+  malformed JSON returns 400. `pull_request` events enqueue a
+  `verify-repo` job (payload `repo`, `repo_full`, `pr`, `sha`,
+  `source: "github-webhook"`) and return 200
+  `{"ok": true, "job_id": <id>}` — but only for the actions `opened`,
+  `synchronize`, `reopened`, and `labeled`, and `labeled` only when the
+  added label is `needs-qa`. Every other action or event returns 200
+  `{"ok": true, "msg": "ignored ..."}` without enqueuing.
+- `POST /enqueue` — manual enqueue over HTTP. When the
+  `QALOOP_ENQUEUE_TOKEN` environment variable is set, the request must
+  carry a matching `X-QALoop-Token` header, else 401
+  `{"ok": false, "error": "bad token"}`; with no token configured the
+  check is skipped. The JSON body becomes the job payload, with `kind`
+  taken from the body (default `verify-flow`), enqueued with the
+  default retry budget. Returns 200 `{"ok": true, "job_id": <id>}`;
+  malformed JSON returns 400.
+
+### `qaloop investigate`: the standalone investigator
+
+`qaloop investigate` runs the agentic investigator against an
+EXISTING run directory — no new verification run is launched. Its
+flags:
+
+- `--run DIR` (required): the run directory, which must contain
+  `run.json`.
+- `--flow FLOW` (required): the flow YAML used for the run.
+- `--target TARGET`: target URL override (defaults to the target
+  recorded in `run.json`).
+- `--max-actions N` (default 20): the investigator's hard browser-action
+  budget.
+- `--headed`: show the browser instead of running headless.
+- `--executable-path PATH`: chromium executable override.
+
+It loads `run.json` as a `RunResult`, loads the flow spec, runs the
+investigation, and prints the diagnosis as JSON to stdout (exit 0).
+Two modes:
+
+- No model credentials configured -> manual mode: writes
+  `INVESTIGATION_BRIEF.md` into the run dir (the failure context the
+  agent would have used) and returns
+  `{"mode": "manual", "brief": <path>, "cost_usd_est": 0.0}`.
+- Model credentials configured -> agent mode: drives the browser
+  against the target within the action budget, writes the transcript
+  to `INVESTIGATION.md` in the run dir, and augments the diagnosis
+  with `mode: "agent"`, `model`, `tokens_in`, `tokens_out`,
+  `cost_usd_est` (rounded to 4 decimals), and `actions_taken`. If the
+  budget is exhausted without a conclusion the diagnosis is
+  `{"diagnosis": "Investigator exhausted its budget without a
+  conclusion.", "likely_cause": "unknown", "suggested_fix": ""}`.
+
+### Cost ledger (`qaloop ledger`)
+
+The cost ledger is an append-only JSONL file: every run appends one
+entry, and `qaloop ledger` (no flags) prints `summarize()` as
+indented JSON to stdout (exit 0). The ledger file is
+`<checkout>/runs/ledger.jsonl`, overridable with the `QALOOP_LEDGER`
+environment variable; the parent directory is created on demand.
+
+Entries are appended by:
+
+- `verify`: `{"kind": "scripted", ..., "cost_usd_est": 0.0}`;
+- an investigator run on verify failure:
+  `{"kind": "investigation", "model", "tokens_in", "tokens_out",
+  "cost_usd_est"}`;
+- matrix verification: `{"kind": "scripted-matrix", ..., "cost_usd_est": 0.0}`;
+- `perform`: `{"kind": "perform", ..., "cost_usd_est"}` (the agent's
+  real model cost);
+- `evaluate`: `{"kind": "evaluate", ..., "tokens_in", "tokens_out",
+  "cost_usd_est"}`.
+
+`summarize()` reads every line and returns:
+
+- `runs`: total entries (all kinds);
+- `scripted_runs`: entries with `kind == "scripted"`;
+- `investigations`: entries with `kind == "investigation"`;
+- `total_cost_usd_est`: sum of `cost_usd_est` over all entries
+  (entries without a cost count 0), rounded to 4 decimals;
+- `investigation_cost_usd_est`: the same sum over `investigation`
+  entries only, rounded to 4 decimals.
+
+Note: `scripted-matrix`, `perform`, and `evaluate` entries count
+toward `runs` and the total cost, but not toward `scripted_runs` or
+`investigations`.
+
 ## `qaloop doctor`: environment self-check
 
 `python3 -m qaloop.cli doctor` self-checks the environment so a run never
