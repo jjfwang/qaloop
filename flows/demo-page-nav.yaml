@@ -1,0 +1,49 @@
+name: demo-page-nav
+description: >-
+  Browser proof for the url_contains / title_contains page-level assertions
+  (issue #154, SPEC-documented polling page-level assertions): goto page A,
+  expect its URL and title; click through to page B, expect its URL and
+  title; go back, expect page A again; reload, both still hold. A negative
+  control with a wrong expected URL and title fails with the step error
+  naming the actual page URL and title.
+target: ${TARGET_URL}
+
+setup:
+  - name: open page A of the nav demo
+    goto: /demo/page-nav-a.html
+
+steps:
+  - name: page A URL and title match
+    expect:
+      - url_contains: "page-nav-a"
+      - title_contains: "Page A - nav demo"
+
+  - name: click through to page B
+    click: "#to-b"
+    expect:
+      - url_contains: "page-nav-b"
+      - title_contains: "Page B - nav demo"
+
+  - name: back returns to page A
+    back: true
+    expect:
+      - url_contains: "page-nav-a"
+      - title_contains: "Page A - nav demo"
+
+  - name: reload keeps page A
+    reload: true
+    expect:
+      - url_contains: "page-nav-a"
+      - title_contains: "Page A - nav demo"
+
+  - name: negative control with a wrong URL and title fails naming the actual page
+    continue_on_fail: true
+    expect:
+      - url_contains: "no-such-page"
+      - title_contains: "No such title"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
