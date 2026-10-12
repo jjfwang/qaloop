@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Form actions - qaloop demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; max-width: 560px; }
+  .row { margin: 18px 0; }
+  label { font-size: 15px; color: #444; }
+  select { padding: 8px 12px; font-size: 16px; }
+  button { padding: 8px 16px; font-size: 15px; }
+  .state { display: inline-block; margin-left: 10px; padding: 4px 12px; border-radius: 12px; background: #eee; }
+</style>
+</head>
+<body>
+  <h1>Form actions demo</h1>
+
+  <div class="row">
+    <input type="checkbox" id="agree">
+    <label for="agree">I agree (check / uncheck toggle me)</label>
+    <span id="agree-state" class="state">unchecked</span>
+  </div>
+
+  <div class="row">
+    <label for="color">Favourite colour</label>
+    <select id="color">
+      <option value="red">Red</option>
+      <option value="green">Green</option>
+      <option value="blue">Blue</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <button id="dbl" type="button">Double-click me</button>
+    <span id="counter" class="state">0</span>
+  </div>
+
+<script>
+  // Checkbox state mirror: the span text reflects the live checked property
+  // on every change event, so a text assertion proves check/uncheck landed.
+  const agree = document.getElementById("agree");
+  const agreeState = document.getElementById("agree-state");
+  agree.addEventListener("change", () => {
+    agreeState.textContent = agree.checked ? "checked" : "unchecked";
+  });
+
+  // Double-click counter: only the dblclick event increments it, so a
+  // single click (or a click action in the flow) cannot fake the count.
+  const counter = document.getElementById("counter");
+  document.getElementById("dbl").addEventListener("dblclick", () => {
+    counter.textContent = String(parseInt(counter.textContent, 10) + 1);
+  });
+</script>
+</body>
+</html>

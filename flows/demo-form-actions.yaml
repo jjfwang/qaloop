@@ -1,0 +1,61 @@
+name: demo-form-actions
+description: >-
+  Browser proof for the check / uncheck / select / dblclick form-interaction
+  actions (issue #158, SPEC-documented locator actions): check toggles the
+  checkbox on (mirrored state text flips to "checked"), uncheck toggles it
+  off, select picks the blue option (asserted via the value assertion), and
+  dblclick increments the counter once per double-click (asserted via text_matches).
+  Negative controls with a wrong select value and a wrong counter text fail
+  with the step error naming the final observed value.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the form-actions demo page
+    goto: /demo/form-actions.html
+
+steps:
+  - name: checkbox starts unchecked and select starts on red
+    expect:
+      - text_matches: {selector: "#agree-state", pattern: "^unchecked$"}
+      - value: {selector: "#color", equals: "red"}
+
+  - name: check toggles the checkbox on
+    check: "#agree"
+    expect:
+      - text_matches: {selector: "#agree-state", pattern: "^checked$"}
+
+  - name: uncheck toggles the checkbox off
+    uncheck: "#agree"
+    expect:
+      - text_matches: {selector: "#agree-state", pattern: "^unchecked$"}
+
+  - name: select picks the blue option
+    select: {target: "#color", value: "blue"}
+    expect:
+      - value: {selector: "#color", equals: "blue"}
+
+  - name: dblclick increments the counter once
+    dblclick: "#dbl"
+    expect:
+      - text_matches: {selector: "#counter", pattern: "^1$"}
+
+  - name: a second dblclick increments the counter again
+    dblclick: "#dbl"
+    expect:
+      - text_matches: {selector: "#counter", pattern: "^2$"}
+
+  - name: negative control with a wrong select value fails naming the observed value
+    continue_on_fail: true
+    expect:
+      - value: {selector: "#color", equals: "green"}
+
+  - name: negative control with a wrong counter text fails naming the observed text
+    continue_on_fail: true
+    expect:
+      - text_matches: {selector: "#counter", pattern: "^99$"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
