@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>retry delay demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <h1>retry_delay_ms demo</h1>
+
+  <button id="flaky-btn" type="button">Activate flaky control</button>
+  <p class="result" id="attempt-counter">attempts so far: 0</p>
+  <p class="result" id="flaky-result"></p>
+
+  <button id="always-fails-btn" type="button">Activate always-failing control</button>
+  <p class="result" id="always-fails-result"></p>
+
+<script>
+let attempts = 0;
+document.getElementById('flaky-btn').addEventListener('click', () => {
+  attempts += 1;
+  document.getElementById('attempt-counter').textContent =
+    'attempts so far: ' + attempts;
+  document.getElementById('flaky-result').textContent =
+    attempts >= 3
+      ? 'flaky control succeeded'
+      : 'flaky control failed (attempt ' + attempts + ')';
+});
+document.getElementById('always-fails-btn').addEventListener('click', () => {
+  document.getElementById('always-fails-result').textContent =
+    'always-failing control failed';
+});
+</script>
+</body>
+</html>
