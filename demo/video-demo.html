@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Video recording - qaloop demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; max-width: 560px; }
+  button { padding: 8px 16px; font-size: 15px; }
+  #stage { display: inline-block; margin-left: 10px; padding: 4px 12px;
+           border-radius: 12px; background: #eee; }
+  #marker { width: 40px; height: 40px; border-radius: 50%; background: #315fd6;
+            margin-top: 24px; transition: margin-left 600ms ease; }
+</style>
+</head>
+<body>
+  <h1>Video recording demo</h1>
+  <p>This page exists so the recorded run video shows visible motion:
+     each Advance click moves the marker and bumps the stage counter.</p>
+
+  <div>
+    <button id="advance" type="button">Advance</button>
+    <span id="stage">stage-0</span>
+  </div>
+  <div id="marker"></div>
+
+<script>
+  // Stage counter + marker position: both change only on a real click, so
+  // the flow's text assertions prove the clicks landed, and the recorded
+  // video.webm shows the marker travelling across the page.
+  let n = 0;
+  const stage = document.getElementById("stage");
+  const marker = document.getElementById("marker");
+  document.getElementById("advance").addEventListener("click", () => {
+    n += 1;
+    stage.textContent = "stage-" + n;
+    marker.style.marginLeft = (n * 120) + "px";
+  });
+</script>
+</body>
+</html>

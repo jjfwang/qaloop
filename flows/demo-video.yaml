@@ -1,0 +1,41 @@
+name: demo-video
+description: >-
+  Browser proof for the top-level video: true recording (issue #160,
+  SPEC-documented run artifact): the flow opts in with video: true, drives
+  the video-demo fixture through three visible stage advances, and the
+  verify run must produce video.webm in the run directory with REPORT.md
+  linking it from the header summary block. Privacy by default is the
+  negative control: the same run shape without video: true (any existing
+  demo flow) produces no video.webm in its run directory.
+target: ${TARGET_URL}
+video: true
+
+setup:
+  - name: open the video demo page
+    goto: /demo/video-demo.html
+
+steps:
+  - name: marker starts at stage 0
+    expect:
+      - text_matches: {selector: "#stage", pattern: "^stage-0$"}
+
+  - name: first advance moves to stage 1
+    click: "#advance"
+    expect:
+      - text_matches: {selector: "#stage", pattern: "^stage-1$"}
+
+  - name: second advance moves to stage 2
+    click: "#advance"
+    expect:
+      - text_matches: {selector: "#stage", pattern: "^stage-2$"}
+
+  - name: third advance moves to stage 3
+    click: "#advance"
+    expect:
+      - text_matches: {selector: "#stage", pattern: "^stage-3$"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
