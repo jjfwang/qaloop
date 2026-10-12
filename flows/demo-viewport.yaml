@@ -1,0 +1,35 @@
+name: demo-viewport
+description: >-
+  Browser proof for the top-level viewport: flow key (issue #162,
+  SPEC.md canonical example): the flow declares a non-default viewport
+  of 800x600 and the fixture echoes window.innerWidth x window.innerHeight
+  plus a size-dependent compact/wide layout mode, so the run only passes
+  when the browser context really runs at the declared size. A negative
+  control sized for the 1280x800 default fails as designed, with the
+  step error naming the observed size.
+target: ${TARGET_URL}
+viewport: {width: 800, height: 600}
+
+setup:
+  - name: open the viewport demo page
+    goto: /demo/viewport-demo.html
+
+steps:
+  - name: window size matches the declared 800x600 viewport
+    expect:
+      - text_matches: {selector: "#size", pattern: "^800x600$"}
+
+  - name: layout mode is compact at 800px wide
+    expect:
+      - text_matches: {selector: "#mode", pattern: "^compact$"}
+
+  - name: negative control sized for the 1280x800 default fails naming the observed size
+    continue_on_fail: true
+    expect:
+      - text_matches: {selector: "#size", pattern: "^1280x800$"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
