@@ -1,0 +1,52 @@
+name: demo-dialog
+description: >-
+  Browser proof for the JS dialog handling (issue #140): the per-step
+  on_dialog policy and the dialog: assertion from PR #69. A fixture page
+  raises alert, confirm (with an observable page-state consequence so the
+  accept/dismiss choice is assertable), and prompt; each step asserts the
+  recorded dialog's type and text, plus the consequence the policy produced.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the dialog demo page
+    goto: /demo/dialog-demo.html
+
+steps:
+  - name: alert is recorded with its text
+    click: "#alert-btn"
+    expect:
+      - dialog: {type: alert, text: "This is a demo alert"}
+      - text_contains: {selector: "#alert-result", text: "alert acknowledged"}
+
+  - name: confirm accept takes the affirmative path
+    click: "#confirm-btn"
+    on_dialog: accept
+    expect:
+      - dialog: {type: confirm, text: "Delete this item?"}
+      - text_contains: {selector: "#confirm-result", text: "confirmed"}
+
+  - name: confirm dismiss leaves state unchanged
+    click: "#confirm-btn"
+    on_dialog: dismiss
+    expect:
+      - dialog: {type: confirm, text: "Delete this item?"}
+      - text_contains: {selector: "#confirm-result", text: "cancelled"}
+
+  - name: confirm default policy is dismiss
+    click: "#confirm-btn"
+    expect:
+      - dialog: {type: confirm, text: "Delete this item?"}
+      - text_contains: {selector: "#confirm-result", text: "cancelled"}
+
+  - name: prompt is accepted with empty input and recorded
+    click: "#prompt-btn"
+    on_dialog: accept
+    expect:
+      - dialog: {type: prompt, text: "Enter your name:"}
+      - text_contains: {selector: "#prompt-result", text: 'prompt answered with ""'}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
