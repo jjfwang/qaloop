@@ -1,0 +1,61 @@
+name: demo-element-state
+description: >-
+  Browser proof for the attribute / value / focused element-state assertions
+  (issue #156, SPEC-documented polling element assertions): a submit button
+  whose aria-disabled flips after async validation, an input whose live
+  value is masked by a button click, and a search field focused via the "/"
+  keyboard shortcut. A negative control per assertion fails with the step
+  error naming the final observed attribute value, input value, or active
+  element.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the element-state demo page
+    goto: /demo/element-state.html
+
+steps:
+  - name: submit starts aria-disabled
+    expect:
+      - attribute: {selector: "#submit", name: "aria-disabled", equals: "true"}
+
+  - name: async validation flips aria-disabled and the badge class
+    click: "#validate"
+    expect:
+      - attribute: {selector: "#submit", name: "aria-disabled", equals: "false"}
+      - attribute: {selector: "#badge", name: "class", contains: "active"}
+
+  - name: fill sets the input value
+    fill: {target: "#email", text: "qa@example.com"}
+    expect:
+      - value: {selector: "#email", equals: "qa@example.com"}
+
+  - name: mask button transforms the live input value
+    click: "#mask"
+    expect:
+      - value: {selector: "#email", equals: "q***@example.com"}
+
+  - name: pressing "/" focuses the search field
+    press: {target: "body", key: "/"}
+    expect:
+      - focused: {selector: "#search"}
+
+  - name: negative control with a wrong attribute value fails naming the observed value
+    continue_on_fail: true
+    expect:
+      - attribute: {selector: "#submit", name: "aria-disabled", equals: "yes"}
+
+  - name: negative control with a wrong input value fails naming the observed value
+    continue_on_fail: true
+    expect:
+      - value: {selector: "#email", equals: "someone@else.com"}
+
+  - name: negative control with the wrong focused element fails naming activeElement
+    continue_on_fail: true
+    expect:
+      - focused: {selector: "#email"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
