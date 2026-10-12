@@ -1159,3 +1159,158 @@ produced by the critic cannot trigger `INSUFFICIENT_EVIDENCE`.
 
 Cost: the critic call's tokens are summed into the existing `_cost`
 dict — `tokens_in`/`tokens_out` cover both calls.
+
+## Perform: the natural-language browser agent
+
+`python3 -m qaloop.cli perform --task "..." --target <URL>` is a
+natural-language browser agent for *doing work*, not just checking it.
+It takes over a fresh browser (default headless) or an already-running
+one via CDP, reads the page as an accessibility tree, acts semantically
+(role/name/text — never CSS trivia), paces itself like a person
+(scroll-into-view, typed input, waits for state), and stops honestly
+when blocked. "Human-like" means robust and legible — real clicks,
+paced typing, semantic targeting, state checks — not bot-evasion or
+fingerprint spoofing.
+
+Flags:
+
+- `--task` (required) — what the agent should do.
+- `--target` — starting URL. Omit when attaching to a live browser.
+- `--max-actions` (int, default 30) — the agent's action budget. Each
+  model action (including `done`/`blocked` and `screenshot`) consumes
+  one action; using all `max_actions` without finishing ends the run as
+  `incomplete`.
+- `--headed` (flag) — run the fresh browser headed (default headless).
+- `--cdp-url` — connect to a live browser over CDP, e.g.
+  `http://127.0.0.1:9222`, instead of launching a fresh one. The first
+  existing context/page is reused when present; the browser is left
+  open afterwards (`attached: true` in `perform.json`).
+- `--executable-path` — chromium binary override (same resolution as
+  `verify`).
+- `--allow-publish` (flag) — permit external publish/post actions
+  (blocked by default, see Safety below).
+- `--upload-dir` — directory file uploads are restricted to. Default:
+  the run dir. Only absolute paths under it are accepted (fail-closed).
+- `--max-cost-usd` (float, default 0 = unlimited) — estimated model
+  spend ceiling. Negative values are rejected (`ERROR: --max-cost-usd
+  cannot be negative`, exit 2).
+
+### Model config and cost estimation
+
+Perform needs a model: any OpenAI-compatible `/chat/completions`
+endpoint. Without `QALOOP_MODEL_API_KEY` the command fails fast
+(`ERROR: ...`, exit 2) — no browser is launched. Config comes from env:
+
+- `QALOOP_MODEL_BASE_URL` (default `https://api.openai.com/v1`),
+- `QALOOP_MODEL_NAME` (default `gpt-4o-mini`),
+- `QALOOP_MODEL_API_KEY` (default empty — required),
+- `QALOOP_MODEL_PRICE_IN` (default `0.15`, USD per 1M tokens),
+- `QALOOP_MODEL_PRICE_OUT` (default `0.60`, USD per 1M tokens).
+
+Estimated USD cost is
+`tokens_in/1e6 * price_in + tokens_out/1e6 * price_out`, rounded to 4
+decimals (`cost_usd_est`). The **cost ceiling**: the first model call is
+always issued (there is no estimate basis yet); afterwards the run stops
+*before* the next model call when `cost_so_far + last_call_cost` would
+exceed `--max-cost-usd`, with status `blocked` and the summary `cost
+ceiling reached (max-cost-usd <n>)`. The ceiling and the stop are
+recorded in `perform.json`, `PERFORM.md`, and the ledger.
+
+### Action set and targeting
+
+Each turn the model replies with exactly one JSON action (temperature
+0.2, max_tokens 1200 per call); a non-JSON reply is re-prompted once —
+no action record is added, though the turn still counts against the
+`max_actions` loop budget. The actions are:
+
+`navigate`, `click`, `dblclick`, `fill`, `press`, `select`,
+`check`/`uncheck`, `hover`, `scroll`, `wait`, `screenshot`, `console`,
+`upload`, plus the terminal `done` ("summary": what was accomplished)
+and `blocked` ("reason": why it cannot proceed).
+
+A target is `{"role": ..., "name": ...}` (preferred), `{"text": "..."}`,
+or as a last resort `{"css": "..."}`. Resolution is strict: zero
+matches or more than one match fails the action (a multi-match names
+the count and asks for disambiguation) rather than guessing. An action
+failure becomes the observation `FAILED: <ExceptionType>: <message>` —
+the loop continues; only harness-level refusals (see Safety) raise
+`PermissionError` and surface as `BLOCKED BY HARNESS`.
+
+Semantics, verified against `qaloop/perform.py`:
+
+- **Pacing.** A 0.25–0.75s pause follows every action (`_pace`).
+  Click-like actions scroll the element into view first. `fill` types
+  short text (<= 80 chars) with select-all then keystrokes at ~30–70ms
+  intervals; longer blobs are set instantly.
+- **Waiting.** `wait` defaults to state `visible`; a text-only target
+  waits for that text, otherwise it waits for the element state (up to
+  15s). A bare `wait` with no target sleeps `ms` (default 1000).
+- **Reading.** Each observation is the URL, title, any auto-dismissed
+  dialogs, and an AX snapshot (max 400 nodes, 25000 chars). A
+  `screenshot` saves `steps/perform-NN.png` in the run dir and its PNG
+  rides along on the next turn as image content, so the model sees the
+  page visually. If the endpoint rejects images, the run retries
+  text-only once and stays text-only.
+- **Stopping.** After each action the agent must verify the outcome in
+  the next observation, never assume it worked. `done` ends the run as
+  `completed`; `blocked` ends it as `blocked`; exhausting the action
+  budget ends it as `incomplete`. Anything ambiguous is a stop, not a
+  guess.
+
+### Safety
+
+Safety is enforced in the harness, not just the prompt (a misbehaving
+model cannot click through):
+
+- **Destructive actions are blocked.** On `click`, `dblclick`,
+  `press`, or `check`, when the target's name/text matches
+  `pay | purchase | checkout | buy now | delete | remove | destroy |
+  erase | wipe` (word-boundary, case-insensitive), the harness raises
+  `PermissionError` — no model discretion.
+- **External publishing is blocked by default.** When the target's
+  name/text matches `publish | post | tweet | share | send invite`
+  (word-boundary, case-insensitive), the action is refused unless
+  `--allow-publish` was passed.
+- **Dialogs are stop signs.** Any browser dialog is auto-dismissed
+  (recorded, the last three shown to the model); a confirmation dialog
+  for something destructive ends the task as `blocked`, never as a
+  speed bump. The model is also instructed up front: never submit a
+  payment, delete or destroy data, or publish/post externally — if the
+  task or a page asks for any of these, stop with `blocked` and say
+  why.
+
+### Upload-dir restriction (fail-closed)
+
+The `upload` action attaches a local file to a `<input type=file>`
+(target the input itself). Only absolute paths under the declared
+upload dir (default: the run dir) are accepted; relative paths and `..`
+escapes are rejected with `ValueError`, surfacing as a FAILED action —
+the same shared guard (`qaloop.upload.check_upload_path`) that the
+verify runner uses (issue #76), so both code paths reject the same
+violations.
+
+### Run artifacts, reporting, exit codes
+
+Every run creates `runs/<id>/` (via `qaloop.artifacts.new_run_dir`
+with the `perform` prefix), containing:
+
+- `perform.json` — the full result: `task`, `target`, `status`
+  (`completed` / `blocked` / `incomplete`), `summary`, the action
+  `transcript` (each record: `n`, the `action`, and its result string),
+  `action_count`, `tokens_in`, `tokens_out`, `cost_usd_est`,
+  `max_cost_usd`, `ceiling_hit`, `final_url`, `final_title`,
+  `attached`.
+- `PERFORM.md` — human-readable report: status line, action/token/cost
+  line, final page, and the numbered transcript.
+- `steps/perform-NN.png` — screenshots taken by the `screenshot`
+  action.
+
+The command prints `status`, `summary`, `actions` + `tokens` + `est $`,
+the `cost ceiling` when set, and the `report:` path. It appends a ledger
+entry (`kind: "perform"`) with `run_dir`, `task` (first 120 chars),
+`status`, `actions`, `tokens_in`, `tokens_out`, `cost_usd_est`,
+`max_cost_usd`, and `ceiling_reached`.
+
+Exit codes: `0` when the run completed, `1` for `blocked` or
+`incomplete`, `2` on configuration errors (missing model key, negative
+`--max-cost-usd`).
