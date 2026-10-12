@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ax demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  #confirm-dialog { border: 1px solid #315FD6; padding: 16px; margin: 12px 0; max-width: 320px; }
+</style>
+</head>
+<body>
+  <h1>ax demo</h1>
+
+  <button id="save-btn" type="button">Save profile</button>
+
+  <button id="show-btn" type="button">Show dialog</button>
+
+  <div id="confirm-dialog" role="dialog" aria-label="Confirm delete" hidden>
+    <p>Delete this item? This cannot be undone.</p>
+    <button id="close-btn" type="button">Close</button>
+  </div>
+
+<script>
+document.getElementById('show-btn').addEventListener('click', () => {
+  document.getElementById('confirm-dialog').hidden = false;
+});
+document.getElementById('close-btn').addEventListener('click', () => {
+  document.getElementById('confirm-dialog').hidden = true;
+});
+</script>
+</body>
+</html>
