@@ -1,0 +1,29 @@
+name: demo-retry-delay
+description: >-
+  Browser proof for retry_delay_ms (issue #146, shipped in PR #119 /
+  issue #95): the runner sleeps retry_delay_ms between retry attempts
+  (never after the final attempt), and the delay counts toward the step's
+  duration_ms. The fixture's flaky control fails its first two activations
+  and succeeds on the third, so the step needs exactly 2 retries (retry: 2,
+  retry_delay_ms: 750); the step's duration (about 1500ms of sleep) proves
+  the delay actually slept between attempts, not just parsed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the retry-delay demo page
+    goto: /demo/retry-delay-demo.html
+
+steps:
+  - name: flaky control succeeds on the third attempt after two delays
+    click: "#flaky-btn"
+    retry: 2
+    retry_delay_ms: 750
+    expect:
+      - text_contains: {selector: "#flaky-result", text: "succeeded"}
+      - text_contains: {selector: "#attempt-counter", text: "attempts so far: 3"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
