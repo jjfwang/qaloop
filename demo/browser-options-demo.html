@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browser options demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>browser context options demo</h1>
+  <p>
+    Each control reads one in-page observable of the Playwright browser
+    context and echoes it below, so a flow can assert the top-level
+    <code>browser:</code> block actually reached the live context
+    (issue #148; the block shipped in PR #123 / issue #122).
+  </p>
+
+  <button id="ua-btn" type="button">Read user agent</button>
+  <p class="result" id="ua-result"></p>
+
+  <button id="locale-btn" type="button">Read language</button>
+  <p class="result" id="locale-result"></p>
+
+  <button id="tz-btn" type="button">Read time zone</button>
+  <p class="result" id="tz-result"></p>
+
+  <button id="dsf-btn" type="button">Read device pixel ratio</button>
+  <p class="result" id="dsf-result"></p>
+
+  <button id="scheme-btn" type="button">Read color scheme</button>
+  <p class="result" id="scheme-result"></p>
+
+  <button id="touch-btn" type="button">Read touch support</button>
+  <p class="result" id="touch-result"></p>
+
+<script>
+const set = (id, value) => { document.getElementById(id).textContent = String(value); };
+document.getElementById('ua-btn').addEventListener('click', () => set('ua-result', navigator.userAgent));
+document.getElementById('locale-btn').addEventListener('click', () => set('locale-result', navigator.language));
+document.getElementById('tz-btn').addEventListener('click', () => set('tz-result', Intl.DateTimeFormat().resolvedOptions().timeZone));
+document.getElementById('dsf-btn').addEventListener('click', () => set('dsf-result', window.devicePixelRatio));
+document.getElementById('scheme-btn').addEventListener('click', () =>
+  set('scheme-result', matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'not-dark'));
+document.getElementById('touch-btn').addEventListener('click', () =>
+  set('touch-result', 'ontouchstart' in window ? 'touch' : 'no-touch'));
+</script>
+</body>
+</html>
