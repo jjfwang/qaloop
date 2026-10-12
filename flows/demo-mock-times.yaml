@@ -1,0 +1,48 @@
+version: 1
+name: demo-mock-times
+tags: [smoke]
+description: >-
+  Browser proof for the mock times: option (issue #166, SPEC.md mock
+  section: times mocks only the first N hits, then requests fall
+  through to the real network, and mock_calls counts only served
+  hits). The mock for /demo/times-data.json is registered with
+  times: 1. The fixture fetches that URL once per click and renders
+  each response into its own slot: the first click shows the mocked
+  message, the second click falls through to the static file the
+  local server actually serves and shows the real message, and
+  mock_calls equals 1 after both requests. The negative control
+  asserts the second slot shows the mocked message and fails naming
+  the observed real content.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the data endpoint for the first hit only
+    mock: {url: "**/demo/times-data.json", json: {message: "mocked response"}, times: 1}
+  - name: open the times demo page
+    goto: /demo/times-demo.html
+
+steps:
+  - name: first fetch is served by the mock
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#first", text: "mocked response"}
+
+  - name: second fetch falls through to the real server
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#second", text: "real server response"}
+
+  - name: mock_calls counts only the served hit
+    expect:
+      - mock_calls: {url: "**/demo/times-data.json", equals: 1}
+
+  - name: negative control - second render is not the mocked content
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#second", text: "mocked response"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
