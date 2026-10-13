@@ -1,0 +1,69 @@
+version: 1
+name: demo-matrix-list
+tags: [smoke]
+description: >-
+  Browser proof for the matrix list-of-maps form (issue #198, SPEC.md
+  Matrix section: matrix accepts two forms - a map of name to value
+  list, expanded as the cross product, and a list of maps, where each
+  map is one combination verbatim). This flow declares the list form
+  with three verbatim combinations - ada/pro, bob/free, cy/pro - a set
+  the map form cannot express: user x plan as lists would also
+  generate the unwanted fourth combination bob/pro. Only step params
+  are interpolated (SPEC flow variables: expect is never interpolated),
+  so each combination's user/plan drive the signup fills, the page
+  posts the pairing to the proof server, and a js assertion reads the
+  server's recording back and checks it against the fixed declared
+  pairing table (ada -> ada@pro, bob -> bob@free, cy -> cy@pro): the
+  declared list, not the fill, carries the expectation. The negative
+  control asserts the recorded email is bob@pro.example.com - the
+  cross-product pairing no declared combination contains - and must
+  FAIL in every combination naming the observed verbatim email; a
+  vacuous proof (the runner silently expanding the cross product, or
+  ignoring the list) would pass it in the extra bob/pro run. The
+  non-vacuity control (bob's plan changed from free to pro in a
+  scratch copy) flips bob's pairing step to a failure naming the
+  observed changed email; it is run by hand, not in this flow.
+target: ${TARGET_URL}
+
+matrix:
+  - {user: ada, plan: pro}
+  - {user: bob, plan: free}
+  - {user: cy, plan: pro}
+
+setup:
+  - name: mock the greeting API (no backend needed)
+    mock: {url: "**/api/greeting", json: {greeting: "Hello from mock"}}
+  - name: open the demo page
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: mocked data renders for the combination
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from mock"}
+
+  - name: fill the signup form with the verbatim combination
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email pairing this user with its declared plan
+    fill: {target: "#email", text: "${user}@${plan}.example.com"}
+
+  - name: submit and see the mocked confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+  - name: the server recorded exactly the declared pairing for this combination
+    expect:
+      - js: {script: "async () => { const r = await fetch('/api/last-signup'); const j = await r.json(); const want = {ada: 'ada@pro.example.com', bob: 'bob@free.example.com', cy: 'cy@pro.example.com'}; const got = j.body && j.body.email; return got === want[j.body.name] ? 'PAIRING-OK ' + got : 'PAIRING-MISMATCH name=' + (j.body && j.body.name) + ' email=' + got; }", contains: "PAIRING-OK"}
+
+  - name: negative control - the cross-product pairing bob/pro is never recorded
+    continue_on_fail: true
+    expect:
+      - js: {script: "async () => { const r = await fetch('/api/last-signup'); const j = await r.json(); return 'recorded email=' + (j.body && j.body.email); }", contains: "bob@pro.example.com"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
