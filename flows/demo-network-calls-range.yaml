@@ -1,0 +1,75 @@
+version: 1
+name: demo-network-calls-range
+tags: [smoke]
+description: >-
+  Browser proof for the network_calls assertion top-level range
+  comparators (issue #208, SPEC.md Assertions table: network_calls is
+  {url, equals: n} / {url, gte: n} / {url, lte: n} - how many entries in
+  network.jsonl whose url contains the given substring). The flow
+  reuses the mock-calls-range fixture page: its button fetches
+  /demo/range-payload.txt exactly once per click, the flow mocks that
+  URL with no times: limit, and mocked responses are recorded in
+  network.jsonl (proven by issue #196), so the recorded entry count
+  for that url grows deterministically: 1, then 2, then 3; the page
+  renders the same running count, pinning the recorded count by
+  visible state too. The positive steps prove both top-level range
+  operators at and inside the boundary at each count: gte passes with
+  the bound equal to the observed count and with the bound below it;
+  lte passes with the bound equal to the observed count and with the
+  bound above it. The negative control asserts gte 4 while only 3
+  entries were recorded and must FAIL naming the observed count in
+  the runner detail form (network_calls=3 want >=4) - a vacuous proof
+  would pass it. The non-vacuity control (a passing gte bound raised
+  by 1 past the actual recorded count in a scratch copy) flips that
+  step to a failure naming the observed count; it is run by hand, not
+  in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the range payload endpoint with no times limit
+    mock: {url: "**/demo/range-payload.txt", body: "range payload served by mock RANGE-206"}
+  - name: open the mock calls range demo page
+    goto: /demo/mock-calls-range-demo.html
+
+steps:
+  - name: first click records one entry - gte and lte both hold at the exact boundary
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "fetched: 1 RANGE-206"}
+      - network_calls: {url: "range-payload.txt", gte: 1}
+      - network_calls: {url: "range-payload.txt", lte: 1}
+
+  - name: second click records a second entry
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "fetched: 2 RANGE-206"}
+
+  - name: at two recorded entries - gte at and below the boundary, lte at and above it
+    expect:
+      - network_calls: {url: "range-payload.txt", gte: 2}
+      - network_calls: {url: "range-payload.txt", gte: 1}
+      - network_calls: {url: "range-payload.txt", lte: 2}
+      - network_calls: {url: "range-payload.txt", lte: 3}
+
+  - name: third click records a third entry
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "fetched: 3 RANGE-206"}
+
+  - name: at three recorded entries - gte and lte both hold at the exact boundary again
+    expect:
+      - network_calls: {url: "range-payload.txt", gte: 3}
+      - network_calls: {url: "range-payload.txt", gte: 2}
+      - network_calls: {url: "range-payload.txt", lte: 3}
+      - network_calls: {url: "range-payload.txt", lte: 4}
+
+  - name: negative control - a fourth entry was never recorded
+    continue_on_fail: true
+    expect:
+      - network_calls: {url: "range-payload.txt", gte: 4}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
