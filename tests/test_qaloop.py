@@ -6463,6 +6463,189 @@ def test_issue_88_matrix_flows():
         pw_sync.sync_playwright = old_pw
 
 
+def test_issue_200_baselines_matrix():
+    """Issue #200: `qaloop baselines` dispatches matrix flows per
+    combination (SPEC: baselines runs the flow in update mode; matrix
+    flows run once per combination — the two must compose).
+
+    _cmd_baselines_run with a matrix spec delegates to the matrix
+    dispatch with baseline_update=True threaded to every combination's
+    run_flow (initial_vars seeded from the combination); exit 0 iff
+    every combination passed, 1 when any fails. The non-matrix path
+    stays a single run_flow(baseline_update=True) call.
+    """
+    import tempfile
+    from types import SimpleNamespace
+    import qaloop.cli as cli_mod
+    from qaloop.cli import _cmd_baselines_run
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    def fake_result(status, ms=10):
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed" if status == "passed"
+                            else "failed",
+                            duration_ms=ms)]
+        return RunResult(flow_name="x", target="http://h", status=status,
+                         started=1.0, ended=1.0 + ms / 1000.0, steps=steps,
+                         failed_step=None if status == "passed" else 0,
+                         console_errors=[], page_errors=[],
+                         failed_requests=[], bad_responses=[], run_dir="")
+
+    def write(path, text):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    real_run_flow = cli_mod.run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "m.yaml")
+            write(flow_path,
+                  "name: baselines-matrix\ntarget: http://h/${user}\n"
+                  "matrix:\n  user: [ada, bob]\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /${user}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n"
+                  "investigate_on_failure: false\n")
+            spec = load_spec(flow_path)
+            args = SimpleNamespace(flow=flow_path, target=None, headed=True,
+                                   executable_path=None, upload_dir=None)
+            run_dir = os.path.join(d, "run")
+            os.makedirs(run_dir)
+
+            # --- dispatch: 2 combinations, baseline_update threaded ---
+            calls = []
+            cli_mod.run_flow = lambda s, **kw: calls.append(kw) or \
+                fake_result("passed")
+            ledger = FakeLedger()
+            rc = _cmd_baselines_run(args, run_dir, spec, ledger, d)
+            check("baselines matrix exit 0 when all pass", rc == 0, str(rc))
+            check("baselines matrix ran 2 combinations", len(calls) == 2,
+                  str(len(calls)))
+            check("baselines matrix threads baseline_update=True",
+                  all(c.get("baseline_update") is True for c in calls),
+                  str([c.get("baseline_update") for c in calls]))
+            check("baselines matrix seeds initial_vars per combination",
+                  [c.get("initial_vars") for c in calls]
+                  == [{"user": "ada"}, {"user": "bob"}],
+                  str([c.get("initial_vars") for c in calls]))
+            check("baselines matrix per-combination subdirs",
+                  all(c.get("run_dir", "").startswith(
+                      os.path.join(run_dir, "matrix")) for c in calls),
+                  str([c.get("run_dir") for c in calls]))
+            check("baselines matrix writes combined parent report",
+                  os.path.exists(os.path.join(run_dir, "REPORT.md")))
+            check("baselines matrix ledger entry",
+                  [r["kind"] for r in ledger.rows] == ["scripted-matrix"],
+                  str([r["kind"] for r in ledger.rows]))
+
+            # --- exit code: one failing combination -> 1 ---
+            calls = []
+            cli_mod.run_flow = lambda s, **kw: calls.append(kw) or \
+                fake_result("failed"
+                            if kw.get("initial_vars") == {"user": "bob"}
+                            else "passed")
+            rc = _cmd_baselines_run(args, run_dir, spec, FakeLedger(), d)
+            check("baselines matrix exit 1 when a combination fails",
+                  rc == 1, str(rc))
+            check("baselines matrix failure still runs all combinations",
+                  len(calls) == 2, str(len(calls)))
+
+            # --- non-matrix path unchanged: single baseline_update run ---
+            plain_path = os.path.join(d, "plain.yaml")
+            write(plain_path,
+                  "name: baselines-plain\ntarget: http://h\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n"
+                  "investigate_on_failure: false\n")
+            plain_spec = load_spec(plain_path)
+            calls = []
+            cli_mod.run_flow = lambda s, **kw: calls.append(kw) or \
+                fake_result("passed")
+            args_p = SimpleNamespace(flow=plain_path, target=None,
+                                     headed=True, executable_path=None,
+                                     upload_dir=None)
+            rc = _cmd_baselines_run(args_p, os.path.join(d, "run2"),
+                                    plain_spec, FakeLedger(), d)
+            check("baselines non-matrix exit 0", rc == 0, str(rc))
+            check("baselines non-matrix single run in run_dir",
+                  len(calls) == 1
+                  and calls[0].get("run_dir") == os.path.join(d, "run2"),
+                  str(calls))
+            check("baselines non-matrix baseline_update=True",
+                  calls and calls[0].get("baseline_update") is True,
+                  str(calls))
+
+            # --- spec=None fallback: _cmd_baselines_run loads it itself ---
+            calls = []
+            cli_mod.run_flow = lambda s, **kw: calls.append(kw) or \
+                fake_result("passed")
+            rc = _cmd_baselines_run(args, os.path.join(d, "run3"), None,
+                                    FakeLedger(), d)
+            check("baselines spec=None loads spec and dispatches matrix",
+                  rc == 0 and len(calls) == 2, f"rc={rc} calls={len(calls)}")
+
+            # --- invalid spec via the fallback load exits 2 ---
+            bad = os.path.join(d, "bad.yaml")
+            write(bad, "name: [unclosed\n")
+            args_b = SimpleNamespace(flow=bad, target=None, headed=True,
+                                     executable_path=None, upload_dir=None)
+            rc = _cmd_baselines_run(args_b, os.path.join(d, "run4"))
+            check("baselines invalid spec exits 2", rc == 2, str(rc))
+    finally:
+        cli_mod.run_flow = real_run_flow
+
+    # --- cmd_baselines end-to-end dispatch (defensive spec load) ---
+    from qaloop.cli import cmd_baselines
+    real_default_runs = cli_mod.default_runs_root
+    try:
+        with tempfile.TemporaryDirectory() as d, temp_ledger():
+            cli_mod.default_runs_root = lambda: os.path.join(d, "runs")
+            flow_path = os.path.join(d, "m.yaml")
+            write(flow_path,
+                  "name: baselines-cli-matrix\ntarget: http://h/${user}\n"
+                  "matrix:\n  user: [ada, bob]\n"
+                  "steps:\n"
+                  "  - name: go\n    goto: /${user}\n"
+                  "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                  "trace: false}\n"
+                  "investigate_on_failure: false\n")
+            calls = []
+            cli_mod.run_flow = lambda s, **kw: calls.append(kw) or \
+                fake_result("passed")
+            args = SimpleNamespace(flow=flow_path, target=None,
+                                   headed=True, executable_path=None)
+            rc = cmd_baselines(args)
+            check("cmd_baselines matrix exit 0", rc == 0, str(rc))
+            check("cmd_baselines matrix ran both combinations",
+                  len(calls) == 2
+                  and all(c.get("baseline_update") is True for c in calls),
+                  str(len(calls)))
+            # Light-parseable but full-spec-invalid: the defensive load
+            # in cmd_baselines must swallow it and still exit 2 via
+            # _cmd_baselines_run, never crash.
+            bad = os.path.join(d, "bad.yaml")
+            write(bad, "name: badstep\ntarget: http://h\nsteps:\n"
+                       "  - name: s\n    bogus_op: 1\n")
+            rc = cmd_baselines(SimpleNamespace(
+                flow=bad, target=None, headed=True, executable_path=None))
+            check("cmd_baselines malformed flow exits 2 (no crash)",
+                  rc == 2, str(rc))
+    finally:
+        cli_mod.run_flow = real_run_flow
+        cli_mod.default_runs_root = real_default_runs
+
+
 def test_issue_89_flow_tags_batch():
     """Issue #89: flow `tags` + `verify` on a directory.
 
@@ -7998,6 +8181,127 @@ def test_issue_126_doctor_demo_fixture_missing():
     check("doctor names the missing fixture",
           "demo/cookie-storage.html" in out)
     check("doctor summary marks demo FAIL", "demo=FAIL" in out)
+
+
+def test_issue_200_baselines_matrix_dispatch():
+    """Issue #200: `qaloop baselines` on a matrix flow dispatches per
+    combination (like verify), threading baseline_update=True into every
+    run_flow call; exit 0 iff every combination passed. Non-matrix
+    baselines behavior is unchanged (single run, no initial_vars)."""
+    from types import SimpleNamespace
+    import qaloop.cli as cli
+    import qaloop.report as report_mod
+    from qaloop.spec import load_spec
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    def fake_result(status):
+        return SimpleNamespace(status=status, steps=[], duration_ms=1,
+                               flow_name="bl-matrix", failed_step=None,
+                               page_errors=[], failed_requests=[],
+                               bad_responses=[], error=None)
+
+    calls = []
+    fail_combos = set()
+
+    def fake_run_flow(spec, **kw):
+        calls.append(kw)
+        combo = kw.get("initial_vars") or {}
+        status = "failed" if combo.get("t") in fail_combos else "passed"
+        return fake_result(status)
+
+    def fake_write_matrix_summary(spec, results, run_dir):
+        path = os.path.join(run_dir, "REPORT.md")
+        with open(path, "w") as fh:
+            fh.write("matrix summary\n")
+        return path
+
+    old_run_flow, old_write_report = cli.run_flow, cli.write_report
+    old_print_summary = cli.print_summary
+    old_wms = report_mod.write_matrix_summary
+    cli.run_flow = fake_run_flow
+    cli.write_report = lambda *a, **kw: {}
+    cli.print_summary = lambda result: None
+    report_mod.write_matrix_summary = fake_write_matrix_summary
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write("name: bl-matrix\ntarget: http://h/${t}\n"
+                    "matrix:\n  t: [a, b]\n"
+                    "steps:\n"
+                    "  - name: go\n    goto: /${t}\n"
+                    "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                    "trace: false}\n")
+            flow_path = f.name
+        args = SimpleNamespace(flow=flow_path, target=None, headed=False,
+                               executable_path=None, upload_dir=None)
+        spec = load_spec(flow_path)
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "run1")
+            os.makedirs(run_dir)
+            ledger = FakeLedger()
+            rc = cli._cmd_baselines_run(args, run_dir, spec, ledger, root)
+            check("baselines matrix exit 0 when all combos pass",
+                  rc == 0, str(rc))
+            check("baselines matrix ran every combination",
+                  len(calls) == 2, str(len(calls)))
+            check("baselines matrix seeded initial_vars per combination",
+                  [c.get("initial_vars") for c in calls]
+                  == [{"t": "a"}, {"t": "b"}], str(calls))
+            check("baselines matrix threads baseline_update=True",
+                  all(c.get("baseline_update") is True for c in calls),
+                  str(calls))
+            check("baselines matrix uses per-combination subdirs",
+                  all(os.path.basename(os.path.dirname(c["run_dir"]))
+                      == "matrix" for c in calls), str(calls))
+            check("baselines matrix ledger row recorded",
+                  [r["kind"] for r in ledger.rows] == ["scripted-matrix"],
+                  str(ledger.rows))
+            # one failing combination -> exit 1
+            calls.clear()
+            fail_combos.add("b")
+            run_dir2 = os.path.join(root, "run2")
+            os.makedirs(run_dir2)
+            rc = cli._cmd_baselines_run(args, run_dir2, spec,
+                                        FakeLedger(), root)
+            check("baselines matrix exit 1 when a combination fails",
+                  rc == 1, str(rc))
+            fail_combos.clear()
+        # non-matrix flow: single run, baseline_update, no initial_vars
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write("name: bl-plain\ntarget: http://h\n"
+                    "steps:\n"
+                    "  - name: go\n    goto: /\n"
+                    "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                    "trace: false}\n")
+            plain_path = f.name
+        try:
+            calls.clear()
+            args2 = SimpleNamespace(flow=plain_path, target=None,
+                                    headed=False, executable_path=None,
+                                    upload_dir=None)
+            with tempfile.TemporaryDirectory() as root:
+                rc = cli._cmd_baselines_run(
+                    args2, os.path.join(root, "run3"))
+                check("baselines non-matrix exit 0", rc == 0, str(rc))
+                check("baselines non-matrix single run",
+                      len(calls) == 1, str(len(calls)))
+                check("baselines non-matrix baseline_update, no seed",
+                      calls[0].get("baseline_update") is True
+                      and "initial_vars" not in calls[0], str(calls))
+        finally:
+            os.unlink(plain_path)
+        os.unlink(flow_path)
+    finally:
+        cli.run_flow, cli.write_report = old_run_flow, old_write_report
+        cli.print_summary = old_print_summary
+        report_mod.write_matrix_summary = old_wms
 
 
 if __name__ == "__main__":

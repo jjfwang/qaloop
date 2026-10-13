@@ -325,7 +325,8 @@ def _combo_slug(combo: dict, index: int) -> str:
 
 
 def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
-                       keep_runs: int, upload_dir, prune: bool = True) -> tuple:
+                       keep_runs: int, upload_dir, prune: bool = True,
+                       baseline_update: bool = False) -> tuple:
     """Run a matrix flow once per combination (issue #88).
 
     One parent run dir, per-combination subdirs
@@ -334,7 +335,9 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
     Exit code 0 iff every combination passed. Per-combination
     investigation is not run in matrix mode (--investigate applies to
     single runs only). Returns (exit_code, batch-summary record) for
-    issue #89's batch table.
+    issue #89's batch table. baseline_update (issue #200) is threaded
+    to each combination's run_flow: `qaloop baselines` reuses this
+    dispatch so screenshot baselines are saved per combination.
     """
     from qaloop.report import write_matrix_summary
     matrix_dir = os.path.join(run_dir, "matrix")
@@ -349,6 +352,7 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
                           headless=not args.headed,
                           executable_path=args.executable_path,
                           upload_dir=upload_dir, initial_vars=combo,
+                          baseline_update=baseline_update,
                           video=getattr(args, "video", False) or None)
         write_report(result, spec, subdir)
         results.append((combo, result, subdir))
@@ -377,6 +381,7 @@ def _cmd_verify_matrix(args, spec, run_dir: str, ledger, runs_root: str,
 def cmd_baselines(args: argparse.Namespace) -> int:
     """Run a flow in baseline-update mode: screenshot_matches assertions
     save their baselines instead of comparing."""
+    from qaloop import ledger
     runs_root = default_runs_root()
     os.makedirs(runs_root, exist_ok=True)
     try:
@@ -385,6 +390,13 @@ def cmd_baselines(args: argparse.Namespace) -> int:
         print(f"INVALID SPEC: {e}")
         return 2
     run_dir = new_run_dir(runs_root, flow_name + "-baselines")
+    # Load the spec defensively (issue #200): a matrix flow dispatches
+    # per combination, and a malformed flow must still exit 2 via
+    # _cmd_baselines_run's own spec handling, never crash here.
+    try:
+        spec = load_spec(args.flow)
+    except Exception:
+        spec = None
     ctx = _service_ctx(args.flow, services, run_dir)
     try:
         ctx.__enter__()
@@ -392,17 +404,31 @@ def cmd_baselines(args: argparse.Namespace) -> int:
         print(f"SERVICE BOOT FAILED: {type(e).__name__}: {e}")
         return 3
     try:
-        return _cmd_baselines_run(args, run_dir)
+        return _cmd_baselines_run(args, run_dir, spec, ledger, runs_root)
     finally:
         ctx.__exit__(None, None, None)
 
 
-def _cmd_baselines_run(args: argparse.Namespace, run_dir: str) -> int:
-    try:
-        spec = load_spec(args.flow)
-    except SpecError as e:
-        print(f"INVALID SPEC: {e}")
-        return 2
+def _cmd_baselines_run(args: argparse.Namespace, run_dir: str, spec=None,
+                       ledger=None, runs_root: str = None) -> int:
+    if spec is None:
+        try:
+            spec = load_spec(args.flow)
+        except SpecError as e:
+            print(f"INVALID SPEC: {e}")
+            return 2
+    if getattr(spec, "matrix", None):
+        # Issue #200: matrix flows run once per combination, each in
+        # baseline-update mode — same dispatch as verify's matrix path.
+        from qaloop.env import resolve_upload_dir
+        print(f"run dir: {run_dir}")
+        print(f"target:  {args.target or spec.target}")
+        print("baseline update mode — screenshots saved, not compared")
+        code, _rec = _cmd_verify_matrix(
+            args, spec, run_dir, ledger, runs_root, 0,
+            resolve_upload_dir(getattr(args, "upload_dir", None)),
+            prune=False, baseline_update=True)
+        return code
     target = args.target or spec.target
     print(f"run dir: {run_dir}")
     print(f"target:  {target}")
