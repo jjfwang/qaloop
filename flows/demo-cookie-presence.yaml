@@ -1,0 +1,47 @@
+version: 1
+name: demo-cookie-presence
+tags: [smoke]
+description: >-
+  Browser proof for the cookie presence-only assertion form (issue
+  #210, SPEC.md Assertions table and the Cookies and web storage
+  section: cookie is {name, equals: v} / {name, contains: s} / {name},
+  where the name-only form asserts presence only - "the login cookie
+  is set"). The flow reuses the cookie-storage fixture page: its login
+  button sets the session cookie asynchronously (a tick after the
+  click), so the presence assertion must poll the live browser
+  context rather than read once. The positive step clicks login and
+  asserts cookie: {name: "session"} with the presence-only form - no
+  equals, no contains - pinning the value-free branch that the
+  issue #82 proof flow never exercised for cookies (it asserts the
+  session cookie with equals and contains only, and uses the
+  presence-only form solely for storage). The negative control
+  asserts presence of a cookie that is never set and must FAIL in the
+  runner detail form (cookie 'never-set'=None want present) - a
+  vacuous proof would pass it. The non-vacuity control (the same
+  presence assertion placed before the login click in a scratch copy,
+  where the cookie does not exist yet) flips that step to a failure
+  naming cookie 'session'=None want present; it is run by hand, not
+  in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the cookie/storage demo page
+    goto: /demo/cookie-storage.html
+
+steps:
+  - name: log in and prove the async-set session cookie is present
+    click: "#login"
+    expect:
+      - text_contains: {selector: "#status", text: "logged in"}
+      - cookie: {name: "session"}
+
+  - name: negative control - a never-set cookie is not present
+    continue_on_fail: true
+    expect:
+      - cookie: {name: "never-set"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
