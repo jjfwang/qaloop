@@ -1,0 +1,50 @@
+version: 1
+name: demo-services-env
+tags: [smoke]
+description: >-
+  Browser proof for the services env form (issue #190, SPEC.md
+  services block: env is optional extra env for the command). The
+  fixture service serves content driven entirely by the
+  QALOOP_DEMO_ENV_TOKEN environment variable, which the parent shell
+  does not set - the only source is the env: block below, merged into
+  the child process environment by env.py boot_command. The positive
+  steps assert the exact declared token in the service payload; with
+  the env removed the service would answer "unset-env-token" instead.
+  The negative control asserts text the service never renders and
+  must FAIL naming the observed content - a vacuous proof would pass
+  it. The non-vacuity control (declared token changed) fails the
+  positive step naming the observed token; it is run by hand, not in
+  this flow.
+services:
+  - name: envsvc
+    command: "python3 demo/env_echo_server.py"
+    cwd: ".."
+    env: {QALOOP_DEMO_ENV_TOKEN: "envsvc-declared-7f3a"}
+    wait: {http: "http://127.0.0.1:8943/api/env-status"}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_ENVSVC_URL}
+
+setup:
+  - name: open the page served by the env-echo service
+    goto: /demo/env-echo.html
+
+steps:
+  - name: the env-echo service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the env-echo service"}
+
+  - name: the payload reflects the exact env value declared in the flow
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "env-declared token is envsvc-declared-7f3a"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "ENVSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
