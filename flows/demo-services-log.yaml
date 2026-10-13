@@ -1,0 +1,52 @@
+version: 1
+name: demo-services-log
+tags: [smoke]
+description: >-
+  Browser proof for the services wait log_contains form (issue #186,
+  SPEC.md services block: wait is exactly one of {port} | {http} |
+  {log_contains}; env.py boot_command polls the service log file for
+  the needle). The fixture service binds its port but prints the
+  needle to stdout only after a ~1.5s delay and does not serve before
+  it, so boot genuinely waits on the log line. boot_command returns
+  an empty URL for the log_contains form, so the service declares an
+  explicit url: for ${QALOOP_SERVICE_LOGSVC_URL} to resolve. The
+  positive steps assert content only this service serves (its page
+  and its /api/log-status payload). The negative control asserts
+  text the service never renders and must FAIL naming the observed
+  content - a vacuous proof would pass it. The non-vacuity boot
+  control (needle changed to a string the fixture never prints)
+  fails boot with SERVICE BOOT FAILED; it is run by hand, not in
+  this flow.
+services:
+  - name: logsvc
+    command: "python3 demo/log_ready_server.py"
+    cwd: ".."
+    wait: {log_contains: "LOGREADY-186 log-gated service ready"}
+    timeout_s: 30
+    url: "http://127.0.0.1:8941/"
+target: ${QALOOP_SERVICE_LOGSVC_URL}
+
+setup:
+  - name: open the page served by the log-gated service
+    goto: /demo/log-ready.html
+
+steps:
+  - name: the log-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the log-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "log-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "LOGSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
