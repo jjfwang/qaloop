@@ -1,0 +1,36 @@
+version: 1
+name: demo-trace
+tags: [smoke]
+description: >-
+  Browser proof for artifacts.trace: true (issue #176, SPEC.md
+  artifacts section: trace: true records a Playwright trace.zip).
+  Every other demo flow sets trace: false, so tracing start/stop was
+  never exercised against a real browser in the demo suite. This flow
+  sets trace: true and performs a small deterministic interaction
+  (click the fixture button, assert the rendered marker). The proof
+  is on the artifact, not just the step results: the verify run dir
+  must contain a non-empty trace.zip, and the same flow with trace
+  flipped to false must produce no trace.zip in its run dir - the
+  artifacts flag drives the artifact.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the trace demo page
+    goto: /demo/trace-demo.html
+
+steps:
+  - name: run the traced action
+    click: "#trace-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "traced action done TRACE-176"}
+
+  - name: negative control - marker text is the click result, not the initial state
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "idle"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
