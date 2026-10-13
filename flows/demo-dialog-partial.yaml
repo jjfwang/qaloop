@@ -1,0 +1,60 @@
+version: 1
+name: demo-dialog-partial
+tags: [smoke]
+description: >-
+  Browser proof for the dialog omitted forms (issue #218, SPEC.md
+  dialog section: in a dialog assertion either field may be omitted
+  to match any dialog). The flow reuses the dialog demo fixture
+  (alert, confirm and prompt buttons with known messages and
+  observable page-state consequences). The type-only step clicks
+  the confirm button with on_dialog: accept and asserts dialog
+  {type: confirm} with no text constraint, plus the confirmed
+  consequence - proving the type branch matches on type alone.
+  The text-only step clicks the alert button and asserts dialog
+  {text: "demo alert"} (a substring of the alert message) with no
+  type constraint, plus the acknowledged consequence - proving the
+  text branch matches on text alone. Two negative controls follow,
+  each a designed failure: a type-only assertion for prompt on a
+  step that raises only an alert, and a text-only assertion for a
+  substring no raised dialog contains on a step that raises only
+  a confirm; each must FAIL with the runner detail "no dialog
+  matched the criteria (saw: ...)" naming the dialog that actually
+  appeared - a vacuous omitted-form match would pass them.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the dialog demo page
+    goto: /demo/dialog-demo.html
+
+steps:
+  - name: type-only - confirm matches on type alone and accept takes the affirmative path
+    click: "#confirm-btn"
+    on_dialog: accept
+    expect:
+      - dialog: {type: confirm}
+      - text_contains: {selector: "#confirm-result", text: "confirmed"}
+
+  - name: text-only - alert matches on text substring alone
+    click: "#alert-btn"
+    expect:
+      - dialog: {text: "demo alert"}
+      - text_contains: {selector: "#alert-result", text: "alert acknowledged"}
+
+  - name: negative control - type-only for a type that was not raised
+    continue_on_fail: true
+    click: "#alert-btn"
+    expect:
+      - dialog: {type: prompt}
+
+  - name: negative control - text-only for a substring no raised dialog contains
+    continue_on_fail: true
+    click: "#confirm-btn"
+    on_dialog: accept
+    expect:
+      - dialog: {text: "no such dialog text"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
