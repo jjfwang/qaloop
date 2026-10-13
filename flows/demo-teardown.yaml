@@ -1,0 +1,58 @@
+version: 1
+name: demo-teardown
+tags: [smoke]
+description: >-
+  Browser proof for the teardown phase (issue #192, SPEC.md flow
+  anatomy: teardown is best-effort, failures do not fail the run, with
+  the example teardown seed js localStorage.clear()). Every other demo
+  flow declares teardown: [], so the phase had zero runnable-demo
+  adoption. The steps phase plants a localStorage value with a page-JS
+  seed and reads it back from the real browser. The teardown phase then
+  runs three steps in order: (1) the SPEC example form, a seed js
+  localStorage.clear(); (2) a deliberately failing step asserting the
+  planted value is still there - it must FAIL naming the observed
+  absent state, which also proves step (1) really cleared the storage,
+  and per best-effort semantics it must neither fail the run nor stop
+  the phase; (3) a further passing step after the failing one, clicking
+  the read button and asserting the rendered absent marker, proving
+  teardown continued past the failure on the still-live page. Proof is
+  the run record: run.json shows the teardown records after the steps
+  records, exactly the designed step failed, and the overall run
+  outcome PASS. The non-vacuity control (the failing teardown step
+  changed to a passing assertion, so no teardown step fails and the
+  step record changes accordingly) is run by hand, not in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the teardown demo page
+    goto: /demo/teardown-demo.html
+
+steps:
+  - name: plant state with a page-JS seed
+    seed: {js: "localStorage.setItem('qaloop_teardown', 'TEARDOWN-192 planted');"}
+
+  - name: storage assertion reads the planted localStorage value
+    expect:
+      - storage: {kind: local, key: "qaloop_teardown", equals: "TEARDOWN-192 planted"}
+
+  - name: page renders the planted storage value
+    click: "#read-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "stored: TEARDOWN-192 planted"}
+
+teardown:
+  - name: teardown clears the planted state (SPEC example form)
+    seed: {js: "localStorage.clear()"}
+
+  - name: designed failing teardown step - the planted value is gone after the clear
+    expect:
+      - storage: {kind: local, key: "qaloop_teardown", equals: "TEARDOWN-192 planted"}
+
+  - name: teardown continues past the failure - page renders the absent marker
+    click: "#read-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "stored: (absent)"}
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
