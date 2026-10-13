@@ -1,0 +1,61 @@
+version: 1
+name: demo-matrix-screenshot
+description: >-
+  Browser proof for matrix + screenshot_matches together (issue #202,
+  SPEC.md screenshot_matches section: on a flow that declares matrix:,
+  baselines dispatches once per combination exactly like verify, saving
+  each combination's baselines in baseline-update mode). The matrix
+  declares two combinations (ada/pro, bob/free). The screenshot target
+  is the static #card-a element on the screenshot-element demo page,
+  which renders identically in every combination, so the single shared
+  baseline path baselines/matrix-card-a.png is valid for all of them:
+  a baselines run creates that PNG (no baseline is committed for this
+  flow - the baselines run creating it is the proof), and a verify run
+  then compares against it per combination. The remaining steps drive
+  the mock-demo signup form with each combination's ${user}/${plan},
+  proving the matrix variables still seed each per-combination run
+  alongside the screenshot step. The negative control is run by hand,
+  not in this flow (it must not turn the baselines/verify runs red):
+  change #card-a's background in demo/screenshot-element.html and
+  verify fails the screenshot step naming rms_diff above max_diff.
+target: ${TARGET_URL}
+
+matrix:
+  - {user: ada, plan: pro}
+  - {user: bob, plan: free}
+
+setup:
+  - name: mock the greeting API (no backend needed)
+    mock: {url: "**/api/greeting", json: {greeting: "Hello from mock"}}
+  - name: open the screenshot element demo page
+    goto: /demo/screenshot-element.html
+
+steps:
+  - name: card-a element matches the shared matrix baseline
+    expect:
+      - screenshot_matches: {baseline: "baselines/matrix-card-a.png", selector: "#card-a", max_diff: 0.02}
+
+  - name: open the mock demo page for this combination
+    goto: /demo/mock-demo.html
+
+  - name: mocked data renders for the combination
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from mock"}
+
+  - name: fill the signup form as the matrix user
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email for the matrix plan
+    fill: {target: "#email", text: "${user}@${plan}.example.com"}
+
+  - name: submit and see the mocked confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
