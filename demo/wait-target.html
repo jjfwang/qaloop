@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop wait: target demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  .slot { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+</style>
+</head>
+<body>
+<h1>Wait: target demo</h1>
+<p>Every element on this page transitions state on a fixed timer from
+page load, driven only by the page script below. The flow's target-ful
+waits gate on exactly those transitions: the spinner starts visible
+and hides, the doomed element starts attached and detaches, the late
+element attaches only after a delay, and the status element's text
+changes last. If a transition does not happen, the matching wait times
+out and the step fails - the waits cannot pass vacuously.</p>
+<div id="spinner" class="slot">spinner visible</div>
+<div id="doomed" class="slot">doomed attached</div>
+<div id="late-slot" class="slot"></div>
+<div id="status" class="slot" role="status" aria-live="polite">waiting</div>
+
+<script>
+setTimeout(() => {
+  document.getElementById('spinner').style.display = 'none';
+}, 700);
+setTimeout(() => {
+  document.getElementById('doomed').remove();
+}, 2400);
+setTimeout(() => {
+  const el = document.createElement('div');
+  el.id = 'late';
+  el.textContent = 'late attached';
+  document.getElementById('late-slot').appendChild(el);
+}, 1200);
+setTimeout(() => {
+  document.getElementById('status').textContent = 'transitions settled';
+}, 2800);
+</script>
+</body>
+</html>
