@@ -1,0 +1,54 @@
+version: 1
+name: demo-wait-load-state
+tags: [smoke]
+description: >-
+  Browser proof for the targetless wait load-state form (issue #174,
+  SPEC.md wait table: wait without a target takes state load,
+  domcontentloaded, or networkidle and dispatches to
+  page.wait_for_load_state). The fixture starts a fetch to
+  /api/loadstate on page load; the mock answers after 3000ms, so the
+  network stays busy well past DOMContentLoaded and the load event.
+  The flow proves all three states positively: domcontentloaded and
+  load pass once reached, and networkidle blocks until the delayed
+  fetch settles (its step duration in run.json runs to seconds, not
+  milliseconds), after which the rendered content is asserted. The
+  negative control runs while that first fetch is still in flight:
+  the same networkidle wait with a 500ms timeout_ms - far shorter
+  than the mock delay - must FAIL; a vacuous or no-op wait would
+  pass it. Ordering note (found by this proof): Playwright latches
+  the networkidle state once reached, so a short-timeout control
+  placed after a successful networkidle wait returns immediately and
+  proves nothing - the control must run before the state is first
+  reached. The run then recovers with the full networkidle wait and
+  the settled-content assertion.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the slow load-state API (responds after 3000ms)
+    mock: {url: "**/api/loadstate**", json: {message: "load state settled"}, delay_ms: 3000}
+  - name: open the load-state demo page
+    goto: /demo/wait-load-state.html
+
+steps:
+  - name: page reaches DOMContentLoaded
+    wait: {state: domcontentloaded}
+
+  - name: page reaches the load event
+    wait: {state: load}
+
+  - name: negative control - short-timeout networkidle wait fails while the fetch is in flight
+    continue_on_fail: true
+    wait: {state: networkidle, timeout_ms: 500}
+
+  - name: networkidle blocks until the delayed fetch settles
+    wait: {state: networkidle, timeout_ms: 15000}
+
+  - name: settled content rendered after networkidle
+    expect:
+      - text_contains: {selector: "#out", text: "load state settled"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

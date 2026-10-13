@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop wait: load states demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  #out { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  button { padding: .5rem 1.25rem; }
+</style>
+</head>
+<body>
+<h1>Wait: load states demo</h1>
+<div id="out" role="status" aria-live="polite">waiting</div>
+
+<script>
+async function loadState() {
+  // The mocked endpoint answers only after a multi-second delay, so the
+  // network stays busy well past DOMContentLoaded and the load event:
+  // networkidle cannot be reached until this fetch settles.
+  const r = await fetch('/api/loadstate', {cache: 'no-store'});
+  const j = await r.json();
+  document.getElementById('out').textContent = j.message;
+  window.loadStateSettled = true;
+}
+loadState();
+</script>
+</body>
+</html>
