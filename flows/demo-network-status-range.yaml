@@ -1,0 +1,60 @@
+version: 1
+name: demo-network-status-range
+tags: [smoke]
+description: >-
+  Browser proof for the network_calls status range sub-filters
+  (issue #196, SPEC.md Run artifacts / network_calls: the status
+  sub-filter is {equals} / {gte} / {lte}, narrowing the count to entries
+  whose response status satisfies it and never matching status: null
+  entries). One click drives three real responses with distinct
+  statuses: the proof server answers 200 for /api/greeting and 404 for
+  /api/nope, and /demo/range-payload.json is mocked with status 503.
+  The positive steps prove both range operators against the recorded
+  run log: the 404 URL counts 1 under {gte: 400} and 0 under
+  {lte: 399}; the 200 URL counts 1 under {lte: 299} and 0 under
+  {gte: 300}; the 503 URL counts 1 under {gte: 500} and 0 under
+  {lte: 499}. The negative control asserts the 404 URL equals 1 under
+  {lte: 399} and must FAIL naming the observed count 0 - a vacuous
+  proof would pass it. The non-vacuity control (the 404 bound changed
+  from gte: 400 to gte: 500 in a scratch copy) flips the corresponding
+  positive step to a failure naming the observed count; it is run by
+  hand, not in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the payload endpoint with a 503 status
+    mock: {url: "**/demo/range-payload.json", status: 503, json: {message: "range unavailable"}}
+  - name: open the network range demo page
+    goto: /demo/network-range-demo.html
+
+steps:
+  - name: one click drives the mixed-status traffic
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "observed: /api/greeting -> 200 | /api/nope -> 404 | /demo/range-payload.json -> 503 RANGE-196"}
+
+  - name: the 404 URL counts under gte 400 and not under lte 399
+    expect:
+      - network_calls: {url: "/api/nope", status: {gte: 400}, equals: 1}
+      - network_calls: {url: "/api/nope", status: {lte: 399}, equals: 0}
+
+  - name: the 200 URL counts under lte 299 and not under gte 300
+    expect:
+      - network_calls: {url: "/api/greeting", status: {lte: 299}, equals: 1}
+      - network_calls: {url: "/api/greeting", status: {gte: 300}, equals: 0}
+
+  - name: the 503 URL counts under gte 500 and not under lte 499
+    expect:
+      - network_calls: {url: "range-payload", status: {gte: 500}, equals: 1}
+      - network_calls: {url: "range-payload", status: {lte: 499}, equals: 0}
+
+  - name: negative control - the 404 URL does not count under lte 399
+    continue_on_fail: true
+    expect:
+      - network_calls: {url: "/api/nope", status: {lte: 399}, equals: 1}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

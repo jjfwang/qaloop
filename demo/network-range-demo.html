@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop network status range demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  .slot { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  button { margin-top: 1rem; padding: .5rem 1.25rem; }
+</style>
+</head>
+<body>
+<h1>Network status range demo</h1>
+<p>The button issues three fetches whose real response statuses differ:
+the proof server's /api/greeting answers 200, /api/nope answers 404, and
+/demo/range-payload.json does not exist on the server - the flow mocks it
+with status 503. The rendered line reports each observed status, so the
+page content itself tracks the mixed-status traffic the flow's
+network_calls range assertions then filter.</p>
+<button id="fetch-btn">Fetch all three</button>
+<div id="out" class="slot" role="status" aria-live="polite"></div>
+
+<script>
+document.getElementById('fetch-btn').addEventListener('click', async () => {
+  const urls = ['/api/greeting', '/api/nope', '/demo/range-payload.json'];
+  const parts = [];
+  for (const u of urls) {
+    const r = await fetch(u, {cache: 'no-store'});
+    parts.push(u + ' -> ' + r.status);
+  }
+  document.getElementById('out').textContent = 'observed: ' + parts.join(' | ') + ' RANGE-196';
+});
+</script>
+</body>
+</html>
