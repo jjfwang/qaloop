@@ -1,0 +1,57 @@
+version: 1
+name: demo-wait-target
+tags: [smoke]
+description: >-
+  Browser proof for the target-ful wait form (issue #184, SPEC.md
+  wait table: wait with a target takes state visible, hidden,
+  attached, or detached, defaults to visible, and the text form
+  waits for the selector to contain the text; runner.py dispatches
+  to wait_for_selector and to locator(has_text).wait_for). The
+  fixture transitions on fixed timers from page load: the spinner
+  hides at 700ms, the late element attaches at 1200ms, the doomed
+  element detaches at 2400ms, and the status text settles at
+  2800ms, so each positive wait blocks until its transition lands
+  and cannot pass vacuously. The flow proves state visible, state
+  hidden, state detached, state attached, the bare target form
+  (default visible), and the text form, then asserts the settled
+  status text. The negative control waits for the already-hidden
+  spinner to be visible again with a 500ms timeout_ms: it must
+  FAIL naming the timeout - a vacuous or no-op wait would pass it.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the wait target demo page
+    goto: /demo/wait-target.html
+
+steps:
+  - name: spinner is visible before it hides
+    wait: {target: "#spinner", state: visible}
+
+  - name: wait blocks until the spinner hides
+    wait: {target: "#spinner", state: hidden}
+
+  - name: wait blocks until the late element attaches
+    wait: {target: "#late", state: attached}
+
+  - name: wait blocks until the doomed element detaches
+    wait: {target: "#doomed", state: detached}
+
+  - name: bare target wait defaults to visible
+    wait: {target: "#late"}
+
+  - name: text wait blocks until the status contains the settled text
+    wait: {target: "#status", text: "transitions settled"}
+
+  - name: settled status text rendered after the waits
+    expect:
+      - text_contains: {selector: "#status", text: "transitions settled"}
+
+  - name: negative control - hidden spinner never becomes visible again
+    continue_on_fail: true
+    wait: {target: "#spinner", state: visible, timeout_ms: 500}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
