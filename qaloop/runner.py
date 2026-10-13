@@ -299,7 +299,8 @@ def _do_mock(page, params: dict, mock_hits: dict) -> None:
 
 
 def _do_action(page, step: Step, target: str, mock_hits: dict,
-               upload_dir: str | None = None) -> int | None:
+               upload_dir: str | None = None,
+               dialogs: list | None = None) -> int | None:
     """Run one action; returns a seed step's HTTP status (None otherwise)."""
     op, p = step.op, step.params
     t = step.timeout_ms or 15000
@@ -309,7 +310,22 @@ def _do_action(page, step: Step, target: str, mock_hits: dict,
     # main page, as does page.mouse (a Frame has no mouse).
     scope = _resolve_scope(page, step, t)
     if op == "goto":
-        page.goto(_resolve_url(target, p), timeout=t, wait_until="domcontentloaded")
+        # Issue #220: a beforeunload dialog dismissed per the step's
+        # on_dialog policy cancels the navigation, and Playwright raises
+        # net::ERR_ABORTED for the goto even though staying put is the
+        # intended outcome. When a beforeunload dialog was recorded
+        # during this goto, treat the abort as the completed action and
+        # let the step's assertions judge where the browser ended up.
+        # Any other abort still raises.
+        dialog_mark = len(dialogs) if dialogs is not None else 0
+        try:
+            page.goto(_resolve_url(target, p), timeout=t,
+                      wait_until="domcontentloaded")
+        except Exception as e:  # noqa: BLE001
+            if ("net::ERR_ABORTED" not in str(e) or dialogs is None
+                    or not any(d.get("type") == "beforeunload"
+                               for d in dialogs[dialog_mark:])):
+                raise
     elif op == "click":
         scope.click(p, timeout=t)
     elif op == "dblclick":
@@ -1128,7 +1144,8 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
                                 # status; other ops report None.
                                 sr.seed_status = _do_action(
                                     page, eff_step, target, mock_hits,
-                                    upload_dir=upload_dir)
+                                    upload_dir=upload_dir,
+                                    dialogs=collectors.dialogs)
                             sr.assertions = _check_assertions(
                                 page, eff_step, collectors,
                                 baseline_dir=baseline_dir,

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>beforeunload demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  input { display: block; margin: 12px 0; padding: 8px; }
+  .state { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <h1>beforeunload demo</h1>
+  <p>A dirty form arms a beforeunload listener: navigating away then
+     raises a beforeunload dialog. Dismissing it stays on this page;
+     accepting it lets the navigation complete.</p>
+
+  <label for="note">Note</label>
+  <input id="note" type="text" autocomplete="off">
+  <p class="state" id="form-state">clean - no unsaved changes</p>
+
+<script>
+let armed = false;
+document.getElementById('note').addEventListener('input', () => {
+  if (!armed) {
+    armed = true;
+    window.addEventListener('beforeunload', (event) => {
+      event.preventDefault();
+    });
+  }
+  document.getElementById('form-state').textContent =
+    'dirty - unsaved changes';
+});
+</script>
+</body>
+</html>
