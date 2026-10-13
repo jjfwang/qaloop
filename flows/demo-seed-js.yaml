@@ -1,0 +1,43 @@
+version: 1
+name: demo-seed-js
+tags: [smoke]
+description: >-
+  Browser proof for the seed js: form (issue #182, SPEC.md seed
+  section: seed is either {http: ...} or {js: "..."}; the http form is
+  proven by demo-headers). The setup opens the seed-js demo page,
+  which never writes the seed key itself, then a seed step with the
+  js: form runs page JavaScript planting a localStorage value and a
+  window flag. Later steps read exactly that planted state back from
+  the real browser: a storage assertion on the localStorage value,
+  and a click that renders both the stored value and the window flag.
+  The negative control asserts a different value and fails naming the
+  observed planted value. Per SPEC the js seed step record carries
+  seed_status null.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the seed js demo page
+    goto: /demo/seed-js-demo.html
+  - name: plant state with a page-JS seed
+    seed: {js: "localStorage.setItem('qaloop_seed_js', 'SEEDJS-182 planted'); window.__qaloop_seed_js = 'FLAGJS-182';"}
+
+steps:
+  - name: storage assertion reads the planted localStorage value
+    expect:
+      - storage: {kind: local, key: "qaloop_seed_js", equals: "SEEDJS-182 planted"}
+
+  - name: page renders the planted storage value and window flag
+    click: "#read-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "stored: SEEDJS-182 planted flag: FLAGJS-182"}
+
+  - name: negative control - planted value is not a different value
+    continue_on_fail: true
+    expect:
+      - storage: {kind: local, key: "qaloop_seed_js", equals: "SEEDJS-OTHER"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
