@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Log-gated service demo</title></head>
+<body>
+  <h1>Log-gated demo service</h1>
+  <p id="ready-note">This page is served only by the log-gated service.</p>
+  <button id="load">Load status</button>
+  <p id="out"></p>
+  <script>
+    document.getElementById("load").addEventListener("click", async () => {
+      const r = await fetch("/api/log-status");
+      const data = await r.json();
+      document.getElementById("out").textContent = data.status;
+    });
+  </script>
+</body>
+</html>
