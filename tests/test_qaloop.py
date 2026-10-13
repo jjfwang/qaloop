@@ -1378,6 +1378,64 @@ def test_screenshot_matches_selector_capture():
               res[0].detail)
 
 
+def test_ax_assertion_includes_hidden():
+    """Issue #216: ax role locators must resolve hidden elements.
+
+    Playwright role locators exclude accessibility-tree-hidden
+    elements by default, so state: attached timed out on a hidden
+    dialog and state: hidden passed vacuously. The runner must pass
+    include_hidden=True and let wait_for decide the state.
+    """
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def make_step(items):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=items,
+                    continue_on_fail=False, timeout_ms=None, raw={})
+
+    class FakeLocator:
+        def __init__(self, page):
+            self.page = page
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, state=None, timeout=None):
+            self.page.waits.append(state)
+
+    class FakePage:
+        def __init__(self):
+            self.role_calls = []
+            self.waits = []
+
+        def get_by_role(self, role, name=None, include_hidden=None):
+            self.role_calls.append((role, name, include_hidden))
+            return FakeLocator(self)
+
+    page = FakePage()
+    res = _check_assertions(
+        page, make_step([("ax", {"role": "dialog", "name": "Confirm delete",
+                                 "state": "attached"})]), None)
+    check("ax attached passes via fake locator", res[0].passed, res[0].detail)
+    check("ax attached locates with include_hidden=True",
+          page.role_calls == [("dialog", "Confirm delete", True)],
+          str(page.role_calls))
+    check("ax attached waits for attached state",
+          page.waits == ["attached"], str(page.waits))
+
+    page = FakePage()
+    res = _check_assertions(
+        page, make_step([("ax", {"role": "dialog", "state": "hidden"})]), None)
+    check("ax hidden (no name) passes via fake locator",
+          res[0].passed, res[0].detail)
+    check("ax hidden locates with include_hidden=True",
+          page.role_calls == [("dialog", None, True)], str(page.role_calls))
+    check("ax hidden waits for hidden state",
+          page.waits == ["hidden"], str(page.waits))
+
+
 def test_text_assertion_polling():
     """text_contains/text_matches poll until async-rendered text appears."""
     import time
@@ -4776,7 +4834,7 @@ def test_frame_scoping():
         def text_content(self, sel):
             self.calls.append(("text", sel))
             return self.texts.get(sel, "")
-        def get_by_role(self, role, name=None):
+        def get_by_role(self, role, name=None, include_hidden=None):
             self.calls.append(("role", role, name))
             return FakeLocator(self, f"role:{role}")
 
