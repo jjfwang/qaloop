@@ -1,0 +1,65 @@
+version: 1
+name: demo-count-range
+tags: [smoke]
+description: >-
+  Browser proof for the count assertion range comparators (issue #204,
+  SPEC.md Assertions table: count is {selector, equals} / {selector, gte} /
+  {selector, lte}). The fixture page starts with exactly one .item and each
+  click of its button appends exactly two more, so the live DOM count is
+  deterministically 1, then 3, then 5 as the flow grows it. The positive
+  steps prove both range operators at and inside the boundary against the
+  real rendered DOM: gte passes with the bound equal to the observed count
+  and with the bound below it; lte passes with the bound equal to the
+  observed count and with the bound above it. The negative control asserts
+  gte 6 while only 5 items are rendered and must FAIL naming the observed
+  count in the runner detail form (count=5 want >=6) - a vacuous proof
+  would pass it. The non-vacuity control (a passing gte bound raised by 1
+  past the actual count in a scratch copy) flips that step to a failure
+  naming the observed count; it is run by hand, not in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the count range demo page
+    goto: /demo/count-range-demo.html
+
+steps:
+  - name: one item initially - gte and lte both hold at the exact boundary
+    expect:
+      - text_contains: {selector: "#out", text: "total: 1 RANGE-204"}
+      - count: {selector: "#items .item", gte: 1}
+      - count: {selector: "#items .item", lte: 1}
+
+  - name: first click grows the list to three items
+    click: "#add-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "total: 3 RANGE-204"}
+
+  - name: at three items - gte at and below the boundary, lte at and above it
+    expect:
+      - count: {selector: "#items .item", gte: 3}
+      - count: {selector: "#items .item", gte: 2}
+      - count: {selector: "#items .item", lte: 3}
+      - count: {selector: "#items .item", lte: 4}
+
+  - name: second click grows the list to five items
+    click: "#add-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "total: 5 RANGE-204"}
+
+  - name: at five items - gte and lte both hold at the exact boundary again
+    expect:
+      - count: {selector: "#items .item", gte: 5}
+      - count: {selector: "#items .item", gte: 4}
+      - count: {selector: "#items .item", lte: 5}
+      - count: {selector: "#items .item", lte: 6}
+
+  - name: negative control - six items are not rendered
+    continue_on_fail: true
+    expect:
+      - count: {selector: "#items .item", gte: 6}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
