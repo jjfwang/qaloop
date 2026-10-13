@@ -328,7 +328,11 @@ python3 -m qaloop.cli baselines flows/my-flow.yaml
 ```
 
 A missing baseline fails the assertion with a pointer to this command;
-`qaloop verify` never writes baselines.
+`qaloop verify` never writes baselines. On a flow that declares
+`matrix:`, `baselines` dispatches once per combination exactly like
+`verify` (per-combination run dirs under `matrix/`, variables seeded
+from the combination), saving each combination's baselines in
+baseline-update mode; the exit code is 0 iff every combination passed.
 
 ### Diff artifacts on mismatch
 
