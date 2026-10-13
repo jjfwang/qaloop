@@ -1,0 +1,46 @@
+version: 1
+name: demo-mock-status
+tags: [smoke]
+description: >-
+  Browser proof for the mock status: option (issue #180, SPEC.md mock
+  section: status is optional, default 200). The mock for
+  /demo/status-payload.json is registered with status: 503 and a JSON
+  payload. The mocked URL itself does not exist on the server, and the
+  demo page branches on the response: the success branch renders only
+  when response.ok is true, while the error branch renders the observed
+  response.status. The rendered error-branch text can therefore only
+  have arrived when the mock served the non-default 503 status. The
+  negative control asserts the success branch and fails naming the
+  observed error-branch content.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the payload endpoint with a 503 status
+    mock: {url: "**/demo/status-payload.json", status: 503, json: {message: "temporarily unavailable"}}
+  - name: open the status demo page
+    goto: /demo/status-demo.html
+
+steps:
+  - name: error branch renders the observed 503 status on click
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "error branch: HTTP 503 temporarily unavailable STATUSERR-180"}
+
+  - name: mock_calls counts the status-served hit
+    expect:
+      - mock_calls: {url: "**/demo/status-payload.json", equals: 1}
+
+  - name: network_calls records the 503 response status
+    expect:
+      - network_calls: {url: "status-payload", status: {equals: 503}, equals: 1}
+
+  - name: negative control - rendered content is not the success branch
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "success branch"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
