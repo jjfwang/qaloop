@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>seed http json demo</title>
+<style>
+  body { font-family: sans-serif; padding: 48px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+  .result { margin: 4px 0 20px 0; color: #101720; min-height: 1.2em; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>Seed HTTP JSON demo</h1>
+
+  <button id="seed-check-btn" type="button">Show the JSON body the seed request posted</button>
+  <p class="result" id="seed-result"></p>
+
+<script>
+document.getElementById('seed-check-btn').addEventListener('click', () => {
+  fetch('/api/last-signup')
+    .then(r => r.json())
+    .then(rec => {
+      const b = rec.body || {};
+      document.getElementById('seed-result').textContent =
+        'server received name ' + b.name + ' with plan ' + b.plan +
+        ' as ' + rec.content_type;
+    })
+    .catch(e => { document.getElementById('seed-result').textContent = 'error: ' + e; });
+});
+</script>
+</body>
+</html>
