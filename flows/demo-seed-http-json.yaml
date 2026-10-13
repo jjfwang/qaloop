@@ -1,0 +1,49 @@
+version: 1
+name: demo-seed-http-json
+tags: [smoke]
+description: >-
+  Browser proof for the seed http json form (issue #194, SPEC.md seed
+  section: the canonical seed example POSTs a declared json body with
+  default method POST and default Content-Type application/json). The
+  setup seed POSTs {name: seedjson-user-194, plan: plan-pro-194} to the
+  proof server's real /api/signup endpoint, which records the parsed
+  body; the demo page reads the recording back through
+  /api/last-signup and renders what the server actually received. The
+  positive step asserts the exact declared name, plan, and content
+  type in the rendered text, so the payload content itself is proven -
+  not just that the request succeeded (the run record also carries
+  seed_status 200 on the seed step). The negative control asserts text
+  the server never received and must FAIL naming the observed received
+  payload - a vacuous proof would pass it. The non-vacuity control
+  (declared json value changed) fails the positive step naming the
+  observed changed value; it is run by hand, not in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: seed a signup by POSTing the declared json body
+    seed:
+      http:
+        url: ${TARGET_URL}/api/signup
+        json: {name: seedjson-user-194, plan: plan-pro-194}
+  - name: open the seed-json demo page
+    goto: /demo/seed-json-demo.html
+
+steps:
+  - name: the server received exactly the declared json payload
+    click: "#seed-check-btn"
+    expect:
+      - text_contains: {selector: "#seed-result", text: "seedjson-user-194"}
+      - text_contains: {selector: "#seed-result", text: "plan-pro-194"}
+      - text_contains: {selector: "#seed-result", text: "application/json"}
+      - network_calls: {url: "/api/last-signup", status: {equals: 200}, equals: 1}
+
+  - name: negative control - the server never received this payload
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#seed-result", text: "SEEDJSON-WRONG never received"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
