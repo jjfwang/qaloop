@@ -1,0 +1,51 @@
+version: 1
+name: demo-mock-delay
+tags: [smoke]
+description: >-
+  Browser proof for the mock delay_ms option in the form SPEC.md
+  documents as its purpose (issue #212): the /api/greeting endpoint is
+  mocked with a 2500ms delay, the fixture page shows a spinner on click
+  and hides it when the response arrives, and the flow asserts the
+  spinner visible while the delayed response is still in flight - that
+  step passing at all proves the route hold does not freeze the
+  automation (runner.py _route_delay yields back to the driver). The
+  flow then waits for the spinner hidden and asserts the settled
+  content. The negative control re-asserts the spinner visible after
+  settling with a short step timeout_ms and must FAIL naming the
+  not-visible outcome - a vacuous in-flight assertion would not
+  distinguish in-flight from settled state. The non-vacuity control
+  (a scratch copy with delay_ms removed, where the response lands
+  almost immediately) makes the in-flight visible assertion fail or
+  race out; it is run by hand, not in this flow.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the greeting API with a 2500ms delay
+    mock: {url: "**/api/greeting", json: {message: "hello after the wait"}, delay_ms: 2500}
+  - name: open the mock-delay demo page
+    goto: /demo/mock-delay.html
+
+steps:
+  - name: click load - spinner shows while the delayed response is in flight
+    click: "#load"
+    expect:
+      - visible: "#spinner"
+
+  - name: spinner hides once the delayed response lands
+    wait: {target: "#spinner", state: hidden, timeout_ms: 10000}
+
+  - name: settled content is rendered
+    expect:
+      - text_contains: {selector: "#out", text: "hello after the wait"}
+
+  - name: negative control - spinner is not visible after settling
+    continue_on_fail: true
+    timeout_ms: 500
+    expect:
+      - visible: "#spinner"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
