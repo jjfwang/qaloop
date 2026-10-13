@@ -1,0 +1,50 @@
+version: 1
+name: demo-services-port
+tags: [smoke]
+description: >-
+  Browser proof for the services wait port form (issue #188, SPEC.md
+  services block: wait is exactly one of {port} | {http} |
+  {log_contains}; env.py boot_command waits via wait_for_port and
+  derives the service URL as http://127.0.0.1:<port>/). The fixture
+  service sleeps ~1.5s before binding its port at all, so boot
+  genuinely waits on the TCP port. The service declares no explicit
+  url: - the derived URL and the exported
+  ${QALOOP_SERVICE_PORTSVC_URL} / _PORT vars carry the target. The
+  positive steps assert content only this service serves (its page
+  and its /api/port-status payload). The negative control asserts
+  text the service never renders and must FAIL naming the observed
+  content - a vacuous proof would pass it. The non-vacuity boot
+  control (wait port changed to a port nothing listens on) fails
+  boot with SERVICE BOOT FAILED; it is run by hand, not in this flow.
+services:
+  - name: portsvc
+    command: "python3 demo/port_ready_server.py"
+    cwd: ".."
+    wait: {port: 8942}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_PORTSVC_URL}
+
+setup:
+  - name: open the page served by the port-gated service
+    goto: /demo/port-ready.html
+
+steps:
+  - name: the port-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the port-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "port-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "PORTSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
