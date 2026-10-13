@@ -1,0 +1,42 @@
+version: 1
+name: demo-mock-body
+tags: [smoke]
+description: >-
+  Browser proof for the mock body: payload form (issue #178, SPEC.md
+  mock section: exactly one of json, body, or path must be given, and
+  body: serves the raw string as-is with no JSON content-type default).
+  The mock for /demo/body-payload.txt is registered with body:
+  carrying a unique non-JSON plain-text marker. The mocked URL itself
+  does not exist on the server, and the demo page renders the response
+  via response.text() (never JSON parsing), so the rendered marker
+  can only have arrived via the inline body string as written. The
+  negative control asserts different content and fails naming the
+  observed body-served content.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the payload endpoint with a raw text body
+    mock: {url: "**/demo/body-payload.txt", body: "raw text served by mock body BODYRAW-178"}
+  - name: open the body demo page
+    goto: /demo/body-demo.html
+
+steps:
+  - name: raw-text body renders on click
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "raw text served by mock body BODYRAW-178"}
+
+  - name: mock_calls counts the body-served hit
+    expect:
+      - mock_calls: {url: "**/demo/body-payload.txt", equals: 1}
+
+  - name: negative control - rendered content is not a json payload
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "json payload"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
