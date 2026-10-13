@@ -914,8 +914,17 @@ def _check_assertions(page, step: Step, collectors: Collectors,
             elif key == "ax":
                 role, name = val["role"], val.get("name")
                 state = val.get("state", "visible")
-                loc = (scope.get_by_role(role, name=name) if name
-                       else scope.get_by_role(role))
+                # Issue #216: role locators exclude elements that are
+                # hidden from the accessibility tree by default, so a
+                # hidden dialog never resolves and state: attached
+                # times out (and state: hidden passes vacuously, the
+                # way a detached element does). include_hidden=True
+                # makes the locator resolve DOM-present elements in
+                # any visibility; wait_for(state=...) then decides
+                # visible/hidden/attached for real.
+                loc = (scope.get_by_role(role, name=name,
+                                         include_hidden=True) if name
+                       else scope.get_by_role(role, include_hidden=True))
                 loc.first.wait_for(state=state, timeout=t)
                 out.append(AssertionResult(
                     key, True,

@@ -1,0 +1,57 @@
+version: 1
+name: demo-ax-attached
+tags: [smoke]
+description: >-
+  Browser proof for the ax state: attached contract (issue #216,
+  SPEC.md ax section: state is visible|hidden|attached, where
+  attached means present in the DOM regardless of visibility). The
+  flow reuses the ax demo fixture: its Confirm delete dialog starts
+  with the hidden attribute - in the DOM, not visible - and the Show
+  dialog button reveals it. On page load the flow asserts the hidden
+  dialog with state: attached and it must PASS - attached is not
+  visible (a visible assertion on the same dialog is what demo-ax
+  proves only after the reveal). The negative control asserts
+  state: attached for a role/name that does not exist on the page
+  and must FAIL naming the ax assertion - attached is not hidden
+  either, because Playwright hidden is also satisfied by a detached
+  (absent) element, so a vacuous attached implementation that
+  behaved like hidden would pass the control. After clicking Show
+  dialog, the flow asserts state: attached alongside state: visible
+  on the revealed dialog - attached is visibility-agnostic in both
+  directions. The non-vacuity control (a scratch copy asserting
+  attached for the dialog on a page where the element is absent)
+  flips that step to a failure; it is run by hand, not in this flow.
+  The first proof run exposed the real bug this issue suspected:
+  Playwright role locators exclude accessibility-tree-hidden
+  elements by default, so attached timed out on the hidden dialog
+  (and hidden passed vacuously, as it does for a detached element);
+  the runner now locates ax roles with include_hidden=True and lets
+  wait_for decide the state, pinned by a unit test.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the ax demo page
+    goto: /demo/ax-demo.html
+
+steps:
+  - name: hidden dialog is attached - present in the DOM while not visible
+    expect:
+      - ax: {role: dialog, name: "Confirm delete", state: attached}
+      - ax: {role: dialog, name: "Confirm delete", state: hidden}
+
+  - name: negative control - a nonexistent control is not attached
+    continue_on_fail: true
+    expect:
+      - ax: {role: button, name: "No such control", state: attached}
+
+  - name: revealed dialog is still attached, now alongside visible
+    click: "#show-btn"
+    expect:
+      - ax: {role: dialog, name: "Confirm delete", state: attached}
+      - ax: {role: dialog, name: "Confirm delete", state: visible}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
