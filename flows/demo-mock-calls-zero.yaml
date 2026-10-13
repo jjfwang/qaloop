@@ -1,0 +1,53 @@
+version: 1
+name: demo-mock-calls-zero
+tags: [smoke]
+description: >-
+  Browser proof for the mock_calls equals: 0 contract (issue #214,
+  SPEC.md mock section): a URL with no registered mock - or a
+  registered mock with no hits yet - evaluates as 0, so
+  mock_calls {url, equals: 0} asserts the request was never made.
+  Before any click, the flow asserts 0 for all three zero branches:
+  the registered-but-unhit range-payload URL (no hits yet), a second
+  registered mock for a URL the page never fetches, and a URL pattern
+  with no registered mock at all. After one click the fetched URL
+  reads equals: 1 while both never-made URLs still read equals: 0 -
+  the zero readings are live counters, not vacuous pre-run state.
+  The negative control asserts equals: 1 for the never-fetched URL
+  and must FAIL naming the observed zero in the runner detail form
+  (mock_calls=0 want =1) - a vacuous proof would pass it.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the range payload endpoint with no times limit
+    mock: {url: "**/demo/range-payload.txt", body: "range payload served by mock RANGE-206"}
+  - name: mock a second endpoint the page never fetches
+    mock: {url: "**/demo/never-fetched.txt", body: "never fetched payload NEVER-214"}
+  - name: open the mock calls range demo page
+    goto: /demo/mock-calls-range-demo.html
+
+steps:
+  - name: before any click - all three zero branches read equals 0
+    expect:
+      - text_contains: {selector: "#out", text: "fetched: 0"}
+      - mock_calls: {url: "**/demo/range-payload.txt", equals: 0}
+      - mock_calls: {url: "**/demo/never-fetched.txt", equals: 0}
+      - mock_calls: {url: "**/demo/no-mock-at-all.txt", equals: 0}
+
+  - name: one click is served once - the never-made URLs still read equals 0
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "fetched: 1 RANGE-206"}
+      - mock_calls: {url: "**/demo/range-payload.txt", equals: 1}
+      - mock_calls: {url: "**/demo/never-fetched.txt", equals: 0}
+      - mock_calls: {url: "**/demo/no-mock-at-all.txt", equals: 0}
+
+  - name: negative control - the never-fetched URL was not served once
+    continue_on_fail: true
+    expect:
+      - mock_calls: {url: "**/demo/never-fetched.txt", equals: 1}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
