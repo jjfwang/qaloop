@@ -27,14 +27,7 @@ description: >-
   presence assertion placed before the login click in a scratch copy,
   where the cookie does not exist yet) flips that step to a failure
   naming cookie 'session'=None want present; it is run by hand, not
-  in this flow. The flow now also proves missing-cookie equals and
-  contains fail-closed per SPEC.md Cookies section: a missing cookie
-  never matches, not even contains, and the detail names the observed
-  None. Alongside the existing presence-only proof, two new negative
-  controls assert a never-set cookie with equals and with contains;
-  both must FAIL in the runner detail forms (cookie
-  'never-set'=None want ='x') and (cookie 'never-set'=None want
-  contains 'x') respectively - a vacuous proof would pass either.
+  in this flow.
 target: ${TARGET_URL}
 
 setup:
