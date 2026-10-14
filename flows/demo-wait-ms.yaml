@@ -1,0 +1,49 @@
+version: 1
+name: demo-wait-ms
+tags: [smoke]
+description: >-
+  Browser proof for the wait_ms fixed pause (issue #264, SPEC.md
+  step table: wait_ms is an int fixed pause, prefer wait). Unlike
+  the target-ful wait form proven by demo-wait-target, wait_ms
+  takes no condition: it must simply pause for the requested
+  duration, and the only observable evidence is the step record's
+  duration_ms in run.json. The fixture creates #late at 1200ms
+  after page load with text late attached, appended to #late-slot.
+  The pre-pause step asserts count equals 0 for #late immediately
+  after goto, well before the 1200ms timer fires; count polls but
+  equals 0 passes on first read, pinning that the reveal had not
+  happened yet. The bare wait_ms step then requests an 1800ms
+  pause, which must carry execution past the 1200ms reveal, and
+  the post-pause step asserts count equals 1 and the late attached
+  text. The duration_ms value is load-bearing: if wait_ms were a
+  no-op or returned early, the post-pause assertions could still
+  pass by polling, so acceptance requires the wait_ms step record
+  to show duration_ms of at least 1600 for the requested 1800ms
+  pause. There is deliberately no negative control and no
+  continue_on_fail step: acceptance requires zero failed step
+  records, unlike the sibling demo-count-zero and
+  demo-wait-target flows.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the wait target demo page
+    goto: /demo/wait-target.html
+
+steps:
+  - name: pre-pause - the late element has not attached yet
+    expect:
+      - count: {selector: "#late", equals: 0}
+
+  - name: fixed pause carries execution past the reveal timer
+    wait_ms: 1800
+
+  - name: post-pause - the late element attached during the pause
+    expect:
+      - count: {selector: "#late", equals: 1}
+      - text_contains: {selector: "#late", text: "late attached"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
