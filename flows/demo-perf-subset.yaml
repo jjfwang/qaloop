@@ -19,6 +19,16 @@ description: >-
   an impossible budget (lcp_ms lte 1) and must FAIL with a detail
   naming only lcp_ms and its observed value - proving the subset form
   is not vacuous and unrequested metrics never leak into the detail.
+  Issue #248 adds the fail-closed clause (SPEC.md: a null reading never
+  satisfies the budget): the first step after the setup goto, before
+  any interaction anywhere in the run, asserts inp_ms lte 500 as a
+  continue_on_fail negative control and must FAIL with a detail naming
+  inp_ms=None and want <=500 - proving the assertion does not pass
+  vacuously on a page nobody interacted with and does not read a
+  fabricated 0. The existing post-click inp_ms step must still pass,
+  proving the same assertion transitions from null-fail to a real
+  reading once a genuine first-input entry exists. Designed pattern:
+  exactly two failed records (both negative controls), overall passed.
 target: ${TARGET_URL}
 
 setup:
@@ -26,6 +36,11 @@ setup:
     goto: /demo/perf.html
 
 steps:
+  - name: negative control - inp_ms fails closed with no interaction yet naming inp_ms=None
+    continue_on_fail: true
+    expect:
+      perf: {inp_ms: {lte: 500}}
+
   - name: single-metric lcp_ms passes naming only lcp_ms
     expect:
       perf: {lcp_ms: {lte: 2500}}
