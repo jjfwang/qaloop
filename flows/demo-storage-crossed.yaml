@@ -15,7 +15,11 @@ description: >-
   must FAIL with detail storage session.flag='beta' want ='gamma',
   and local presence for a never-set key must FAIL with detail
   storage local.never-set=None want present - proving neither crossed
-  form is vacuous.
+  form is vacuous. A third negative control follows: local equals on
+  the never-set key must FAIL with detail storage
+  local.never-set=None want ='x' - proving the SPEC.md missing-key
+  clause (a missing key never matches) for the equals form in a real
+  browser, previously exercised only against a fake page in tests.
 target: ${TARGET_URL}
 
 setup:
@@ -38,6 +42,11 @@ steps:
     continue_on_fail: true
     expect:
       - storage: {kind: local, key: "never-set"}
+
+  - name: negative control - local equals for a never-set key fails naming None
+    continue_on_fail: true
+    expect:
+      - storage: {kind: local, key: "never-set", equals: "x"}
 
 teardown: []
 
