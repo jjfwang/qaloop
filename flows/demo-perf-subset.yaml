@@ -1,0 +1,52 @@
+name: demo-perf-subset
+tags: [smoke]
+description: >-
+  Browser proof for the perf assertion's single-metric subset form
+  (issue #232, SPEC.md Web Vitals section: perf is
+  {lcp_ms: {lte: n}, cls: {lte: n}, inp_ms: {lte: n}} with each metric
+  independently optional and at least one required). Adoption was
+  all-or-nothing: demo-perf is the only flow using perf and always
+  names all three metrics together, and the subset form was exercised
+  only on fake pages in unit tests, never in a real browser run - so
+  an omitted metric had never been proven ignored (not read into the
+  detail, not able to fail the step) against real Web Vitals data.
+  The flow reuses the demo/perf.html fixture (hero element for LCP,
+  #act button whose ~120ms handler produces a real first-input entry,
+  no layout shifts so CLS is 0). Each positive step names exactly one
+  metric and must pass with a detail naming only that metric: lcp_ms
+  alone after goto, cls alone, and inp_ms alone after clicking #act.
+  One negative control (continue_on_fail) asserts a single metric with
+  an impossible budget (lcp_ms lte 1) and must FAIL with a detail
+  naming only lcp_ms and its observed value - proving the subset form
+  is not vacuous and unrequested metrics never leak into the detail.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the web vitals demo page
+    goto: /demo/perf.html
+
+steps:
+  - name: single-metric lcp_ms passes naming only lcp_ms
+    expect:
+      perf: {lcp_ms: {lte: 2500}}
+
+  - name: single-metric cls passes naming only cls
+    expect:
+      perf: {cls: {lte: 0.1}}
+
+  - name: single-metric inp_ms passes after a real click naming only inp_ms
+    click: "#act"
+    expect:
+      perf: {inp_ms: {lte: 500}}
+
+  - name: negative control - impossible single-metric lcp_ms budget fails naming only lcp_ms
+    continue_on_fail: true
+    expect:
+      perf: {lcp_ms: {lte: 1}}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+version: 1
