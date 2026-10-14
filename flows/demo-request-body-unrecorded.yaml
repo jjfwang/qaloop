@@ -1,0 +1,49 @@
+version: 1
+name: demo-request-body-unrecorded
+tags: [smoke]
+description: >-
+  Browser proof for request_body fail-closed / privacy-by-default
+  behavior (issue #236): this flow deliberately does NOT opt in to
+  request-body recording, so no bodies are recorded. The page POSTs
+  a JSON payload via fetch to the mocked /api/save endpoint, the
+  flow waits for the response, a positive control asserts
+  network_calls still counts the request (equals 1), and a
+  negative control asserts request_body must FAIL naming the
+  opt-in, proving the assertion fails closed rather than passing
+  vacuously when nothing was recorded. Per SPEC.md, bodies are
+  recorded only when the flow explicitly opts in to recording.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the save API (no backend needed)
+    # delay_ms: the mock answers after 600ms so the response event fires
+    # after the `wait: {response: ...}` step starts listening (same pattern
+    # as flows/demo-wait-js-response.yaml)
+    mock: {url: "**/api/save", method: POST, json: {ok: true}, delay_ms: 600}
+  - name: open the demo page
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: POST the payload via fetch (fire-and-forget)
+    # `void` discards the fetch promise: page.evaluate would otherwise
+    # await it, and the response event would fire before the next step's
+    # `wait: {response: ...}` starts listening.
+    script: {js: "void fetch('/api/save',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({pet:'fluffy',hp:42})})"}
+
+  - name: wait for the save response
+    wait: {response: "/api/save", timeout_ms: 10000}
+
+  - name: positive control - network_calls still counts the request without body recording
+    expect:
+      - network_calls: {url: "/api/save", equals: 1}
+
+  - name: negative control - request_body fails closed naming the opt-in when no body was recorded
+    continue_on_fail: true
+    expect:
+      - request_body: {url: "/api/save", contains: '"pet":"fluffy"'}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
