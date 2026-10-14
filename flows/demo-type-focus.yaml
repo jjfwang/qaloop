@@ -3,7 +3,13 @@ description: >-
   Browser proof for the type and focus action ops (issue #78): types a query
   keystroke-by-keystroke into a debounced search input (delay_ms 60ms) and
   the debounced suggestion list renders; then focuses a button and reads
-  document.activeElement.id back.
+  document.activeElement.id back. Delay_ms-omitted form (issue #240): a
+  further step types one more character with NO delay_ms key, so the input
+  value becomes apr, and asserts the suggestion list now shows apricot and
+  the live input value equals apr - per-character input events really fired
+  with the runner default delay of 0. One negative-control step
+  (continue_on_fail) asserts a suggestion the typed prefix cannot produce,
+  which must FAIL naming the wanted text.
 target: ${TARGET_URL}
 
 setup:
@@ -15,6 +21,15 @@ steps:
     type: {target: "#q", text: "ap", delay_ms: 60}
     expect:
       - text_contains: {selector: "#suggestions", text: "apple"}
+  - name: type with delay_ms omitted - default delay 0 still fires per-character events
+    type: {target: "#q", text: "r"}
+    expect:
+      - text_contains: {selector: "#suggestions", text: "apricot"}
+      - value: {selector: "#q", equals: "apr"}
+  - name: negative control - a suggestion the typed prefix cannot produce fails naming the wanted text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#suggestions", text: "banana"}
   - name: focus the button
     focus: {target: "#ok"}
     expect:
