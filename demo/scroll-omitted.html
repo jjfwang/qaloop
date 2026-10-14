@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>scroll omitted forms demo</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  #plane { width: 4000px; height: 4000px; }
+  #readout {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    padding: 10px 14px; border: 2px solid #315fd6; border-radius: 8px;
+    background: #f7f5ef; font-size: 20px; font-weight: bold;
+  }
+</style>
+</head>
+<body>
+  <div id="readout">pos: v0 h0</div>
+  <div id="plane"></div>
+  <script>
+    // Band readout pinning the scroll default pixels (600): vertical
+    // bands are 300-900 (v1), 900-1500 (v2), 1500+ (v3), so a single
+    // default 600px wheel lands in v1 while a wrong default such as
+    // 100 (still v0) or 2000 (v3) lands in a different band, and a
+    // second consecutive default wheel cumulates to 1200 (v2). The
+    // horizontal band flips only past 300px of horizontal scroll, so
+    // a pixels-only step proves the default direction is vertical.
+    function band(v, edges) {
+      var b = 0;
+      for (var i = 0; i < edges.length; i++) { if (v >= edges[i]) b = i + 1; }
+      return b;
+    }
+    var readout = document.getElementById('readout');
+    function update() {
+      var v = band(window.scrollY, [300, 900, 1500]);
+      var h = band(window.scrollX, [300]);
+      readout.textContent = 'pos: v' + v + ' h' + h;
+    }
+    window.addEventListener('scroll', update);
+    update();
+  </script>
+</body>
+</html>

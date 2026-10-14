@@ -1,0 +1,63 @@
+name: demo-scroll-omitted
+tags: [smoke]
+description: >-
+  Browser proof for the scroll action's two omitted forms (issue #234,
+  SPEC.md scroll row: {target?, direction?: up|down|left|right,
+  pixels?: N} with default pixels 600, and runner.py defaulting an
+  omitted direction to down). Adoption was full-form only: scroll
+  appears in other flows as {direction, pixels} or {target}, and both
+  defaults were exercised only on a fake mouse in unit tests, never by
+  a real wheel event in a real page. The fixture is a 4000x4000 plane
+  with a position:fixed band readout (pos: v-band h-band) whose vertical
+  bands pin the 600px default from both sides: one default wheel lands
+  in v1 (a 100px default would stay in v0, a 2000px default would jump
+  to v3), a second consecutive default wheel cumulates to 1200 (v2),
+  and a direction-only up wheel returns to v1. A pixels-only step from
+  v1 then moves to v2 with the horizontal band unchanged, proving the
+  omitted direction defaults to down (up would return to v0, left or
+  right would flip the horizontal band or leave v unchanged). One
+  negative control (continue_on_fail) asserts a band the page is not
+  in and must FAIL with a detail naming the wanted text, proving the
+  band assertions are not vacuous.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the scroll omitted forms demo page
+    goto: /demo/scroll-omitted.html
+
+steps:
+  - name: page starts in band v0 h0
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v0 h0"}
+
+  - name: direction-only scroll down uses the default 600 pixels
+    scroll: {direction: down}
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v1 h0"}
+
+  - name: second consecutive direction-only scroll cumulates to 1200
+    scroll: {direction: down}
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v2 h0"}
+
+  - name: direction-only scroll up uses the default 600 pixels back
+    scroll: {direction: up}
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v1 h0"}
+
+  - name: pixels-only scroll defaults to direction down
+    scroll: {pixels: 600}
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v2 h0"}
+
+  - name: negative control - asserting a band the page is not in fails naming the wanted text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#readout", text: "pos: v3 h0"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+version: 1
