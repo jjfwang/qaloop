@@ -1,10 +1,16 @@
 name: demo-console-clean
 description: >-
   Browser proof for the console_clean page-level assertion (issue #144,
-  shipped in PR #14): a fixture page raises a console error and an uncaught
-  page error on its dirty control, while the clean control performs a quiet
-  DOM update. Each positive step clicks the clean control and asserts
-  console_clean: true plus the visible consequence.
+  shipped in PR #14; negative form issue #238): a fixture page raises a
+  console error and an uncaught page error on its dirty control, while
+  the clean control performs a quiet DOM update. Positive steps click
+  the clean control and assert console_clean: true plus the visible
+  consequence. One negative-control step (continue_on_fail) clicks the
+  dirty control and asserts console_clean: true, which must FAIL naming
+  both errors, while its text_contains assertion passes - proving the
+  failure branch end-to-end. A closing positive step clicks the clean
+  control again and must pass, proving the per-step checkpoint resets
+  and the dirty step errors do not leak into later steps.
 target: ${TARGET_URL}
 
 setup:
@@ -19,6 +25,19 @@ steps:
       - text_contains: {selector: "#clean-result", text: "quiet update done"}
 
   - name: second quiet update is also clean
+    click: "#clean-btn"
+    expect:
+      - console_clean: true
+      - text_contains: {selector: "#clean-result", text: "quiet update done"}
+
+  - name: negative control - noisy update fails console_clean naming both errors
+    continue_on_fail: true
+    click: "#dirty-btn"
+    expect:
+      - console_clean: true
+      - text_contains: {selector: "#dirty-result", text: "noisy update done"}
+
+  - name: closing positive - checkpoint resets after the dirty step
     click: "#clean-btn"
     expect:
       - console_clean: true
