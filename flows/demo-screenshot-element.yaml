@@ -7,7 +7,10 @@ description: >-
   browser and passes with rms_diff at or below max_diff, and a negative
   control asserting the same baseline against the different #card-b element
   fails with rms_diff above max_diff named in the detail - the selector,
-  not the page, decides the result.
+  not the page, decides the result. A missing-baseline control asserts a
+  baseline that is never created (baselines/never-created.png) against
+  #card-a and fails closed with a baseline missing detail pointing at
+  qaloop baselines.
 target: ${TARGET_URL}
 
 setup:
@@ -23,6 +26,11 @@ steps:
     continue_on_fail: true
     expect:
       - screenshot_matches: {baseline: "baselines/element-card-a.png", selector: "#card-b", max_diff: 0.02}
+
+  - name: missing-baseline fail-closed control - never-created baseline fails naming baseline missing
+    continue_on_fail: true
+    expect:
+      - screenshot_matches: {baseline: "baselines/never-created.png", selector: "#card-a"}
 
   - name: card-a still matches after the negative control
     expect:
