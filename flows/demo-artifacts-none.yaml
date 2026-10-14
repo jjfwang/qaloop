@@ -1,0 +1,46 @@
+name: demo-artifacts-none
+description: >-
+  Browser proof for the flow-level artifacts none policies (issue #222):
+  a flow declaring artifacts {screenshot: none, ax_snapshot: none} captures
+  no screenshot and no accessibility snapshot for ANY step - in particular
+  not for a FAILED step, where the on-failure policy would capture both.
+  The flow runs pass / designed-fail (continue_on_fail) / pass against the
+  dialog fixture. The proof is external, following the demo-trace (#176)
+  and demo-video (#160) pattern: after baselines and an independent verify
+  run, the run dir's steps/ must contain zero .png files and zero -ax.txt
+  files, while run.json still records the designed step as failed with its
+  assertion detail - proving capture was suppressed, not that nothing
+  failed. Non-vacuity control: the same flow with artifacts flipped to
+  on-failure makes the failing step produce steps-01.png and
+  steps-01-ax.txt.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the dialog demo page
+    goto: /demo/dialog-demo.html
+
+steps:
+  - name: passing step captures nothing under the none policies
+    click: "#confirm-btn"
+    on_dialog: dismiss
+    expect:
+      - text_contains: {selector: "#confirm-result", text: "cancelled"}
+
+  - name: designed failing step captures nothing under the none policies
+    continue_on_fail: true
+    click: "#alert-btn"
+    on_dialog: accept
+    expect:
+      - text_contains: {selector: "#alert-result", text: "this text never appears"}
+
+  - name: pass-after-fail step still captures nothing under the none policies
+    click: "#prompt-btn"
+    on_dialog: accept
+    expect:
+      - text_contains: {selector: "#prompt-result", text: "prompt answered"}
+
+teardown: []
+
+artifacts: {screenshot: none, ax_snapshot: none, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
