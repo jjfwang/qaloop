@@ -1,0 +1,46 @@
+version: 1
+name: demo-network-failed
+tags: [smoke]
+description: >-
+  Browser proof for network_calls failed-request counting end-to-end
+  (issue #250, SPEC.md Assertions line 279 and Run artifacts lines
+  873-876/893-900: failed requests get status: null, ms: null,
+  failure: <reason> in network.jsonl - qaloop/artifacts.py
+  Collectors._on_requestfailed records the entry with status=None,
+  ms=None, failure=str(failure)[:300]; qaloop/runner.py network_calls
+  counts them with no filter and, with a filter, requires status is not
+  None plus _status_cmp, so they never match). One click drives exactly
+  one fetch to a dead endpoint on a closed high port; the connection is
+  refused and the page renders its failure marker only in the catch
+  path. The positive step proves the failed request counts 1 without a
+  filter and 0 under both status equals 200 and status gte 200. The
+  negative control asserts it equals 1 under status equals 200 and must
+  FAIL naming the observed count 0 - a vacuous proof would pass it.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the network failed demo page
+    goto: /demo/network-failed-demo.html
+
+steps:
+  - name: one click drives exactly one failed request
+    click: "#fetch-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "NETFAIL-250"}
+
+  - name: the failed request counts without a filter and never with one
+    expect:
+      - network_calls: {url: "dead-endpoint", equals: 1}
+      - network_calls: {url: "dead-endpoint", status: {equals: 200}, equals: 0}
+      - network_calls: {url: "dead-endpoint", status: {gte: 200}, equals: 0}
+
+  - name: negative control - the failed request does not count under status equals 200
+    continue_on_fail: true
+    expect:
+      - network_calls: {url: "dead-endpoint", status: {equals: 200}, equals: 1}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

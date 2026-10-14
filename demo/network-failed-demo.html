@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop network failed request demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  .slot { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  button { margin-top: 1rem; padding: .5rem 1.25rem; }
+</style>
+</head>
+<body>
+<h1>Network failed request demo</h1>
+<p>The button issues a single fetch to a dead endpoint on a closed high
+port (127.0.0.1:59991). The connection is refused, so the request fails
+with no response at all: the run log records it with status null. Only
+the failure path renders the marker line in the output slot.</p>
+<button id="fetch-btn">Fetch the dead endpoint</button>
+<div id="out" class="slot" role="status" aria-live="polite"></div>
+
+<script>
+document.getElementById('fetch-btn').addEventListener('click', async () => {
+  try {
+    await fetch('http://127.0.0.1:59991/dead-endpoint', {cache: 'no-store'});
+    document.getElementById('out').textContent = 'unexpected success';
+  } catch (e) {
+    document.getElementById('out').textContent = 'request failed: dead endpoint unreachable NETFAIL-250';
+  }
+});
+</script>
+</body>
+</html>
