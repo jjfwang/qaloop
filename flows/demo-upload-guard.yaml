@@ -1,0 +1,31 @@
+name: demo-upload-guard
+description: >-
+  Browser proof for the upload fail-closed guard end-to-end (issue #252):
+  an upload step with no declared upload dir, or with a path outside the
+  declared dir, must fail the step and set no file. The upload path comes
+  from QALOOP_UPLOAD_FILE (the absolute demo/upload-fixture.txt path),
+  independent of any declared dir, so each guard run drives the same file
+  against a different declaration state. The upload step is marked
+  continue_on_fail so the run continues, and a separate expect-only step
+  asserts #picked stays empty (text_matches "^$", never a vacuous empty
+  text_contains) - proving no file was set on the #resume input.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the upload demo page
+    goto: /demo/upload-demo.html
+
+steps:
+  - name: upload without a usable declared dir fails closed
+    continue_on_fail: true
+    upload: {target: "#resume", path: "${QALOOP_UPLOAD_FILE}"}
+
+  - name: no file was picked after the rejected upload
+    expect:
+      - text_matches: {selector: "#picked", pattern: "^$"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
