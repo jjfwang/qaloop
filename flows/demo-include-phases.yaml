@@ -1,0 +1,38 @@
+name: demo-include-phases
+description: >-
+  Browser proof for issue #244: include expansion in setup and teardown
+  phases plus a nested include end-to-end. Setup includes the outer
+  fragment with {user: carol}; the outer fragment opens the login page
+  and fills the user, then nested-includes the inner fragment by bare
+  sibling filename, whose own with supplies the password (lexical
+  scoping per level, nested resolution relative to the fragment's
+  directory). Steps submit the form and assert Welcome, carol, which is
+  impossible if setup or nested expansion were dropped. One
+  continue_on_fail negative control asserting a different user's
+  welcome is the only failed step and fails naming the observed
+  Welcome, carol text. The teardown include's inlined step name appears
+  passed in run.json, proving teardown expansion.
+target: ${TARGET_URL}
+
+setup:
+  - name: setup include opens the login page and fills both credentials
+    include: fragments/include-setup-outer.yaml
+    with: {user: carol}
+
+steps:
+  - name: submit the login form filled during setup and expect the welcome text
+    click: "#login"
+    expect:
+      text_contains: {selector: "#welcome", text: "Welcome, carol"}
+  - name: negative control - the welcome text names carol, not a different user
+    continue_on_fail: true
+    expect:
+      text_contains: {selector: "#welcome", text: "Welcome, mallory"}
+
+teardown:
+  - name: teardown include confirms the session state
+    include: fragments/include-teardown-check.yaml
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

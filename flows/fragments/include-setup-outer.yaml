@@ -1,0 +1,16 @@
+# Outer fragment for issue #244, used in the flow's setup phase.
+#
+# The username is filled from the flow-level include's `with:` mapping.
+# The password is delegated to the nested include of the inner fragment
+# (flows/fragments/include-password.yaml), included here by bare sibling
+# filename; the nested include's own `with:` mapping, declared here,
+# supplies the password (lexical scoping per level, nested resolution
+# relative to this fragment's directory).
+steps:
+  - name: open the login page
+    goto: /demo/demo-login.html
+  - name: enter the username from the setup include with
+    fill: {target: "#user", text: "${user}"}
+  - name: nested include fills the password
+    include: include-password.yaml
+    with: {password: s3cret}

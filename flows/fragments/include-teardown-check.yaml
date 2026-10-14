@@ -1,0 +1,10 @@
+# Teardown-phase fragment for issue #244.
+#
+# The welcome text asserted here only exists because the setup phase
+# filled the login form and the steps phase submitted it, so a passing
+# teardown step proves teardown include expansion ran against live
+# session state left by the earlier phases.
+steps:
+  - name: teardown include confirms the welcome text from the earlier phases
+    expect:
+      text_contains: {selector: "#welcome", text: "Welcome, carol"}
