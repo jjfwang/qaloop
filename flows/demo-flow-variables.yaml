@@ -1,18 +1,28 @@
 name: demo-flow-variables
 description: >-
-  Browser proof for flow variables (issue #87): create a row whose id is
-  generated at runtime, capture it with `store:` into ${itemId}, assert
-  the row is visible, then delete the row using the captured id and
-  assert it is gone.
+  Browser proof for the flow-variables store lifecycle end-to-end
+  (issue #242, building on issue #87): setup stores a variable consumed
+  by the steps phase (cross-phase sharing, setup to steps); a row id
+  captured with `store:` is re-stored after a second create and the
+  overwrite is proven by observation, since deleting with the stale id
+  would fail (re-store overwrite); a negative-control step whose
+  assertion fails captures nothing, so its `store:` variable is never
+  set (failed store captures nothing) and a later referencing step
+  fails at runtime naming the never-captured variable; a steps-phase
+  capture is consumed by the teardown phase (cross-phase sharing,
+  steps to teardown). The run record shows exactly two failed step
+  records (the negative control and the referencing step), the
+  teardown record passed, and the overall run passed.
 target: ${TARGET_URL}
 
 setup:
-  - name: open the flow-variables demo page
+  - name: open the flow-variables demo page and capture the create button id
     goto: /demo/flow-variables.html
+    store: {createBtn: {js: "document.querySelector('button').id"}}
 
 steps:
-  - name: create an item and capture its generated id
-    click: "#create"
+  - name: create an item via the setup-captured button id and capture its generated id
+    click: "#${createBtn}"
     store: {itemId: {js: "document.querySelector('.row').dataset.itemId"}}
     expect:
       - visible: ".row"
@@ -22,7 +32,38 @@ steps:
     expect:
       - hidden: ".row"
 
-teardown: []
+  - name: create another item and re-store the id, overwriting the first capture
+    click: "#create"
+    store: {itemId: {js: "document.querySelector('.row').dataset.itemId"}}
+    expect:
+      - visible: ".row"
+
+  - name: delete the second item using the re-stored id
+    click: ".del[data-item-id='${itemId}']"
+    expect:
+      - hidden: ".row"
+
+  - name: create an item whose id is captured for the teardown phase
+    click: "#create"
+    store: {teardownId: {js: "document.querySelector('.row').dataset.itemId"}}
+    expect:
+      - visible: ".row"
+
+  - name: negative control - failing assertion captures nothing for its store variable
+    continue_on_fail: true
+    store: {ghostId: {js: "document.querySelector('.row').dataset.itemId"}}
+    expect:
+      - visible: ".definitely-absent"
+
+  - name: referencing the never-captured variable fails naming it
+    continue_on_fail: true
+    click: ".del[data-item-id='${ghostId}']"
+
+teardown:
+  - name: teardown deletes the item using the steps-captured id
+    click: ".del[data-item-id='${teardownId}']"
+    expect:
+      - hidden: ".row"
 
 artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
 timeouts: {step_ms: 15000, run_ms: 120000}
