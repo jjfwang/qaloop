@@ -1,0 +1,40 @@
+version: 1
+name: demo-count-zero
+tags: [smoke]
+description: >-
+  Browser proof for the count equals: 0 contract (issue #262,
+  SPEC.md Assertions table: count is {selector, equals} / {selector, gte} /
+  {selector, lte}). Sibling zero proofs already cover mock_calls and
+  network_calls equals: 0, but element count equals: 0 was unproven
+  end-to-end, and the unit test test_count_assertion_polling never serves
+  a real 0. The fixture page renders exactly one .item, so a selector
+  matching no rendered element must read count equals: 0 against the
+  live DOM. The negative control asserts equals: 0 for the one rendered
+  item and must FAIL naming the observed count in the runner detail
+  form (#items .item: count=1 want =0) - a vacuous proof would pass it.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the count range demo page
+    goto: /demo/count-range-demo.html
+
+steps:
+  - name: positive anchor - the live page renders exactly one item
+    expect:
+      - text_contains: {selector: "#out", text: "total: 1 RANGE-204"}
+      - count: {selector: "#items .item", equals: 1}
+
+  - name: absent element - a selector matching nothing reads count equals 0
+    expect:
+      - count: {selector: "#items .never-rendered", equals: 0}
+
+  - name: negative control - the rendered item does not read count equals 0
+    continue_on_fail: true
+    expect:
+      - count: {selector: "#items .item", equals: 0}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
