@@ -915,7 +915,7 @@ def _check_assertions(page, step: Step, collectors: Collectors,
                 else:
                     diff = screenshot_rms_diff(shot, baseline)
                     ok = diff <= max_diff
-                    detail = f"rms_diff={diff:.4f} max_diff={max_diff}"
+                    detail = f"rms_diff={diff:.4f} max_diff={max_diff:.4f}"
                     if not ok:
                         diff_name = (f"assert-{step.phase}-{step.index:02d}"
                                      f"-diff.png")

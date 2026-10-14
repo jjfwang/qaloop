@@ -1376,6 +1376,31 @@ def test_screenshot_matches_selector_capture():
         check("missing selector fails cleanly",
               not res[0].passed and res[0].detail.startswith("TimeoutError:"),
               res[0].detail)
+        # Case 4 (issue #230): max_diff omitted -> documented default 0.02
+        # applies; identical element image passes with the default named
+        # in the detail at four decimal places.
+        page = FakePage(element_png, full_png)
+        res = _check_assertions(
+            page, make_step({"baseline": "e.png", "selector": "#out"}),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        check("omitted max_diff passes identical element",
+              res[0].passed, res[0].detail)
+        check("omitted max_diff detail names default 0.0200",
+              res[0].detail == "rms_diff=0.0000 max_diff=0.0200",
+              res[0].detail)
+        # Case 5 (issue #230): max_diff omitted -> a differing element image
+        # fails against the same default, detail naming rms_diff above 0.02.
+        page = FakePage(full_png, full_png)
+        res = _check_assertions(
+            page, make_step({"baseline": "e.png", "selector": "#out"}),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        check("omitted max_diff fails differing element",
+              not res[0].passed, res[0].detail)
+        parts = res[0].detail.split()
+        check("omitted max_diff failure detail names default 0.0200",
+              len(parts) >= 2 and parts[1] == "max_diff=0.0200"
+              and float(parts[0].split("=")[1]) > 0.02,
+              res[0].detail)
 
 
 def test_ax_assertion_includes_hidden():
