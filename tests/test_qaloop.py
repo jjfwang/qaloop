@@ -4241,6 +4241,94 @@ def test_dialog_support():
           res2[0].detail)
 
 
+def test_goto_beforeunload_abort():
+    """goto + dismissed beforeunload (issue #220): Playwright raises
+    net::ERR_ABORTED when a dismissed beforeunload dialog cancels the
+    navigation. _do_action treats that abort as the completed action
+    only when a beforeunload dialog was recorded during the goto, so
+    the step's assertions can judge where the browser ended up; every
+    other abort still raises."""
+    from qaloop.runner import _do_action
+    from qaloop.spec import Step
+
+    def mkstep():
+        return Step(index=0, phase="steps", name="g", op="goto",
+                    params="/demo/page-nav-b.html", expect={},
+                    expect_items=[], continue_on_fail=False,
+                    timeout_ms=None, raw={})
+
+    class FakePage:
+        def __init__(self, dialogs=None, raise_msg=None, record=None):
+            self.calls = []
+            self._dialogs = dialogs
+            self._raise_msg = raise_msg
+            self._record = record
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.calls.append(url)
+            if self._record is not None and self._dialogs is not None:
+                self._dialogs.append(self._record)
+            if self._raise_msg is not None:
+                raise Exception(self._raise_msg)  # noqa: BLE001
+
+    abort = "Page.goto: net::ERR_ABORTED at http://x/demo/page-nav-b.html"
+
+    dialogs = []
+    page = FakePage(dialogs=dialogs, raise_msg=abort,
+                    record={"type": "beforeunload", "message": ""})
+    _do_action(page, mkstep(), "http://x", {}, dialogs=dialogs)
+    check("goto abort with beforeunload recorded is completed, not raised",
+          page.calls == ["http://x/demo/page-nav-b.html"], str(page.calls))
+
+    dialogs2 = []
+    page2 = FakePage(dialogs=dialogs2, raise_msg=abort)
+    try:
+        _do_action(page2, mkstep(), "http://x", {}, dialogs=dialogs2)
+        check("goto abort with no dialog still raises", False, "no error")
+    except Exception as e:  # noqa: BLE001
+        check("goto abort with no dialog still raises",
+              "ERR_ABORTED" in str(e), str(e))
+
+    dialogs3 = []
+    page3 = FakePage(dialogs=dialogs3, raise_msg=abort,
+                     record={"type": "alert", "message": "hi"})
+    try:
+        _do_action(page3, mkstep(), "http://x", {}, dialogs=dialogs3)
+        check("goto abort with only an alert dialog still raises",
+              False, "no error")
+    except Exception as e:  # noqa: BLE001
+        check("goto abort with only an alert dialog still raises",
+              "ERR_ABORTED" in str(e), str(e))
+
+    page4 = FakePage(raise_msg=abort)
+    try:
+        _do_action(page4, mkstep(), "http://x", {})
+        check("goto abort without dialogs tracking still raises",
+              False, "no error")
+    except Exception as e:  # noqa: BLE001
+        check("goto abort without dialogs tracking still raises",
+              "ERR_ABORTED" in str(e), str(e))
+
+    dialogs5 = []
+    page5 = FakePage(dialogs=dialogs5,
+                     raise_msg="Page.goto: net::ERR_FAILED at http://x/",
+                     record={"type": "beforeunload", "message": ""})
+    try:
+        _do_action(page5, mkstep(), "http://x", {}, dialogs=dialogs5)
+        check("goto non-abort error raises even with beforeunload",
+              False, "no error")
+    except Exception as e:  # noqa: BLE001
+        check("goto non-abort error raises even with beforeunload",
+              "ERR_FAILED" in str(e), str(e))
+
+    page6 = FakePage()
+    res = _do_action(page6, mkstep(), "http://x", {}, dialogs=[])
+    check("goto success returns None and navigates",
+          res is None
+          and page6.calls == ["http://x/demo/page-nav-b.html"],
+          str(page6.calls))
+
+
 def test_hover_op():
     """hover op: spec validation ({target} required) and the runner calling
     page.hover with the selector and step timeout (issue #74)."""

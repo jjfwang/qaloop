@@ -1,0 +1,67 @@
+version: 1
+name: demo-beforeunload
+tags: [smoke]
+description: >-
+  Browser proof for the dialog type: beforeunload end-to-end
+  (issue #220, SPEC.md dialog section: type is
+  alert|confirm|prompt|beforeunload). The fixture page
+  (demo/beforeunload-demo.html) arms a beforeunload listener only
+  after its field is edited - a dirty form - so an unarmed
+  navigation away raises no dialog: the first step's dialog
+  {type: beforeunload} assertion is a designed negative control
+  failing with the detail "no dialog appeared since the step
+  started", while the navigation itself completes. After a fill
+  arms the listener (the form state reads dirty), a goto to the
+  target page with on_dialog: dismiss asserts the recorded
+  beforeunload dialog and that the browser stayed on the fixture
+  page (url and title); a second goto with on_dialog: accept
+  asserts the dialog again and that navigation completed (the
+  target page's url and title). The dismissed goto also proves
+  the runner's #220 fix: Playwright raises net::ERR_ABORTED for a
+  navigation a dismissed beforeunload cancels, and the runner
+  treats that abort as the completed action when a beforeunload
+  dialog was recorded during the goto.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the beforeunload demo page
+    goto: /demo/beforeunload-demo.html
+
+steps:
+  - name: negative control - unarmed navigation away raises no dialog
+    continue_on_fail: true
+    goto: /demo/page-nav-b.html
+    expect:
+      - dialog: {type: beforeunload}
+
+  - name: return to the fixture and edit the field to arm beforeunload
+    goto: /demo/beforeunload-demo.html
+    expect:
+      - text_contains: {selector: "#form-state", text: "clean"}
+
+  - name: editing the field marks the form dirty
+    fill: {target: "#note", text: "unsaved note"}
+    expect:
+      - text_contains: {selector: "#form-state", text: "dirty - unsaved changes"}
+
+  - name: dismiss on the armed goto stays on the fixture page
+    goto: /demo/page-nav-b.html
+    on_dialog: dismiss
+    expect:
+      - dialog: {type: beforeunload}
+      - url_contains: "beforeunload-demo"
+      - title_contains: "beforeunload demo"
+
+  - name: accept on the armed goto completes the navigation
+    goto: /demo/page-nav-b.html
+    on_dialog: accept
+    expect:
+      - dialog: {type: beforeunload}
+      - url_contains: "page-nav-b"
+      - title_contains: "Page B - nav demo"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

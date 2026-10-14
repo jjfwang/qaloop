@@ -424,6 +424,13 @@ the dialog message. Either may be omitted to match any dialog. All dialogs
 are listed in the run report and `run.json` under `dialogs`. Note: `prompt()`
 is accepted with empty input — typed prompt input is out of scope.
 
+A `beforeunload` dialog raised by a step's `goto` follows the same policy:
+`accept` lets the navigation complete; `dismiss` cancels it, and the `goto`
+counts as completed (Playwright's `net::ERR_ABORTED` for the blocked
+navigation is not a step error) so the step's assertions judge where the
+browser ended up — e.g. `dialog: {type: beforeunload}` plus a `url_contains`
+for the page it stayed on.
+
 ### Element state — `attribute`, `value`, `focused`
 
 Three assertions on an element's runtime state, for contracts like "the
