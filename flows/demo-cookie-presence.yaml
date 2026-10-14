@@ -17,7 +17,13 @@ description: >-
   presence-only form solely for storage). The negative control
   asserts presence of a cookie that is never set and must FAIL in the
   runner detail form (cookie 'never-set'=None want present) - a
-  vacuous proof would pass it. The non-vacuity control (the same
+  vacuous proof would pass it. Issue #256 extends the same fail-closed
+  clause to the value forms: two further negative controls assert the
+  never-set cookie with equals and with contains, and both must FAIL
+  naming the observed value None (cookie 'never-set'=None want ='x'
+  and cookie 'never-set'=None want contains 'x'), pinning SPEC.md's
+  rule that a missing cookie never matches, not even with contains,
+  through the real context.cookies() path. The non-vacuity control (the same
   presence assertion placed before the login click in a scratch copy,
   where the cookie does not exist yet) flips that step to a failure
   naming cookie 'session'=None want present; it is run by hand, not
@@ -39,6 +45,16 @@ steps:
     continue_on_fail: true
     expect:
       - cookie: {name: "never-set"}
+
+  - name: negative control - a never-set cookie never matches equals
+    continue_on_fail: true
+    expect:
+      - cookie: {name: "never-set", equals: "x"}
+
+  - name: negative control - a never-set cookie never matches contains
+    continue_on_fail: true
+    expect:
+      - cookie: {name: "never-set", contains: "x"}
 
 teardown: []
 
