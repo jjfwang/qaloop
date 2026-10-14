@@ -1,0 +1,37 @@
+name: demo-screenshot-default-diff
+description: >-
+  Browser proof for the max_diff-omitted (default) form of the
+  screenshot_matches assertion (issue #230, SPEC.md screenshot_matches
+  section): max_diff is optional and defaults to the documented 0.02, so
+  every step below omits it - the positive step re-captures the #card-a
+  element against the checked-in baseline under flows/baselines/ and
+  passes with rms_diff at or below the default 0.02, a negative control
+  asserting the same baseline against the different #card-b element fails
+  with rms_diff above the default 0.02 named in the detail, and the
+  closing positive repeats the #card-a form - the selector, not the page,
+  decides the result.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the screenshot element demo page
+    goto: /demo/screenshot-element.html
+
+steps:
+  - name: card-a element matches its element baseline at the default max_diff
+    expect:
+      - screenshot_matches: {baseline: "baselines/element-card-a.png", selector: "#card-a"}
+
+  - name: negative control - same baseline against card-b fails naming rms_diff
+    continue_on_fail: true
+    expect:
+      - screenshot_matches: {baseline: "baselines/element-card-a.png", selector: "#card-b"}
+
+  - name: card-a still matches after the negative control
+    expect:
+      - screenshot_matches: {baseline: "baselines/element-card-a.png", selector: "#card-a"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
