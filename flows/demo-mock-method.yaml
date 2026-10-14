@@ -1,0 +1,48 @@
+version: 1
+name: demo-mock-method
+tags: [smoke]
+description: >-
+  Browser proof for the mock method: option (SPEC.md mock section:
+  a mock registered with a method only matches requests with that
+  method; requests with a different method fall through to the real
+  network, and mock_calls counts only served hits). The mock for
+  /api/greeting is registered with method: POST. The fixture fetches
+  that URL once per button: the GET fetch does not match the POST
+  mock and falls through to the proof server, showing the real
+  greeting, while the POST fetch matches and shows the mocked
+  greeting, and mock_calls equals 1 after both requests. The
+  negative control asserts the GET slot shows the mocked greeting
+  and fails naming the observed real content.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the greeting endpoint for POST only
+    mock: {url: "**/api/greeting", method: POST, json: {greeting: "Hello from mock POST"}}
+  - name: open the mock method demo page
+    goto: /demo/mock-method-demo.html
+
+steps:
+  - name: GET fetch falls through to the real server
+    click: "#get-btn"
+    expect:
+      - text_contains: {selector: "#get-slot", text: "Hello from the proof server"}
+
+  - name: POST fetch is served by the mock
+    click: "#post-btn"
+    expect:
+      - text_contains: {selector: "#post-slot", text: "Hello from mock POST"}
+
+  - name: mock_calls counts only the matched POST hit
+    expect:
+      - mock_calls: {url: "**/api/greeting", equals: 1}
+
+  - name: negative control - GET render is not the mocked content
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#get-slot", text: "Hello from mock POST"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

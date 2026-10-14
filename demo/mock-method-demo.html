@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qaloop mock method demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; }
+  .slot { margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; min-height: 2rem; }
+  button { margin-top: 1rem; padding: .5rem 1.25rem; }
+</style>
+</head>
+<body>
+<h1>Mock method demo</h1>
+<p>The greeting endpoint is mocked for POST only. Clicking the GET
+button fetches /api/greeting with a GET request, which does not match
+the POST mock and falls through to the real server. Clicking the POST
+button fetches the same URL with a POST request, which matches the
+mock and is served by it.</p>
+<button id="get-btn">Fetch greeting (GET)</button>
+<button id="post-btn">Fetch greeting (POST)</button>
+<div id="get-slot" class="slot" role="status" aria-live="polite"></div>
+<div id="post-slot" class="slot" role="status" aria-live="polite"></div>
+
+<script>
+document.getElementById('get-btn').addEventListener('click', async () => {
+  const r = await fetch('/api/greeting', {cache: 'no-store'});
+  const j = await r.json();
+  document.getElementById('get-slot').textContent = j.greeting;
+});
+document.getElementById('post-btn').addEventListener('click', async () => {
+  const r = await fetch('/api/greeting', {method: 'POST', cache: 'no-store'});
+  const j = await r.json();
+  document.getElementById('post-slot').textContent = j.greeting;
+});
+</script>
+</body>
+</html>
