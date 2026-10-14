@@ -1,0 +1,47 @@
+name: demo-ax-no-name
+tags: [smoke]
+description: >-
+  Browser proof for the ax assertion name-omitted form (issue #224,
+  SPEC.md ax row: {role, name?, state?} - name is optional). The flow
+  reuses the ax demo fixture: a Save profile button, and a Confirm
+  delete dialog that starts with the hidden attribute and is revealed
+  by the Show dialog button. Every positive step omits name entirely:
+  {role: button} alone matches the button role without naming it,
+  {role: dialog, state: hidden} matches the still-hidden dialog, and
+  after the reveal {role: dialog, state: visible} matches it. The
+  negative control asserts {role: checkbox} - a role the page does
+  not carry - and must FAIL with detail naming the ax assertion,
+  proving name-omitted matching is not vacuous: omitting name widens
+  the match to any element with the role, it does not make the
+  assertion pass unconditionally.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the ax demo page
+    goto: /demo/ax-demo.html
+
+steps:
+  - name: button role matches with name omitted
+    expect:
+      - ax: {role: button}
+
+  - name: hidden dialog matches with name omitted and state hidden
+    expect:
+      - ax: {role: dialog, state: hidden}
+
+  - name: negative control - a role the page does not carry fails naming the ax assertion
+    continue_on_fail: true
+    expect:
+      - ax: {role: checkbox}
+
+  - name: revealed dialog matches with name omitted and state visible
+    click: "#show-btn"
+    expect:
+      - ax: {role: dialog, state: visible}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+version: 1
