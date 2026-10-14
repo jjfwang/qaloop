@@ -1,0 +1,47 @@
+name: demo-storage-crossed
+tags: [smoke]
+description: >-
+  Browser proof for the storage crossed forms (issue #226, SPEC.md
+  storage row: {kind: local|session, key, equals?: v} - equals is
+  optional for either kind). Adoption was crossed-incomplete: local
+  only ever appeared with equals and session only ever presence-only.
+  The flow reuses the cookie/storage fixture: its login button writes,
+  asynchronously (400ms tick), localStorage consent=accepted and
+  sessionStorage flag=beta, so both positives must poll over the async
+  write. The positive step asserts session with equals beta
+  (session+equals) and local consent with no equals (local
+  presence-only) on the same login click. Two negative controls
+  follow, each a designed failure: session+equals with a wrong value
+  must FAIL with detail storage session.flag='beta' want ='gamma',
+  and local presence for a never-set key must FAIL with detail
+  storage local.never-set=None want present - proving neither crossed
+  form is vacuous.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the cookie/storage demo page
+    goto: /demo/cookie-storage.html
+
+steps:
+  - name: crossed positives - session equals and local presence after the async login write
+    click: "#login"
+    expect:
+      - storage: {kind: session, key: "flag", equals: "beta"}
+      - storage: {kind: local, key: "consent"}
+
+  - name: negative control - session equals with a wrong value fails naming the observed value
+    continue_on_fail: true
+    expect:
+      - storage: {kind: session, key: "flag", equals: "gamma"}
+
+  - name: negative control - local presence for a never-set key fails naming the key
+    continue_on_fail: true
+    expect:
+      - storage: {kind: local, key: "never-set"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+version: 1
