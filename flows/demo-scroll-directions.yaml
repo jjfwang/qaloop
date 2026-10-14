@@ -1,0 +1,64 @@
+name: demo-scroll-directions
+tags: [smoke]
+description: >-
+  Browser proof for the scroll action's up, left and right directions
+  (issue #228, SPEC.md scroll row: {target?, direction?:
+  up|down|left|right, pixels?: N} - a targetless scroll drives
+  mouse.wheel, down/up vertical, left/right horizontal). Adoption was
+  one-sided: demo-scroll-lazy proves only direction down plus the
+  target form, and up/left/right were covered only by fake-mouse unit
+  checks of the runner's offset map, never by a real wheel event in a
+  real page. The fixture is a 4000x4000 plane with a position:fixed
+  readout whose text a scroll listener sets to a coarse region label
+  (top-left / top-right / bottom-right / bottom-left) derived from
+  window.scrollX/scrollY with thresholds well inside the scroll range,
+  so wheel granularity cannot flip a label. Each direction gets one
+  scroll step with explicit direction and pixels: right moves the
+  region horizontally only, down reaches bottom-right, left moves back
+  horizontally, and up returns the flow to top-left - proving up and
+  left actually reversed the earlier down and right scrolls. One
+  negative control (continue_on_fail) asserts a region the page is not
+  in and must FAIL with a detail naming the wanted text, proving the
+  region assertions are not vacuous.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the scroll directions demo page
+    goto: /demo/scroll-directions.html
+
+steps:
+  - name: page starts at the top-left region
+    expect:
+      - text_contains: {selector: "#readout", text: "region: top-left"}
+
+  - name: scroll right moves the region horizontally only
+    scroll: {direction: right, pixels: 2000}
+    expect:
+      - text_contains: {selector: "#readout", text: "region: top-right"}
+
+  - name: scroll down reaches the bottom-right region
+    scroll: {direction: down, pixels: 2000}
+    expect:
+      - text_contains: {selector: "#readout", text: "region: bottom-right"}
+
+  - name: scroll left moves the region back horizontally
+    scroll: {direction: left, pixels: 2000}
+    expect:
+      - text_contains: {selector: "#readout", text: "region: bottom-left"}
+
+  - name: scroll up returns the flow to the top-left region
+    scroll: {direction: up, pixels: 2000}
+    expect:
+      - text_contains: {selector: "#readout", text: "region: top-left"}
+
+  - name: negative control - asserting a region the page is not in fails naming the wanted text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#readout", text: "region: bottom-right"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+version: 1
