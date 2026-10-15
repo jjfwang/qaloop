@@ -1,0 +1,55 @@
+version: 1
+name: demo-retry-fail
+tags: [smoke]
+description: >-
+  Browser proof for the step retry exhaustion fail-closed promise
+  (issue #280, SPEC.md retry semantics: a step with retry: N is
+  attempted N+1 times, the last attempt's status, error and
+  assertions are retained, and with continue_on_fail: true the run
+  continues past the exhausted step). Until now retry exhaustion
+  was proven only for an aborting last step in the unit suite
+  (test_step_retry_runner) and retry success on the third attempt
+  by flows/demo-retry-delay.yaml; neither covered exhaustion with
+  continuation in a real browser. This flow reuses
+  demo/retry-delay-demo.html unchanged: the #always-fails-btn
+  control deterministically sets #always-fails-result to
+  'always-failing control failed' on every click. The opening
+  anchor clicks it and asserts that exact text, and passes with
+  attempts: 1. The negative control clicks it again with retry: 2
+  and continue_on_fail: true (timeout_ms: 2000 so each attempt's
+  assertion polling stays fast) and expects the text 'succeeded',
+  which can never hold, so it must FAIL after exactly 3 attempts
+  with an error naming the unmet text expectation. Exactly one
+  step is designed to fail. The closing positive repeats the
+  anchor assertion and passes again, so the run stays passed
+  overall (status passed, failed_step null) with exactly the one
+  control step recorded as failed with attempts: 3.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the retry-delay demo page
+    goto: /demo/retry-delay-demo.html
+
+steps:
+  - name: positive anchor - always-failing control sets its failure text
+    click: "#always-fails-btn"
+    expect:
+      - text_contains: {selector: "#always-fails-result", text: "always-failing control failed"}
+
+  - name: negative control - retry exhaustion fails closed after exactly 3 attempts
+    click: "#always-fails-btn"
+    retry: 2
+    continue_on_fail: true
+    timeout_ms: 2000
+    expect:
+      - text_contains: {selector: "#always-fails-result", text: "succeeded"}
+
+  - name: closing positive - failure text still present after the exhausted step
+    expect:
+      - text_contains: {selector: "#always-fails-result", text: "always-failing control failed"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
