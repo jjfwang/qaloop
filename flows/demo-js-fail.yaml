@@ -1,0 +1,53 @@
+version: 1
+name: demo-js-fail
+tags: [smoke]
+description: >-
+  Browser proof for the js assertion fail-closed promise (issue #270,
+  SPEC.md Assertions table: js is {script, contains} - evaluate JS,
+  polls until output contains text). Until now the polling and
+  fail-closed behavior was proven only against a FakePage unit test
+  (test_js_assertion_polling). This flow reuses demo/drag-drop.html
+  unchanged: the #vol-value element reads 0 initially and is only
+  mutated on a slider drag, which this flow never performs, so it
+  stays 0 deterministically. The opening positive anchor asserts the
+  js script reading #vol-value contains 0 and passes. The negative
+  control asserts the same script contains 999 with continue_on_fail:
+  true and a step-level timeout_ms of 2000, and must FAIL with a js
+  assertion detail naming the final observed value (want '999' in
+  '0'), proving the assertion fails closed end-to-end in a real
+  browser rather than silently passing or timing out generically.
+  The closing positive repeats the anchor assertion and passes
+  again, so the run stays passed overall with exactly the one
+  control step recorded as failed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the drag demo page
+    goto: /demo/drag-drop.html
+
+steps:
+  - name: positive anchor - vol-value reads 0 before the control
+    expect:
+      - js:
+          script: "document.querySelector('#vol-value').textContent"
+          contains: "0"
+
+  - name: negative control - never-appearing substring fails naming the final observed value
+    continue_on_fail: true
+    timeout_ms: 2000
+    expect:
+      - js:
+          script: "document.querySelector('#vol-value').textContent"
+          contains: "999"
+
+  - name: closing positive - vol-value still reads 0 after the control
+    expect:
+      - js:
+          script: "document.querySelector('#vol-value').textContent"
+          contains: "0"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
