@@ -8622,6 +8622,141 @@ def test_issue_284_run_timeout():
           str([(s.phase, s.status) for s in result.steps]))
 
 
+def test_issue_286_setup_fail():
+    # Issue #286: setup-phase failure end-to-end with a faked browser.
+    # A failing setup step must abort the run (status failed), every
+    # steps-phase step must be recorded skipped (none dropped), and
+    # teardown must still run and pass. The fake page is stateful:
+    # evaluate() is backed by a dict, so seed-js setItem/clear mutate
+    # it and storage assertions read it back - teardown clearing the
+    # planted value is proven by the dict being empty after the run.
+    import re
+
+    import playwright.sync_api as pw_sync
+
+    from qaloop.runner import run_flow
+    from qaloop.spec import load_spec
+
+    storage = {}
+
+    class FakePage:
+        def __init__(self):
+            self.url = "about:blank"
+
+        def on(self, event, handler):
+            pass
+
+        def evaluate(self, js, arg=None):
+            if isinstance(arg, dict) and "key" in arg:
+                return storage.get(arg["key"])
+            if isinstance(js, str) and "localStorage.setItem" in js:
+                m = re.search(
+                    r"localStorage\.setItem\('([^']*)',\s*'([^']*)'\)", js)
+                if m:
+                    storage[m.group(1)] = m.group(2)
+                return None
+            if isinstance(js, str) and "localStorage.clear()" in js:
+                storage.clear()
+                return None
+
+        def goto(self, url, **kw):
+            self.url = url
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeCtx:
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write("name: setup-fail\ntarget: http://h\n"
+                    "setup:\n"
+                    "  - name: open page\n"
+                    "    goto: /demo/teardown-demo.html\n"
+                    "  - name: plant state\n"
+                    "    seed: {js: \"localStorage.setItem("
+                    "'qaloop_teardown', 'SETUP-286 planted');\"}\n"
+                    "  - name: designed failing setup step\n"
+                    "    timeout_ms: 1000\n"
+                    "    expect:\n"
+                    "      - storage: {kind: local, key: qaloop_teardown, "
+                    "equals: \"SETUP-286 wrong-value\"}\n"
+                    "steps:\n"
+                    "  - name: would pass one\n"
+                    "    expect:\n"
+                    "      - storage: {kind: local, key: qaloop_teardown, "
+                    "equals: \"SETUP-286 planted\"}\n"
+                    "  - name: would pass two\n"
+                    "    expect: [{noop: true}]\n"
+                    "teardown:\n"
+                    "  - name: teardown clears the planted state\n"
+                    "    seed: {js: \"localStorage.clear()\"}\n"
+                    "  - name: teardown passes\n"
+                    "    expect: [{noop: true}]\n"
+                    "artifacts: {screenshot: none, ax_snapshot: none, "
+                    "trace: false}\n")
+            spec_path = f.name
+        try:
+            spec = load_spec(spec_path)
+        finally:
+            os.unlink(spec_path)
+        with tempfile.TemporaryDirectory() as run_dir:
+            result = run_flow(spec, run_dir=run_dir)
+    finally:
+        pw_sync.sync_playwright = old_pw
+    check("setup fail: run status is failed",
+          result.status == "failed", result.status)
+    setup_statuses = [s.status for s in result.steps if s.phase == "setup"]
+    check("setup fail: setup statuses are passed, passed, failed",
+          setup_statuses == ["passed", "passed", "failed"],
+          str(setup_statuses))
+    failed_setup = [s for s in result.steps
+                    if s.phase == "setup" and s.status == "failed"]
+    check("setup fail: failure error names the observed value",
+          len(failed_setup) == 1
+          and "SETUP-286 planted" in failed_setup[0].error
+          and "SETUP-286 wrong-value" in failed_setup[0].error,
+          failed_setup[0].error if failed_setup else "no failed setup step")
+    step_statuses = [s.status for s in result.steps if s.phase == "steps"]
+    check("setup fail: steps recorded skipped, none dropped",
+          step_statuses == ["skipped", "skipped"], str(step_statuses))
+    teardown_statuses = [s.status for s in result.steps
+                         if s.phase == "teardown"]
+    check("setup fail: teardown still runs and passes",
+          teardown_statuses == ["passed", "passed"],
+          str(teardown_statuses))
+    check("setup fail: teardown cleared the fake storage",
+          storage == {}, str(storage))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
