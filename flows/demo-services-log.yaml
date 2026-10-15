@@ -15,8 +15,8 @@ description: >-
   text the service never renders and must FAIL naming the observed
   content - a vacuous proof would pass it. The non-vacuity boot
   control (needle changed to a string the fixture never prints)
-  fails boot with SERVICE BOOT FAILED; it is run by hand, not in
-  this flow.
+  is automated in flows/demo-services-log-fail.yaml: verify on
+  that flow fails boot with SERVICE BOOT FAILED at timeout.
 services:
   - name: logsvc
     command: "python3 demo/log_ready_server.py"

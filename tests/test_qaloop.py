@@ -1799,6 +1799,56 @@ def test_flow_services_boot_failure():
               "QALOOP_SERVICE_BAD_URL" not in os.environ)
 
 
+def test_flow_services_log_contains_boot_failure():
+    # Issue #278: the log_contains timeout branch against a LIVE
+    # (non-exiting) subprocess that never prints the needle must raise
+    # TimeoutError naming the needle and the timeout, and the timed-out
+    # service process must be terminated (no orphan left alive).
+    import subprocess
+    import time
+    from qaloop.env import flow_services
+    needle = "NEEDLE-NEVER-PRINTED-278"
+    # The needle rides in the child's argv as a trailing comment so
+    # pgrep -f <needle> genuinely matches the live child if orphaned.
+    spec = [{"name": "logsvc",
+             "command": "python3 -c 'import time; print(\"booting, no "
+                        "needle\", flush=True); time.sleep(60)  # "
+                        + needle + "'",
+             "cwd": None, "env": {},
+             "wait": {"log_contains": needle},
+             "timeout_s": 2.0, "url": None}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        try:
+            ctx.__enter__()
+            check("log_contains boot failure raised TimeoutError", False)
+        except TimeoutError as e:
+            check("log_contains boot failure raised TimeoutError", True)
+            check("log_contains TimeoutError names the needle",
+                  needle in str(e), str(e))
+            check("log_contains TimeoutError names the timeout",
+                  "after 2.0s" in str(e), str(e))
+        finally:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        # terminate() is async; poll briefly so a dying child is not
+        # mistaken for an orphan.
+        orphans = None
+        for _ in range(30):
+            orphans = subprocess.run(["pgrep", "-f", needle],
+                                     capture_output=True, text=True)
+            if orphans.returncode != 0:
+                break
+            time.sleep(0.1)
+        check("timed-out log_contains service terminated",
+              orphans.returncode != 0 and not orphans.stdout.strip(),
+              orphans.stdout)
+        check("failed logsvc env cleaned",
+              "QALOOP_SERVICE_LOGSVC_URL" not in os.environ)
+
+
 def test_evaluate_verdict_extraction():
     from qaloop.evaluate import _extract_verdict
     v = _extract_verdict('note: {"verdict": "MAKES_SENSE", "confidence": "high",'
