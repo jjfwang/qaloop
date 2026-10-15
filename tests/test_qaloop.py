@@ -80,6 +80,55 @@ def test_spec_invalid():
         os.unlink(path)
 
 
+def test_spec_unknown_top_level_keys():
+    from qaloop.spec import load_spec, SpecError
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    base = "name: t\ntarget: http://x\nsteps:\n  - goto: /\n"
+    _, err = load(base + "servces: []\n")
+    check("unknown top-level key rejected naming the key",
+          err is not None and "servces" in err, str(err))
+    _, err = load(base + "timeot: {step_ms: 1}\n")
+    check("typo top-level key rejected naming the key",
+          err is not None and "timeot" in err, str(err))
+    _, err = load(base + "timeouts: {step_ms: 1, bogus_ms: 2}\n")
+    check("unknown timeouts subkey rejected naming it",
+          err is not None and "bogus_ms" in err, str(err))
+    _, err = load(base + "artifacts: {screenshot: none, bogus: true}\n")
+    check("unknown artifacts subkey rejected naming it",
+          err is not None and "bogus" in err, str(err))
+    _, err = load(base + "viewport: {width: 800, depth: 3}\n")
+    check("unknown viewport subkey rejected naming it",
+          err is not None and "depth" in err, str(err))
+    all_keys = (
+        "version: 1\nname: all-keys\ndescription: every known key\n"
+        "target: http://x\nviewport: {width: 1280, height: 800}\n"
+        "artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}\n"
+        "timeouts: {step_ms: 15000, run_ms: 300000}\n"
+        "record_bodies: true\nvideo: false\ntags: [smoke]\n"
+        "browser: {color_scheme: dark}\n"
+        "setup:\n  - goto: /\n"
+        "steps:\n  - goto: /\n"
+        "teardown:\n  - goto: /\n"
+        "investigate_on_failure: true\nmax_investigation_actions: 5\n"
+        "services:\n  - name: api\n    command: \"python3 app.py\"\n"
+        "    wait: {port: 8000}\n"
+        "matrix:\n  - {variant: a}\n")
+    spec, err = load(all_keys)
+    check("flow using all 18 known top-level keys loads",
+          spec is not None and spec.name == "all-keys", str(err))
+
+
 def test_queue_claim_complete():
     from qaloop import queue
     with temp_db():

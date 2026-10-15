@@ -79,6 +79,18 @@ Service stdout/stderr are copied to `<run_dir>/services/<name>.log`.
 If a service fails to boot, the run aborts with `SERVICE BOOT FAILED`
 and previously booted services are stopped.
 
+The top-level key set is closed (issue #296): a flow may only use
+`version`, `name`, `description`, `target`, `viewport`, `artifacts`,
+`timeouts`, `record_bodies`, `video`, `tags`, `browser`, `setup`,
+`steps`, `teardown`, `investigate_on_failure`,
+`max_investigation_actions`, `services`, and `matrix`. Any other
+top-level key is a load-time error naming the key — a typo such as
+`servces:` fails fast instead of being silently ignored while the flow
+runs with defaults. The mapping-valued keys are closed too:
+`timeouts` allows only `step_ms` and `run_ms`; `artifacts` allows only
+`screenshot`, `ax_snapshot`, and `trace`; `viewport` allows only
+`width` and `height`. (`browser` likewise rejects unknown subkeys.)
+
 ## Action ops (one per step; a step may also carry `expect`)
 
 | op | params | notes |

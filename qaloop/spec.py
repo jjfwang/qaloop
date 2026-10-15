@@ -55,6 +55,22 @@ STEP_SCREENSHOT_POLICIES = {"always", "never", "on-failure"}
 # Issue #84: metric names supported by the `perf` assertion.
 PERF_METRICS = {"lcp_ms", "cls", "inp_ms"}
 
+# Issue #296: the closed set of known top-level flow keys. A typo'd key
+# (servces:, timeot:) was previously ignored silently, so the flow ran
+# with defaults the author never intended; load_spec now rejects any
+# top-level key outside this set, mirroring the step-level guard.
+TOP_LEVEL_KEYS = {
+    "version", "name", "description", "target", "viewport", "artifacts",
+    "timeouts", "record_bodies", "video", "tags", "browser", "setup",
+    "steps", "teardown", "investigate_on_failure",
+    "max_investigation_actions", "services", "matrix",
+}
+# Issue #296: closed subkey sets for the mapping-valued top-level keys
+# that load_spec merges/consumes directly (browser has its own guard).
+TIMEOUT_KEYS = {"step_ms", "run_ms"}
+ARTIFACT_KEYS = {"screenshot", "ax_snapshot", "trace"}
+VIEWPORT_KEYS = {"width", "height"}
+
 
 class SpecError(ValueError):
     """Raised when a flow spec is invalid."""
@@ -204,9 +220,9 @@ def _validate_tags(raw: Any, where: str) -> list[str]:
     """Validate the top-level `tags:` block (issue #89).
 
     A list of non-empty strings matching ^[A-Za-z0-9][A-Za-z0-9_.-]*$,
-    no duplicates. There is no unknown-top-level-key guard, so tags
-    must be explicitly validated here — unknown keys are otherwise
-    silently ignored.
+    no duplicates. Tags are validated explicitly here for shape; the
+    unknown-top-level-key guard in load_spec (issue #296) separately
+    rejects misspelled top-level keys instead of ignoring them.
     """
     if raw is None:
         return []
@@ -1165,6 +1181,22 @@ def _parse_steps(raw: Any, phase: str, default_timeout_ms: int,
             for i, s in enumerate(raw)]
 
 
+def _reject_unknown(mapping: Any, known: set, where: str, label: str) -> None:
+    """Issue #296: reject unknown keys in a mapping, naming them.
+
+    Shared by the top-level guard and the timeouts/artifacts/viewport
+    subkey guards in load_spec. Non-mapping values are left for the
+    caller's own validation to reject.
+    """
+    if not isinstance(mapping, dict):
+        return
+    unknown = [k for k in mapping if k not in known]
+    if unknown:
+        raise SpecError(
+            f"{where}: unknown {label} keys {unknown} "
+            f"(known: {sorted(known)})")
+
+
 def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     """Load and validate a flow-spec YAML file. Raises SpecError on problems."""
     with open(path, encoding="utf-8") as f:
@@ -1178,12 +1210,14 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     where = f"spec {path}"
     if not isinstance(raw, dict):
         raise SpecError(f"{where}: top level must be a mapping")
+    _reject_unknown(raw, TOP_LEVEL_KEYS, where, "top-level")
     version = raw.get("version", 1)
     if version != SPEC_VERSION:
         raise SpecError(f"{where}: unsupported version {version} (want {SPEC_VERSION})")
     name = raw.get("name")
     if not name or not isinstance(name, str):
         raise SpecError(f"{where}: `name` is required")
+    _reject_unknown(raw.get("timeouts"), TIMEOUT_KEYS, where, "timeouts")
     timeouts = {"step_ms": 15000, "run_ms": 300000}
     timeouts.update(raw.get("timeouts") or {})
     default_step_ms = int(timeouts["step_ms"])
@@ -1191,7 +1225,9 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     # below), so matrix ${name} refs in the target survive load-time
     # $ENV expansion untouched.
     target_raw = raw.get("target", "")
+    _reject_unknown(raw.get("viewport"), VIEWPORT_KEYS, where, "viewport")
     viewport = raw.get("viewport") or {"width": 1280, "height": 800}
+    _reject_unknown(raw.get("artifacts"), ARTIFACT_KEYS, where, "artifacts")
     artifacts = {"screenshot": "per-step", "ax_snapshot": "on-failure", "trace": True}
     artifacts.update(raw.get("artifacts") or {})
     if artifacts.get("screenshot") not in {"per-step", "on-failure", "none"}:
@@ -1202,13 +1238,14 @@ def load_spec(path: str, strict_env: bool = True) -> FlowSpec:
     if not isinstance(record_bodies, bool):
         raise SpecError(
             f"{where}: record_bodies must be a bool, got {record_bodies!r}")
-    # Issue #90: opt-in video recording. Must be a real bool (there is no
-    # unknown-top-level-key guard, so validate explicitly).
+    # Issue #90: opt-in video recording. Must be a real bool; validated
+    # explicitly here (the issue #296 guard rejects unknown keys, but
+    # cannot check a known key's value type).
     video = raw.get("video", False)
     if not isinstance(video, bool):
         raise SpecError(f"{where}: video must be a bool, got {video!r}")
-    # Issue #89: flow tags for batch selection (validated explicitly —
-    # there is no unknown-top-level-key guard).
+    # Issue #89: flow tags for batch selection (validated explicitly
+    # here; unknown top-level keys are rejected above, issue #296).
     tags = _validate_tags(raw.get("tags"), where)
     # Issue #122: optional browser context options (validated
     # explicitly — typos are rejected, not silently ignored).
