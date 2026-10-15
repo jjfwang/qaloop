@@ -1,0 +1,55 @@
+version: 1
+name: demo-run-timeout
+tags: [smoke]
+description: >-
+  Browser proof for the run-level timeout end-to-end (issue #284,
+  SPEC.md:57 timeouts example: timeouts {step_ms: 15000, run_ms:
+  300000} bounds the whole run via run_ms). Until now run_ms was
+  proven only at unit level. This flow sets run_ms to 12000 against
+  four 4000ms wait_ms steps after a fast opening assertion on
+  demo/wait-target.html (#status starts 'waiting' and settles to
+  'transitions settled' at 2800ms), so the deadline crosses while
+  steps remain: the run must record status error with error 'run
+  timeout exceeded', every unstarted steps-phase step must be
+  recorded as skipped (none dropped), and teardown must still run
+  despite the crossed deadline - its step asserts #status visible
+  and settled, and must pass. The runner fix in qaloop/runner.py
+  makes this possible: the deadline previously dropped unstarted
+  steps without records and skipped teardown entirely (a break out
+  of the phase loop); now the abort check runs first, the deadline
+  branch records the crossed step as skipped and aborts the phase,
+  and teardown is exempt from the deadline check. The run is
+  therefore expected to FAIL with exit 1 and status error - that
+  failure is the proof.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the wait target demo page
+    goto: /demo/wait-target.html
+
+steps:
+  - name: status starts waiting before the waits burn the run budget
+    expect:
+      - text_contains: {selector: "#status", text: "waiting"}
+
+  - name: first long wait burns the run budget
+    wait_ms: 4000
+
+  - name: second long wait burns the run budget
+    wait_ms: 4000
+
+  - name: third long wait burns the run budget
+    wait_ms: 4000
+
+  - name: fourth long wait starts after the run deadline
+    wait_ms: 4000
+
+teardown:
+  - name: teardown still runs after the run timeout
+    expect:
+      - visible: "#status"
+      - text_contains: {selector: "#status", text: "transitions settled"}
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 12000}
+investigate_on_failure: false
