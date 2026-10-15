@@ -5741,7 +5741,11 @@ def test_issue_84_perf_assertions():
     check("perf uses one fixed script for every read",
           len(pg.scripts) == 3 and len(set(pg.scripts)) == 1
           and "largest-contentful-paint" in pg.scripts[0]
-          and "first-input" in pg.scripts[0], str(len(pg.scripts)))
+          and "first-input" in pg.scripts[0]
+          and "layout-shift" in pg.scripts[0]
+          and "PerformanceObserver" in pg.scripts[0]
+          and "observe({type: 'layout-shift'" in pg.scripts[0],
+          str(len(pg.scripts)))
 
 
 def test_issue_85_a11y_assertions():

@@ -505,9 +505,12 @@ startTime` (`null` when no such entry was recorded); CLS is the sum of
 recorded — a real reading); INP is the max `duration` of `first-input`
 entries with an `interactionId` (`null` when none, i.e. no real
 interaction happened yet). Two headless-shell realities shape this
-read: LCP entries are delivered to observers but not retained in the
-queryable `getEntriesByType` buffer, so the read collects them with a
-short-lived `PerformanceObserver` (`buffered: true`); and `event`
+read: LCP and `layout-shift` entries are delivered to observers but
+not retained in the queryable `getEntriesByType` buffer, so the read
+collects them with short-lived `PerformanceObserver`s
+(`buffered: true`) — CLS is therefore the sum of the `layout-shift`
+entry values delivered to that observer with `!hadRecentInput`; and
+`event`
 timing entries are only recorded for an observer registered *before*
 the interaction — which an assertion cannot install after the fact —
 so INP is approximated from the buffered `first-input` entry instead
