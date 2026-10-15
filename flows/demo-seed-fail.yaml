@@ -1,0 +1,46 @@
+version: 1
+name: demo-seed-fail
+tags: [smoke]
+description: >-
+  Browser proof for seed http fail-closed behavior (issue #268, SPEC.md
+  seed section: a 4xx/5xx seed response fails the step fast with seed
+  request failed: HTTP <status> and the status is recorded structurally
+  as seed_status). The setup anchor POSTs {name: seedfail-user-268,
+  plan: plan-pro-268} to the proof server's real /api/signup endpoint,
+  which records the payload. The steps-phase control step seeds an
+  unknown endpoint and is designed to fail with HTTP 404 while carrying
+  seed_status 404, with continue_on_fail: true so the run continues.
+  The final step proves the server still holds exactly the anchor
+  payload, so the failed seed did not overwrite the anchor recording.
+target: ${TARGET_URL}
+
+setup:
+  - name: anchor - seed a signup by POSTing the declared json body
+    seed:
+      http:
+        url: ${TARGET_URL}/api/signup
+        json: {name: seedfail-user-268, plan: plan-pro-268}
+
+steps:
+  - name: negative control - seed to an unknown endpoint fails fast with HTTP 404
+    continue_on_fail: true
+    seed:
+      http:
+        url: ${TARGET_URL}/api/no-such-seed
+
+  - name: open the seed-json demo page
+    goto: /demo/seed-json-demo.html
+
+  - name: the server still holds exactly the anchor payload
+    click: "#seed-check-btn"
+    expect:
+      - text_contains: {selector: "#seed-result", text: "seedfail-user-268"}
+      - text_contains: {selector: "#seed-result", text: "plan-pro-268"}
+      - text_contains: {selector: "#seed-result", text: "application/json"}
+      - network_calls: {url: "/api/last-signup", status: {equals: 200}, equals: 1}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
