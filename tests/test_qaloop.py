@@ -9209,6 +9209,147 @@ def test_issue_288_steps_fail():
           storage == {}, str(storage))
 
 
+def test_issue_300_target_override_contract():
+    """Issue #300: --target overrides the spec target in both the verify
+    path (_cmd_verify_run -> _run_single_flow) and the baselines
+    non-matrix path (_cmd_baselines_run). The printed target line, the
+    run_flow target kwarg, and (for verify) the written report must all
+    carry the override; with args.target=None the spec target is used."""
+    import io
+    from types import SimpleNamespace
+
+    import qaloop.cli as cli
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    spec_target = "http://spec-target"
+    override = "http://override-target"
+    calls = []
+
+    def echo_run_flow(spec, **kw):
+        calls.append(kw)
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed", duration_ms=1)]
+        return RunResult(flow_name=spec.name, target=kw.get("target", ""),
+                         status="passed", started=1.0, ended=1.001,
+                         steps=steps, failed_step=None, console_errors=[],
+                         page_errors=[], failed_requests=[],
+                         bad_responses=[], run_dir=kw.get("run_dir", ""))
+
+    old_run_flow = cli.run_flow
+    cli.run_flow = echo_run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "t300.yaml")
+            with open(flow_path, "w") as fh:
+                fh.write(f"name: t300\ntarget: {spec_target}\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def verify_args(target):
+                return SimpleNamespace(
+                    flow=flow_path, target=target, headed=True,
+                    executable_path=None, upload_dir=None, investigate=False,
+                    keep_runs=0, max_investigation_actions=None)
+
+            # --- verify: override wins over the spec target ---
+            calls.clear()
+            run_dir = os.path.join(d, "v-override")
+            os.makedirs(run_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(override), run_dir,
+                                         FakeLedger(), d, 0)
+            out = buf.getvalue()
+            check("verify override exits 0", rc == 0, str(rc))
+            check("verify override printed target line",
+                  f"target:  {override}" in out, out)
+            check("verify override threaded into run_flow",
+                  len(calls) == 1 and calls[0].get("target") == override,
+                  str(calls))
+            with open(os.path.join(run_dir, "REPORT.md")) as fh:
+                report = fh.read()
+            check("verify override recorded in REPORT.md",
+                  f"- target: `{override}`" in report, report[:300])
+            check("verify report omits spec target as run target",
+                  f"- target: `{spec_target}`" not in report, report[:300])
+            with open(os.path.join(run_dir, "run.json")) as fh:
+                run_data = json.load(fh)
+            check("verify override recorded in run.json",
+                  run_data.get("target") == override,
+                  str(run_data.get("target")))
+
+            # --- verify control: no override -> spec target ---
+            calls.clear()
+            run_dir2 = os.path.join(d, "v-spec")
+            os.makedirs(run_dir2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(None), run_dir2,
+                                         FakeLedger(), d, 0)
+            out = buf.getvalue()
+            check("verify control exits 0", rc == 0, str(rc))
+            check("verify control printed spec target line",
+                  f"target:  {spec_target}" in out, out)
+            check("verify control threaded spec target into run_flow",
+                  len(calls) == 1 and calls[0].get("target") == spec_target,
+                  str(calls))
+
+            # --- baselines: override wins, baseline_update stays True ---
+            spec = load_spec(flow_path)
+
+            def baselines_args(target):
+                return SimpleNamespace(flow=flow_path, target=target,
+                                       headed=False, executable_path=None,
+                                       upload_dir=None)
+
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_baselines_run(baselines_args(override),
+                                            os.path.join(d, "b-override"),
+                                            spec, FakeLedger(), d)
+            out = buf.getvalue()
+            check("baselines override exits 0", rc == 0, str(rc))
+            check("baselines override printed target line",
+                  f"target:  {override}" in out, out)
+            check("baselines override threaded into run_flow",
+                  len(calls) == 1 and calls[0].get("target") == override,
+                  str(calls))
+            check("baselines override keeps baseline_update=True",
+                  bool(calls) and calls[0].get("baseline_update") is True,
+                  str(calls))
+
+            # --- baselines control: no override -> spec target ---
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_baselines_run(baselines_args(None),
+                                            os.path.join(d, "b-spec"),
+                                            spec, FakeLedger(), d)
+            out = buf.getvalue()
+            check("baselines control exits 0", rc == 0, str(rc))
+            check("baselines control printed spec target line",
+                  f"target:  {spec_target}" in out, out)
+            check("baselines control threaded spec target into run_flow",
+                  len(calls) == 1 and calls[0].get("target") == spec_target,
+                  str(calls))
+            check("baselines control keeps baseline_update=True",
+                  bool(calls) and calls[0].get("baseline_update") is True,
+                  str(calls))
+    finally:
+        cli.run_flow = old_run_flow
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
