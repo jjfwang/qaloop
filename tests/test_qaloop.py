@@ -9350,6 +9350,179 @@ def test_issue_300_target_override_contract():
         cli.run_flow = old_run_flow
 
 
+def test_issue_302_headed_executable_path_contract():
+    """Issue #302: --headed and --executable-path are threaded as
+    headless/executable_path kwargs into run_flow on the verify
+    single path (_cmd_verify_run -> _run_single_flow), the baselines
+    non-matrix path (_cmd_baselines_run), and one matrix path
+    (baselines matrix, reusing _cmd_verify_matrix). The sentinel
+    executable is never launched: run_flow is stubbed throughout."""
+    import io
+    from types import SimpleNamespace
+
+    import qaloop.cli as cli
+    import qaloop.report as report_mod
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    EXE = "/fake/chromium-302"
+    calls = []
+
+    def echo_run_flow(spec, **kw):
+        calls.append(kw)
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed", duration_ms=1)]
+        return RunResult(flow_name=spec.name, target=kw.get("target", ""),
+                         status="passed", started=1.0, ended=1.001,
+                         steps=steps, failed_step=None, console_errors=[],
+                         page_errors=[], failed_requests=[],
+                         bad_responses=[], run_dir=kw.get("run_dir", ""))
+
+    old_run_flow = cli.run_flow
+    cli.run_flow = echo_run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "t302.yaml")
+            with open(flow_path, "w") as fh:
+                fh.write("name: t302\ntarget: http://spec-target\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def verify_args(headed, executable_path):
+                return SimpleNamespace(
+                    flow=flow_path, target=None, headed=headed,
+                    executable_path=executable_path, upload_dir=None,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None)
+
+            # --- verify single: headed + sentinel executable ---
+            calls.clear()
+            run_dir = os.path.join(d, "v-headed")
+            os.makedirs(run_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(True, EXE), run_dir,
+                                         FakeLedger(), d, 0)
+            check("verify headed exits 0", rc == 0, str(rc))
+            check("verify headed single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("verify headed threads headless=False",
+                  bool(calls) and calls[0].get("headless") is False,
+                  str(calls))
+            check("verify headed threads executable_path sentinel",
+                  bool(calls) and calls[0].get("executable_path") == EXE,
+                  str(calls))
+
+            # --- verify control: headless default, no executable ---
+            calls.clear()
+            run_dir2 = os.path.join(d, "v-control")
+            os.makedirs(run_dir2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(False, None), run_dir2,
+                                         FakeLedger(), d, 0)
+            check("verify control exits 0", rc == 0, str(rc))
+            check("verify control single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("verify control threads headless=True",
+                  bool(calls) and calls[0].get("headless") is True,
+                  str(calls))
+            check("verify control threads executable_path None",
+                  bool(calls) and calls[0].get("executable_path") is None,
+                  str(calls))
+
+            # --- baselines non-matrix: headed + sentinel executable ---
+            spec = load_spec(flow_path)
+            baselines_args = SimpleNamespace(
+                flow=flow_path, target=None, headed=True,
+                executable_path=EXE, upload_dir=None)
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_baselines_run(baselines_args,
+                                            os.path.join(d, "b1"),
+                                            spec, FakeLedger(), d)
+            check("baselines headed exits 0", rc == 0, str(rc))
+            check("baselines headed single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("baselines headed threads headless=False",
+                  bool(calls) and calls[0].get("headless") is False,
+                  str(calls))
+            check("baselines headed threads executable_path sentinel",
+                  bool(calls) and calls[0].get("executable_path") == EXE,
+                  str(calls))
+            check("baselines headed keeps baseline_update=True",
+                  bool(calls) and calls[0].get("baseline_update") is True,
+                  str(calls))
+
+            # --- baselines matrix: headed + sentinel per combination ---
+            matrix_path = os.path.join(d, "bl302-matrix.yaml")
+            with open(matrix_path, "w") as fh:
+                fh.write("name: bl302-matrix\ntarget: http://h/${t}\n"
+                         "matrix:\n  t: [a, b]\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /${t}\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def fake_write_matrix_summary(spec, results, run_dir):
+                path = os.path.join(run_dir, "REPORT.md")
+                with open(path, "w") as fh:
+                    fh.write("matrix summary\n")
+                return path
+
+            old_write_report = cli.write_report
+            old_print_summary = cli.print_summary
+            old_wms = report_mod.write_matrix_summary
+            cli.write_report = lambda *a, **kw: {}
+            cli.print_summary = lambda result: None
+            report_mod.write_matrix_summary = fake_write_matrix_summary
+            try:
+                calls.clear()
+                matrix_run_dir = os.path.join(d, "b-matrix")
+                os.makedirs(matrix_run_dir)
+                matrix_args = SimpleNamespace(
+                    flow=matrix_path, target=None, headed=True,
+                    executable_path=EXE, upload_dir=None)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_baselines_run(
+                        matrix_args, matrix_run_dir,
+                        load_spec(matrix_path), FakeLedger(), d)
+                check("baselines matrix headed exits 0", rc == 0, str(rc))
+                check("baselines matrix headed ran every combination",
+                      len(calls) == 2, str(len(calls)))
+                check("baselines matrix threads headless=False",
+                      bool(calls)
+                      and all(c.get("headless") is False for c in calls),
+                      str(calls))
+                check("baselines matrix threads executable_path sentinel",
+                      bool(calls)
+                      and all(c.get("executable_path") == EXE
+                              for c in calls),
+                      str(calls))
+                check("baselines matrix keeps baseline_update=True",
+                      bool(calls)
+                      and all(c.get("baseline_update") is True
+                              for c in calls),
+                      str(calls))
+            finally:
+                cli.write_report = old_write_report
+                cli.print_summary = old_print_summary
+                report_mod.write_matrix_summary = old_wms
+    finally:
+        cli.run_flow = old_run_flow
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
