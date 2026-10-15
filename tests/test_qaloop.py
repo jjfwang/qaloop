@@ -8529,6 +8529,99 @@ def test_issue_200_baselines_matrix_dispatch():
         report_mod.write_matrix_summary = old_wms
 
 
+def test_issue_284_run_timeout():
+    # Issue #284: run-level timeout (timeouts.run_ms) end-to-end with a
+    # faked browser. The deadline must abort new steps (each unstarted
+    # steps-phase step is recorded skipped, none dropped), the run must
+    # record status error / "run timeout exceeded", and teardown must
+    # still execute despite the crossed deadline.
+    import time
+
+    import playwright.sync_api as pw_sync
+
+    from qaloop.runner import run_flow
+    from qaloop.spec import load_spec
+
+    class FakePage:
+        def on(self, event, handler):
+            pass
+
+        def evaluate(self, js):
+            return None
+
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_timeout(self, ms):
+            time.sleep(ms / 1000)
+
+    class FakeCtx:
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write("name: run-timeout\ntarget: http://h\n"
+                    "timeouts: {step_ms: 15000, run_ms: 300}\n"
+                    "steps:\n"
+                    "  - name: wait one\n    wait_ms: 200\n"
+                    "  - name: wait two\n    wait_ms: 200\n"
+                    "  - name: wait three\n    wait_ms: 200\n"
+                    "  - name: wait four\n    wait_ms: 200\n"
+                    "teardown:\n"
+                    "  - name: teardown still runs\n"
+                    "    expect: [{noop: true}]\n"
+                    "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+                    "trace: false}\n")
+            spec_path = f.name
+        try:
+            spec = load_spec(spec_path)
+        finally:
+            os.unlink(spec_path)
+        with tempfile.TemporaryDirectory() as run_dir:
+            result = run_flow(spec, run_dir=run_dir)
+    finally:
+        pw_sync.sync_playwright = old_pw
+    check("run timeout: run status is error",
+          result.status == "error", result.status)
+    check("run timeout: run error names the timeout",
+          result.error == "run timeout exceeded", result.error)
+    step_statuses = [s.status for s in result.steps if s.phase == "steps"]
+    check("run timeout: unstarted steps recorded skipped, none dropped",
+          step_statuses == ["passed", "passed", "skipped", "skipped"],
+          str(step_statuses))
+    teardown = [s for s in result.steps if s.phase == "teardown"]
+    check("run timeout: teardown still runs and passes",
+          len(teardown) == 1 and teardown[0].status == "passed",
+          str([(s.phase, s.status) for s in result.steps]))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

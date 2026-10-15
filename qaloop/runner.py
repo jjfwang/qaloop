@@ -1118,12 +1118,14 @@ def run_flow(spec: FlowSpec, *, run_dir: str, target: str | None = None,
             abort = False
             for phase, steplist, is_setup in phases:
                 for step in steplist:
-                    if time.time() > deadline:
+                    if abort and phase != "teardown":
+                        steps.append(StepResult(step.index, phase, step.name, step.op,
+                                                "skipped", 0))
+                        continue
+                    if phase != "teardown" and time.time() > deadline:
                         run_error = "run timeout exceeded"
                         status = "error"
                         abort = True
-                        break
-                    if abort and phase != "teardown":
                         steps.append(StepResult(step.index, phase, step.name, step.op,
                                                 "skipped", 0))
                         continue
