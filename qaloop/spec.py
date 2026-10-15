@@ -1048,6 +1048,14 @@ def _parse_step(raw: Any, index: int, phase: str, default_timeout_ms: int) -> St
     if not isinstance(expect, (dict, list)):
         raise SpecError(f"{where}: expect must be a mapping or list of assertions")
     continue_on_fail = bool(raw.get("continue_on_fail", False))
+    # continue_on_fail outside the steps phase would be silently inert —
+    # fail fast, mirroring the retry > 0 phase rule.
+    if continue_on_fail and phase != "steps":
+        raise SpecError(
+            f"{where}: continue_on_fail: true is only allowed in the "
+            f"steps phase (got phase '{phase}'; setup aborts on any "
+            "failure and teardown is best-effort, so the flag would "
+            "be inert)")
     timeout_ms = raw.get("timeout_ms", default_timeout_ms)
     retry = raw.get("retry", 0)
     if isinstance(retry, bool) or not isinstance(retry, int) or retry < 0:

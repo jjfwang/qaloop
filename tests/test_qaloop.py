@@ -2605,6 +2605,68 @@ def test_step_retry_delay_ms_spec():
             os.unlink(p)
 
 
+def test_step_continue_on_fail_spec():
+    """continue_on_fail: true accepted in steps; true in setup/teardown
+    rejected (silently inert there); absent/false valid everywhere."""
+    from qaloop.spec import load_spec, SpecError
+
+    def write_flow(phase, extra):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("name: continue-on-fail-spec\ntarget: http://x\n")
+            if phase == "steps":
+                f.write(f"steps:\n  - name: s\n    goto: /\n    {extra}\n")
+            else:
+                f.write(f"{phase}:\n  - name: s\n    goto: /\n    {extra}\n"
+                        "steps:\n  - name: t\n    expect: {noop: true}\n")
+            return f.name
+
+    p = write_flow("steps", "continue_on_fail: true")
+    try:
+        spec = load_spec(p)
+        check("continue_on_fail accepted in steps",
+              spec.steps[0].continue_on_fail is True)
+    finally:
+        os.unlink(p)
+
+    p = write_flow("steps", "")
+    try:
+        spec = load_spec(p)
+        check("continue_on_fail defaults to False",
+              spec.steps[0].continue_on_fail is False)
+    finally:
+        os.unlink(p)
+
+    for phase in ("setup", "teardown"):
+        p = write_flow(phase, "continue_on_fail: true")
+        try:
+            load_spec(p)
+            check(f"continue_on_fail in {phase} rejected", False,
+                  "no error raised")
+        except SpecError as e:
+            check(f"continue_on_fail in {phase} rejected", True)
+            check(f"continue_on_fail {phase} error names key and rule",
+                  "continue_on_fail" in str(e) and "steps phase" in str(e),
+                  str(e))
+        finally:
+            os.unlink(p)
+
+    p = write_flow("setup", "continue_on_fail: false")
+    try:
+        spec = load_spec(p)
+        check("continue_on_fail false in setup accepted",
+              spec.setup[0].continue_on_fail is False)
+    finally:
+        os.unlink(p)
+
+    p = write_flow("teardown", "")
+    try:
+        spec = load_spec(p)
+        check("continue_on_fail absent in teardown accepted",
+              spec.teardown[0].continue_on_fail is False)
+    finally:
+        os.unlink(p)
+
+
 def test_step_retry_runner():
     """Real browser proof: flaky action passes with retry:2; permanent
     failure with retry:1 fails after exactly 2 attempts; retry:0 unchanged."""
