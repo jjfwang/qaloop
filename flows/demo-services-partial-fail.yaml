@@ -1,0 +1,45 @@
+version: 1
+name: demo-services-partial-fail
+tags: [smoke]
+description: >-
+  Automated proof for services partial-boot cleanup (issue #294
+  automated proof; companion to demo-services-http-fail). The
+  first service (a plain http.server on port 8946) boots fine,
+  but the second service waits on a health path the fixture
+  answers 404 forever, so boot must fail closed at timeout_s.
+  This flow is EXPECTED to fail at boot with exit 3: qaloop
+  prints SERVICE BOOT FAILED, the already-booted first service
+  must be stopped (port 8946 free afterwards, no orphan
+  process), its env exports removed, and its log still copied
+  into the run dir under services/first.log. Its steps never
+  run. The proof is the verify command failure output, its
+  exit code 3, and ports 8946 and 8933 free afterwards.
+services:
+  - name: first
+    command: "python3 -m http.server 8946 --bind 127.0.0.1"
+    cwd: ".."
+    wait: {port: 8946}
+    timeout_s: 15
+  - name: second
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/no-such-health"}
+    timeout_s: 5
+    url: "http://127.0.0.1:8933/"
+target: ${QALOOP_SERVICE_FIRST_URL}
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
