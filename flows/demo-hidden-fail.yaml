@@ -1,0 +1,62 @@
+version: 1
+name: demo-hidden-fail
+tags: [smoke]
+description: >-
+  Browser proof for the hidden assertion fail-closed promise (issue
+  #272, SPEC.md Assertions table: hidden asserts an element is not
+  visible and must fail closed on a still-visible element rather
+  than silently passing). Until now that behavior was proven only
+  against unit tests. This flow reuses demo/hover-tooltip.html
+  unchanged: the #tip tooltip is display:none until its .tipwrap
+  parent is hovered, and #tip-trigger is a plain visible button at
+  all times. The opening positive anchor asserts hidden on #tip
+  and passes before any hover. Negative control 1 asserts hidden
+  on #tip-trigger with continue_on_fail: true and a step-level
+  timeout_ms of 2000, and must FAIL with a detail that starts with
+  TimeoutError and names #tip-trigger, proving a visible element
+  never satisfies hidden. The middle step hovers #tip-trigger and
+  asserts visible on #tip, revealing the tooltip. Negative control
+  2 asserts hidden on the now-revealed #tip with continue_on_fail:
+  true and a step-level timeout_ms of 2000, and must FAIL with a
+  detail that starts with TimeoutError and names #tip, proving
+  the same assertion that passed before hover now fails closed
+  once the element is visible. The closing positive asserts
+  visible on #tip again and passes, so the run stays passed
+  overall with exactly the two control steps recorded as failed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the tooltip demo page
+    goto: /demo/hover-tooltip.html
+
+steps:
+  - name: positive anchor - tooltip is hidden before hover
+    expect:
+      - hidden: "#tip"
+
+  - name: negative control 1 - visible trigger never satisfies hidden
+    continue_on_fail: true
+    timeout_ms: 2000
+    expect:
+      - hidden: "#tip-trigger"
+
+  - name: hover the trigger reveals the tooltip
+    hover: {target: "#tip-trigger"}
+    expect:
+      - visible: "#tip"
+
+  - name: negative control 2 - revealed tooltip never satisfies hidden
+    continue_on_fail: true
+    timeout_ms: 2000
+    expect:
+      - hidden: "#tip"
+
+  - name: closing positive - tooltip still visible after the controls
+    expect:
+      - visible: "#tip"
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
