@@ -9523,6 +9523,165 @@ def test_issue_302_headed_executable_path_contract():
         cli.run_flow = old_run_flow
 
 
+def test_issue_304_video_plumbing_contract():
+    """Issue #304: --video is threaded as video=getattr(args, "video",
+    False) or None into run_flow on the verify single path
+    (_cmd_verify_run -> _run_single_flow) and the verify matrix path
+    (_cmd_verify_matrix). True forces recording on; False and a missing
+    attribute both deliver None so the spec governs (runner:
+    record_video = spec.video if video is None else video). run_flow is
+    stubbed throughout so no browser or recording is launched."""
+    import io
+    from types import SimpleNamespace
+
+    import qaloop.cli as cli
+    import qaloop.report as report_mod
+    from qaloop.runner import RunResult, StepResult
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    calls = []
+
+    def echo_run_flow(spec, **kw):
+        calls.append(kw)
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed", duration_ms=1)]
+        return RunResult(flow_name=spec.name, target=kw.get("target", ""),
+                         status="passed", started=1.0, ended=1.001,
+                         steps=steps, failed_step=None, console_errors=[],
+                         page_errors=[], failed_requests=[],
+                         bad_responses=[], run_dir=kw.get("run_dir", ""))
+
+    old_run_flow = cli.run_flow
+    cli.run_flow = echo_run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "t304.yaml")
+            with open(flow_path, "w") as fh:
+                fh.write("name: t304\ntarget: http://spec-target\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def verify_args(video):
+                return SimpleNamespace(
+                    flow=flow_path, target=None, headed=False,
+                    executable_path=None, upload_dir=None,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None, video=video)
+
+            def verify_args_no_video():
+                return SimpleNamespace(
+                    flow=flow_path, target=None, headed=False,
+                    executable_path=None, upload_dir=None,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None)
+
+            # --- verify single: video=True forces recording on ---
+            calls.clear()
+            run_dir = os.path.join(d, "v-true")
+            os.makedirs(run_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(True), run_dir,
+                                         FakeLedger(), d, 0)
+            check("verify video=True exits 0", rc == 0, str(rc))
+            check("verify video=True single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("verify video=True threads video=True",
+                  bool(calls) and "video" in calls[0]
+                  and calls[0].get("video") is True,
+                  str(calls))
+
+            # --- verify single: video=False threads None, not False ---
+            calls.clear()
+            run_dir = os.path.join(d, "v-false")
+            os.makedirs(run_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args(False), run_dir,
+                                         FakeLedger(), d, 0)
+            check("verify video=False exits 0", rc == 0, str(rc))
+            check("verify video=False single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("verify video=False threads video=None not False",
+                  bool(calls) and "video" in calls[0]
+                  and calls[0].get("video") is None,
+                  str(calls))
+
+            # --- verify single: no video attribute threads None ---
+            calls.clear()
+            run_dir = os.path.join(d, "v-absent")
+            os.makedirs(run_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_verify_run(verify_args_no_video(), run_dir,
+                                         FakeLedger(), d, 0)
+            check("verify no video attr exits 0", rc == 0, str(rc))
+            check("verify no video attr single run_flow call",
+                  len(calls) == 1, str(calls))
+            check("verify no video attr threads video=None",
+                  bool(calls) and "video" in calls[0]
+                  and calls[0].get("video") is None,
+                  str(calls))
+
+            # --- verify matrix: video=True on both combinations ---
+            matrix_path = os.path.join(d, "t304-matrix.yaml")
+            with open(matrix_path, "w") as fh:
+                fh.write("name: t304-matrix\ntarget: http://h/${t}\n"
+                         "matrix:\n  t: [a, b]\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /${t}\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def fake_write_matrix_summary(spec, results, run_dir):
+                path = os.path.join(run_dir, "REPORT.md")
+                with open(path, "w") as fh:
+                    fh.write("matrix summary\n")
+                return path
+
+            old_write_report = cli.write_report
+            old_print_summary = cli.print_summary
+            old_wms = report_mod.write_matrix_summary
+            cli.write_report = lambda *a, **kw: {}
+            cli.print_summary = lambda result: None
+            report_mod.write_matrix_summary = fake_write_matrix_summary
+            try:
+                calls.clear()
+                matrix_run_dir = os.path.join(d, "v-matrix")
+                os.makedirs(matrix_run_dir)
+                matrix_args = SimpleNamespace(
+                    flow=matrix_path, target=None, headed=False,
+                    executable_path=None, upload_dir=None,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None, video=True)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_verify_run(matrix_args, matrix_run_dir,
+                                             FakeLedger(), d, 0)
+                check("verify matrix video=True exits 0", rc == 0, str(rc))
+                check("verify matrix video=True ran every combination",
+                      len(calls) == 2, str(len(calls)))
+                check("verify matrix video=True on both combinations",
+                      bool(calls)
+                      and all("video" in c and c.get("video") is True
+                              for c in calls),
+                      str(calls))
+            finally:
+                cli.write_report = old_write_report
+                cli.print_summary = old_print_summary
+                report_mod.write_matrix_summary = old_wms
+    finally:
+        cli.run_flow = old_run_flow
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
