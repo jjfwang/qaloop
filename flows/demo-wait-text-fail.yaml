@@ -1,0 +1,46 @@
+version: 1
+name: demo-wait-text-fail
+tags: [smoke]
+description: >-
+  Browser proof for the wait text form fail-closed promise (issue
+  #282, SPEC.md wait table: wait with text waits for the selector
+  to contain the text; runner.py scope.locator(sel,
+  has_text=text).wait_for, distinct from the wait_for_selector
+  state branch). Until now the text form was proven only on the
+  happy path by demo-wait-target. This flow reuses
+  demo/wait-target.html unchanged (#status starts 'waiting',
+  settles to 'transitions settled' at 2800ms, never changes
+  again). The anchor waits with text for 'transitions settled'
+  and must pass, proving the text form blocks until the text
+  lands. The negative control waits with text for 'this text
+  never appears' with continue_on_fail: true and a timeout_ms of
+  2000, and must FAIL naming the timeout (Timeout / 2000ms
+  exceeded), proving text that never appears fails closed via
+  the locator branch rather than silently passing or hanging.
+  Exactly the one control is designed to fail. The closing
+  positive asserts the settled status text and passes again, so
+  the run stays passed overall with exactly the one control
+  step recorded as failed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the wait target demo page
+    goto: /demo/wait-target.html
+
+steps:
+  - name: text wait blocks until the status contains the settled text
+    wait: {target: "#status", text: "transitions settled"}
+
+  - name: negative control - text that never appears times out
+    continue_on_fail: true
+    wait: {target: "#status", text: "this text never appears", timeout_ms: 2000}
+
+  - name: closing positive - settled status text still present after the control
+    expect:
+      - text_contains: {selector: "#status", text: "transitions settled"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
