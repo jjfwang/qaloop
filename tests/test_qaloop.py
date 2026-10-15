@@ -1849,6 +1849,69 @@ def test_flow_services_log_contains_boot_failure():
               "QALOOP_SERVICE_LOGSVC_URL" not in os.environ)
 
 
+def test_flow_services_http_boot_failure():
+    # Issue #292: the http timeout branch against a LIVE service that
+    # answers 404 forever on the health path must raise TimeoutError
+    # naming the wait URL and the timeout, and the timed-out service
+    # process must be terminated (no orphan left alive).
+    import socket
+    import subprocess
+    import time
+    from qaloop.env import flow_services
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    wait_url = f"http://127.0.0.1:{port}/api/no-such-health-292"
+    # Live server answering 404 on every GET, so the health URL never
+    # returns 200. The wait URL rides in the child's argv as a
+    # trailing comment so pgrep -f <wait_url> genuinely matches the
+    # live child if orphaned.
+    server = ("python3 -c \"from http.server import BaseHTTPRequestHandler,"
+              " HTTPServer\n"
+              "class H(BaseHTTPRequestHandler):\n"
+              "    def do_GET(self):\n"
+              "        self.send_response(404); self.end_headers();"
+              " self.wfile.write(b'nope')\n"
+              "    def log_message(self, *a): pass\n"
+              f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()"
+              f"  # {wait_url}\"")
+    spec = [{"name": "api", "command": server,
+             "cwd": None, "env": {},
+             "wait": {"http": wait_url},
+             "timeout_s": 2.0, "url": None}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        try:
+            ctx.__enter__()
+            check("http boot failure raised TimeoutError", False)
+        except TimeoutError as e:
+            check("http boot failure raised TimeoutError", True)
+            check("http TimeoutError names the wait URL",
+                  wait_url in str(e), str(e))
+            check("http TimeoutError names the timeout",
+                  "not ready after 2.0s" in str(e), str(e))
+        finally:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        # terminate() is async; poll briefly so a dying child is not
+        # mistaken for an orphan.
+        orphans = None
+        for _ in range(30):
+            orphans = subprocess.run(["pgrep", "-f", wait_url],
+                                     capture_output=True, text=True)
+            if orphans.returncode != 0:
+                break
+            time.sleep(0.1)
+        check("timed-out http service terminated",
+              orphans.returncode != 0 and not orphans.stdout.strip(),
+              orphans.stdout)
+        check("failed api env cleaned",
+              "QALOOP_SERVICE_API_URL" not in os.environ)
+
+
 def test_evaluate_verdict_extraction():
     from qaloop.evaluate import _extract_verdict
     v = _extract_verdict('note: {"verdict": "MAKES_SENSE", "confidence": "high",'

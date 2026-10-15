@@ -1,0 +1,40 @@
+version: 1
+name: demo-services-http-fail
+tags: [smoke]
+description: >-
+  Automated non-vacuity boot control for the services wait http
+  form (issue #292, companion to demo-services). The service
+  command, cwd, and fixture are identical to demo-services, but
+  the wait health path is one the fixture answers 404 forever, so
+  boot must fail closed at timeout_s: qaloop/env.py wait_for_http
+  raises TimeoutError "http://127.0.0.1:8933/api/no-such-health
+  not ready after 5s (last: HTTP Error 404...)", boot_command
+  terminates the process, and qaloop/cli.py prints SERVICE BOOT
+  FAILED with exit 3. This flow is expected to FAIL at boot - its
+  steps never run. The proof is the verify command's failure
+  output, its exit code 3, no run recorded as passed, and port
+  8933 free afterwards.
+services:
+  - name: api
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/no-such-health"}
+    timeout_s: 5
+    url: "http://127.0.0.1:8933/"
+target: ${QALOOP_SERVICE_API_URL}
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
