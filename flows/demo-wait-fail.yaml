@@ -1,0 +1,65 @@
+version: 1
+name: demo-wait-fail
+tags: [smoke]
+description: >-
+  Browser proof for the wait js/response fail-closed promise (issue
+  #274, SPEC.md wait table: wait with js polls a JS expression and
+  wait with response waits for a matching network response, each
+  bounded by timeout_ms). Until now those forms were proven only on
+  the happy path by demo-wait-js-response. This flow reuses
+  demo/wait-js-response.html unchanged and the same mocked
+  /api/waitdata endpoint (800ms delay). The opening anchors click
+  #load, wait for the /api/waitdata response, wait for
+  window.dataLoaded === true, and assert the rendered text, and
+  all pass. Negative control 1 waits with js for
+  window.neverSet === true with continue_on_fail: true and a
+  timeout_ms of 2000, and must FAIL with a detail starting with
+  TimeoutError, proving a JS condition that never holds fails
+  closed rather than silently passing or hanging. Negative
+  control 2 waits with response for /api/never-called with
+  continue_on_fail: true and a timeout_ms of 2000, and must FAIL
+  with a detail starting with TimeoutError, proving a response
+  that never arrives fails closed the same way. Exactly the two
+  controls are designed to fail. The closing positive repeats the
+  rendered-text assertion and passes again, so the run stays
+  passed overall with exactly the two control steps recorded as
+  failed.
+target: ${TARGET_URL}
+
+setup:
+  - name: mock the slow data API (responds after 800ms)
+    mock: {url: "**/api/waitdata", json: {message: "data arrived"}, delay_ms: 800}
+  - name: open the demo page
+    goto: /demo/wait-js-response.html
+
+steps:
+  - name: trigger the fetch
+    click: "#load"
+
+  - name: wait for the network response (headers)
+    wait: {response: "/api/waitdata", timeout_ms: 10000}
+
+  - name: wait for the app to mark the data loaded
+    wait: {js: "window.dataLoaded === true", timeout_ms: 10000}
+
+  - name: rendered data is visible
+    expect:
+      - text_contains: {selector: "#out", text: "data arrived"}
+
+  - name: negative control 1 - JS condition that never holds times out
+    continue_on_fail: true
+    wait: {js: "window.neverSet === true", timeout_ms: 2000}
+
+  - name: negative control 2 - response that never arrives times out
+    continue_on_fail: true
+    wait: {response: "/api/never-called", timeout_ms: 2000}
+
+  - name: closing positive - rendered data still visible after the controls
+    expect:
+      - text_contains: {selector: "#out", text: "data arrived"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
