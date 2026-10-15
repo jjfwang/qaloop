@@ -507,7 +507,11 @@ def _dialog_matches(dialogs: list[dict], criteria: dict) -> tuple[bool, str]:
 #   entries to observers but does not retain them in the queryable
 #   getEntriesByType buffer.
 # - CLS: sum of layout-shift entry values where !hadRecentInput; 0 when
-#   none recorded — that is a real reading, not missing data.
+#   none recorded — that is a real reading, not missing data. Read via
+#   a short-lived PerformanceObserver with buffered:true for the same
+#   reason as LCP: headless-shell delivers layout-shift entries to
+#   observers but does not retain them in the queryable
+#   getEntriesByType buffer.
 # - INP: max duration of `first-input` entries with an interactionId,
 #   null when none (no real interaction happened yet). Headless-shell
 #   only records `event` timing entries for an observer registered
@@ -529,8 +533,19 @@ _PERF_VITALS_SCRIPT = """(async () => {
   });
   let lcp = null;
   for (const e of lcpEntries) lcp = e.renderTime || e.startTime;
+  const clsEntries = await new Promise((resolve) => {
+    const seen = [];
+    let obs = null;
+    try {
+      obs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) seen.push(e);
+      });
+      obs.observe({type: 'layout-shift', buffered: true});
+    } catch (err) { /* entry type unsupported: cls stays 0 */ }
+    setTimeout(() => { if (obs) obs.disconnect(); resolve(seen); }, 60);
+  });
   let cls = 0;
-  for (const e of performance.getEntriesByType('layout-shift')) {
+  for (const e of clsEntries) {
     if (!e.hadRecentInput) cls += e.value;
   }
   let inp = null;

@@ -1,0 +1,36 @@
+version: 1
+name: demo-perf-cls
+description: >-
+  Browser proof for observer-based CLS collection (issue #276): the
+  demo page inserts a 300px banner about 1000ms after load, pushing
+  the 800x600 hero down with no user input, so the browser records a
+  genuine layout-shift entry. The flow waits for the inserted banner,
+  then asserts perf cls budgets. Designed pattern: exactly one failed
+  record (the continue_on_fail control step asserting cls lte 0.01,
+  which must fail naming a positive cls value), the closing step
+  asserting cls lte 0.5 passes naming a positive cls value, and the
+  run status is passed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the layout shift demo page
+    goto: /demo/perf-cls.html
+
+steps:
+  - name: wait for the inserted banner that shifts the hero
+    wait: {target: "#shift-banner", state: visible}
+
+  - name: negative control - tight cls budget fails naming a positive cls
+    continue_on_fail: true
+    expect:
+      perf: {cls: {lte: 0.01}}
+
+  - name: closing cls budget passes naming a positive cls
+    expect:
+      perf: {cls: {lte: 0.5}}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false

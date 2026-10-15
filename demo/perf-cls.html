@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>layout shift demo</title>
+<style>
+  #hero { width: 800px; height: 600px; background: #315FD6; color: #fff;
+          font-size: 56px; display: flex; align-items: center;
+          justify-content: center; }
+  #shift-banner { height: 300px; background: #f5a623; color: #101720;
+          font-size: 32px; display: flex; align-items: center;
+          justify-content: center; }
+</style>
+</head>
+<body>
+<div id="hero">Layout shift demo</div>
+<script>
+// Insert a 300px banner above the hero after ~1000ms, with no user
+// input, so the hero is pushed down and the browser records a genuine
+// layout-shift entry with hadRecentInput false.
+setTimeout(() => {
+  const banner = document.createElement("div");
+  banner.id = "shift-banner";
+  banner.textContent = "Late banner";
+  document.body.insertBefore(banner, document.getElementById("hero"));
+}, 1000);
+</script>
+</body>
+</html>
