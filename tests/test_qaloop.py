@@ -9888,6 +9888,150 @@ def test_issue_306_upload_dir_plumbing_contract():
         cli.run_flow = old_run_flow
 
 
+def test_issue_308_perform_cli_plumbing_contract():
+    """Issue #308: cmd_perform threads the documented perform flags
+    into qaloop.perform.perform verbatim (task/target/max_actions/
+    headless=not headed/executable_path/cdp_url/allow_publish/
+    upload_dir/max_cost_usd), rejects a negative --max-cost-usd with
+    the exact ERROR line and exit 2 before any perform call, maps a
+    RuntimeError from perform() to ERROR + exit 2, and returns 0 iff
+    the result status is completed. perform is stubbed throughout so
+    no browser or model is touched; the ledger append is captured so
+    no real ledger row is written."""
+    import io
+
+    import qaloop.cli as cli
+    import qaloop.ledger as ledger_mod
+    import qaloop.perform as perform_mod
+
+    calls = []
+    ledger_rows = []
+    state = {"mode": "ok", "status": "completed"}
+
+    def fake_perform(**kw):
+        calls.append(kw)
+        if state["mode"] == "raise":
+            raise RuntimeError("boom-308")
+        return {"status": state["status"], "summary": "did it",
+                "action_count": 3, "tokens_in": 10, "tokens_out": 5,
+                "cost_usd_est": 0.0012, "run_dir": "/tmp/run308"}
+
+    old_perform = perform_mod.perform
+    old_append = ledger_mod.append
+    perform_mod.perform = fake_perform
+    ledger_mod.append = ledger_rows.append
+    try:
+        def run_cli(argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_perform(cli.build_parser().parse_args(argv))
+            return rc, buf.getvalue()
+
+        # --- (a) full-flag case: every kwarg threaded verbatim ---
+        calls.clear()
+        ledger_rows.clear()
+        state["mode"] = "ok"
+        state["status"] = "completed"
+        rc, out = run_cli(
+            ["perform", "--task", "do X", "--target", "http://example.test/",
+             "--max-actions", "7", "--headed",
+             "--cdp-url", "http://127.0.0.1:9222",
+             "--executable-path", "/fake/chromium-308",
+             "--allow-publish", "--upload-dir", "/tmp/up308",
+             "--max-cost-usd", "1.25"])
+        check("perform full flags exits 0 on completed", rc == 0, str(rc))
+        check("perform full flags single perform call",
+              len(calls) == 1, str(calls))
+        kw = calls[0] if calls else {}
+        check("perform full flags kwarg keys exact",
+              set(kw) == {"task", "target", "max_actions", "headless",
+                          "executable_path", "cdp_url", "allow_publish",
+                          "upload_dir", "max_cost_usd"},
+              str(sorted(kw)))
+        check("perform full flags task", kw.get("task") == "do X", str(kw))
+        check("perform full flags target",
+              kw.get("target") == "http://example.test/", str(kw))
+        check("perform full flags max_actions",
+              kw.get("max_actions") == 7, str(kw))
+        check("perform full flags headed gives headless False",
+              kw.get("headless") is False, str(kw))
+        check("perform full flags executable_path",
+              kw.get("executable_path") == "/fake/chromium-308", str(kw))
+        check("perform full flags cdp_url threaded",
+              "cdp_url" in kw
+              and kw.get("cdp_url") == "http://127.0.0.1:9222", str(kw))
+        check("perform full flags allow_publish",
+              kw.get("allow_publish") is True, str(kw))
+        check("perform full flags upload_dir",
+              kw.get("upload_dir") == "/tmp/up308", str(kw))
+        check("perform full flags max_cost_usd",
+              kw.get("max_cost_usd") == 1.25, str(kw))
+        check("perform full flags prints status line",
+              "status: completed" in out, out)
+        check("perform full flags ledger row kind perform",
+              len(ledger_rows) == 1
+              and ledger_rows[0].get("kind") == "perform",
+              str(ledger_rows))
+
+        # --- (b) defaults case: parser defaults reach the stub ---
+        calls.clear()
+        rc, out = run_cli(["perform", "--task", "x"])
+        check("perform defaults exits 0 on completed", rc == 0, str(rc))
+        check("perform defaults single perform call",
+              len(calls) == 1, str(calls))
+        kw = calls[0] if calls else {}
+        check("perform defaults target None",
+              "target" in kw and kw.get("target") is None, str(kw))
+        check("perform defaults max_actions 30",
+              kw.get("max_actions") == 30, str(kw))
+        check("perform defaults headless True",
+              kw.get("headless") is True, str(kw))
+        check("perform defaults executable_path None",
+              "executable_path" in kw
+              and kw.get("executable_path") is None, str(kw))
+        check("perform defaults cdp_url None",
+              "cdp_url" in kw and kw.get("cdp_url") is None, str(kw))
+        check("perform defaults allow_publish False",
+              kw.get("allow_publish") is False, str(kw))
+        check("perform defaults upload_dir None",
+              "upload_dir" in kw and kw.get("upload_dir") is None, str(kw))
+        check("perform defaults max_cost_usd 0.0",
+              kw.get("max_cost_usd") == 0.0, str(kw))
+
+        # --- (c) negative-cost guard: exit 2, exact line, no call ---
+        calls.clear()
+        ledger_rows.clear()
+        rc, out = run_cli(["perform", "--task", "x",
+                           "--max-cost-usd", "-1"])
+        check("perform negative cost exits 2", rc == 2, str(rc))
+        check("perform negative cost exact ERROR line",
+              out.strip() == "ERROR: --max-cost-usd cannot be negative",
+              out)
+        check("perform negative cost stub not called",
+              calls == [] and ledger_rows == [],
+              str(calls) + str(ledger_rows))
+
+        # --- (d) RuntimeError path: exit 2 with ERROR: <msg> ---
+        calls.clear()
+        state["mode"] = "raise"
+        rc, out = run_cli(["perform", "--task", "x"])
+        check("perform RuntimeError exits 2", rc == 2, str(rc))
+        check("perform RuntimeError ERROR line",
+              "ERROR: boom-308" in out.splitlines(), out)
+        state["mode"] = "ok"
+
+        # --- (e) non-completed status maps to exit 1 ---
+        state["status"] = "blocked"
+        rc, out = run_cli(["perform", "--task", "x"])
+        check("perform non-completed exits 1", rc == 1, str(rc))
+        check("perform non-completed prints status",
+              "status: blocked" in out, out)
+        state["status"] = "completed"
+    finally:
+        perform_mod.perform = old_perform
+        ledger_mod.append = old_append
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
