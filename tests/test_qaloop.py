@@ -8524,6 +8524,67 @@ def _run_doctor():
     return rc, buf.getvalue()
 
 
+def _run_validate(path):
+    """Run cmd_validate with stdout captured. Returns (rc, output)."""
+    import io
+    from qaloop import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_validate(cli.build_parser().parse_args(["validate", path]))
+    return rc, buf.getvalue()
+
+
+def test_issue_298_validate_valid_contract():
+    rc, out = _run_validate("flows/demo-teardown.yaml")
+    check("validate valid teardown exits 0", rc == 0, f"rc={rc}")
+    check("validate valid teardown line is byte-for-byte",
+          out == "VALID: demo-teardown — 7 steps (setup 1, steps 3, teardown 3), target ${TARGET_URL}\n",
+          repr(out))
+    rc, out = _run_validate("flows/demo-mock-ux.yaml")
+    check("validate valid mock-ux exits 0", rc == 0, f"rc={rc}")
+    check("validate valid mock-ux line is byte-for-byte",
+          out == "VALID: demo-mock-ux — 9 steps (setup 2, steps 7, teardown 0), target ${TARGET_URL}\n",
+          repr(out))
+
+
+def test_issue_298_validate_invalid_contract():
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("name: no-target\n"
+                "steps:\n"
+                "  - name: a step\n"
+                "    goto: /\n")
+        path = f.name
+    try:
+        rc, out = _run_validate(path)
+    finally:
+        os.unlink(path)
+    check("validate invalid exits 1", rc == 1, f"rc={rc}")
+    check("validate invalid line starts with INVALID prefix and spec path",
+          out.startswith(f"INVALID: spec {path}: "), repr(out))
+    check("validate invalid line names the missing target",
+          "`target` is required" in out, repr(out))
+
+
+def test_issue_298_validate_missing_file_propagates():
+    import io
+    from qaloop import cli
+    missing = os.path.join(tempfile.gettempdir(),
+                           "qaloop-no-such-flow-298.yaml")
+    if os.path.exists(missing):
+        os.unlink(missing)
+    buf = io.StringIO()
+    raised = False
+    with contextlib.redirect_stdout(buf):
+        try:
+            cli.cmd_validate(cli.build_parser().parse_args(["validate", missing]))
+        except FileNotFoundError:
+            raised = True
+    out = buf.getvalue()
+    check("validate missing file raises FileNotFoundError", raised)
+    check("validate missing file prints no INVALID line",
+          "INVALID:" not in out, repr(out))
+
+
 def test_issue_126_doctor_all_pass():
     rc, out = _run_doctor()
     lines = out.strip().splitlines()
