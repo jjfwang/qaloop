@@ -1,0 +1,62 @@
+version: 1
+name: demo-setup-fail
+tags: [smoke]
+description: >-
+  Browser proof for the setup-phase failure contract (issue #286,
+  SPEC.md flow anatomy: a setup failure aborts the run, the steps
+  phase is skipped, and teardown still runs). Every other demo flow
+  has a passing setup, so that contract had zero runnable-demo
+  adoption. This flow reuses demo/teardown-demo.html unchanged. The
+  setup phase opens the page and plants a localStorage value with a
+  page-JS seed (both must pass), then a designed failing step asserts
+  the planted key equals a wrong value with a step-level timeout_ms
+  of 1000 - it must record failed, with an error naming the observed
+  value (storage local.qaloop_teardown='SETUP-286 planted' want
+  ='SETUP-286 wrong-value'). The two steps-phase steps would both
+  pass if they ran (reading the planted value back through the page
+  and through a storage assertion), and both must instead record
+  skipped, none dropped. The teardown phase must still run on the
+  live page: it clears localStorage with a page-JS seed and then
+  clicks the read button and asserts the rendered absent marker,
+  and both teardown steps must record passed. Proof is the run
+  record: run.json shows phase statuses exactly setup [passed,
+  passed, failed], steps [skipped, skipped], teardown [passed,
+  passed], the overall run status failed, and REPORT.md renders
+  failed. The run is therefore EXPECTED to fail with exit 1 - that
+  failure is the proof.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the teardown demo page
+    goto: /demo/teardown-demo.html
+
+  - name: plant state with a page-JS seed
+    seed: {js: "localStorage.setItem('qaloop_teardown', 'SETUP-286 planted');"}
+
+  - name: designed failing setup step - planted value is not the wrong value
+    timeout_ms: 1000
+    expect:
+      - storage: {kind: local, key: "qaloop_teardown", equals: "SETUP-286 wrong-value"}
+
+steps:
+  - name: page renders the planted storage value
+    click: "#read-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "stored: SETUP-286 planted"}
+
+  - name: storage assertion reads the planted localStorage value
+    expect:
+      - storage: {kind: local, key: "qaloop_teardown", equals: "SETUP-286 planted"}
+
+teardown:
+  - name: teardown clears the planted state
+    seed: {js: "localStorage.clear()"}
+
+  - name: teardown page renders the absent marker
+    click: "#read-btn"
+    expect:
+      - text_contains: {selector: "#out", text: "stored: (absent)"}
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
