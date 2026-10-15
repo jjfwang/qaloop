@@ -1,0 +1,58 @@
+version: 1
+name: demo-frame-missing
+tags: [smoke]
+description: >-
+  Browser proof for the frame fail-closed promise (issue #266,
+  SPEC.md: a frame selector that matches no frame fails the step
+  naming the missing frame, rather than silently scoping to the
+  main page or waiting on a selector timeout). The flow reuses the
+  iframe demo page and its demo-frame iframe unchanged. The opening
+  positive anchor clicks the button inside demo-frame and asserts
+  the in-frame result, so the asserted content demonstrably exists
+  in the real frame. Negative control 1 uses the assertion form:
+  the identical text_contains assertion is run with frame
+  no-such-frame and must FAIL with a frame-not-found detail naming
+  no-such-frame, not a selector timeout, even though the content
+  exists in the real frame at that point. Negative control 2 uses
+  the action form: a click with frame no-such-frame and no expect
+  must FAIL the same way, so both the assertion path and the
+  action path are proven fail-closed. The closing positive repeats
+  the identical assertion from control 1 in demo-frame and must
+  PASS after the controls, proving the same assertion passes in
+  demo-frame before and after but fails in no-such-frame by naming
+  frame-not-found. Both controls carry continue_on_fail: true so
+  the run stays passed overall with exactly the two control steps
+  recorded as failed.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the iframe demo page
+    goto: /demo/iframe-demo.html
+
+steps:
+  - name: click the button inside the frame (positive anchor)
+    click: "#inner-btn"
+    frame: demo-frame
+    expect:
+      - text_contains: {selector: "#inner-out", text: "clicked"}
+  - name: negative control - assertion fails closed when the frame does not exist
+    continue_on_fail: true
+    timeout_ms: 2000
+    frame: no-such-frame
+    expect:
+      - text_contains: {selector: "#inner-out", text: "clicked"}
+  - name: negative control - action fails closed when the frame does not exist
+    continue_on_fail: true
+    timeout_ms: 2000
+    frame: no-such-frame
+    click: "#inner-btn"
+  - name: closing positive - the identical assertion passes in the real frame after the controls
+    frame: demo-frame
+    expect:
+      - text_contains: {selector: "#inner-out", text: "clicked"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
