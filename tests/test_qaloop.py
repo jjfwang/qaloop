@@ -1912,6 +1912,84 @@ def test_flow_services_http_boot_failure():
               "QALOOP_SERVICE_API_URL" not in os.environ)
 
 
+def test_flow_services_partial_boot_failure():
+    # Issue #294: when the SECOND service fails to boot, the FIRST
+    # already-booted service must be stopped, its env exports must be
+    # removed, and its log must still be copied into the run dir.
+    import socket
+    import subprocess
+    import time
+    from qaloop.env import flow_services
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    portA = s.getsockname()[1]
+    s.close()
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    portB = s.getsockname()[1]
+    s.close()
+    wait_url = f"http://127.0.0.1:{portB}/api/no-such-health-294"
+    server_b = ("python3 -c \"from http.server import BaseHTTPRequestHandler,"
+                " HTTPServer\n"
+                "class H(BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n"
+                "        self.send_response(404); self.end_headers();"
+                " self.wfile.write(b'nope')\n"
+                "    def log_message(self, *a): pass\n"
+                f"HTTPServer(('127.0.0.1', {portB}), H).serve_forever()"
+                f"  # {wait_url}\"")
+    spec = [
+        {"name": "first", "command": f"python3 -m http.server {portA}",
+         "cwd": None, "env": {}, "wait": {"port": portA},
+         "timeout_s": 15.0, "url": None},
+        {"name": "second", "command": server_b,
+         "cwd": None, "env": {},
+         "wait": {"http": wait_url},
+         "timeout_s": 2.0, "url": None},
+    ]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        try:
+            ctx.__enter__()
+            check("partial boot failure raised TimeoutError", False)
+        except TimeoutError as e:
+            check("partial boot failure raised TimeoutError", True)
+            check("partial TimeoutError names the wait URL",
+                  wait_url in str(e), str(e))
+        finally:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        orphans = None
+        for _ in range(30):
+            orphans = subprocess.run(
+                ["pgrep", "-f", f"http.server {portA}"],
+                capture_output=True, text=True)
+            if orphans.returncode != 0:
+                break
+            time.sleep(0.1)
+        check("partial boot: first service terminated",
+              orphans is not None and orphans.returncode != 0
+              and not orphans.stdout.strip(),
+              orphans.stdout if orphans else "no pgrep result")
+        port_free = False
+        try:
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", portA))
+            probe.close()
+            port_free = True
+        except OSError:
+            port_free = False
+        check("partial boot: first service port is free", port_free)
+        check("partial boot: first URL env cleaned",
+              "QALOOP_SERVICE_FIRST_URL" not in os.environ)
+        check("partial boot: first PORT env cleaned",
+              "QALOOP_SERVICE_FIRST_PORT" not in os.environ)
+        check("partial boot: first service log copied",
+              os.path.exists(os.path.join(run_dir, "services", "first.log")))
+
+
 def test_evaluate_verdict_extraction():
     from qaloop.evaluate import _extract_verdict
     v = _extract_verdict('note: {"verdict": "MAKES_SENSE", "confidence": "high",'
