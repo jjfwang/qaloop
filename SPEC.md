@@ -348,6 +348,10 @@ A missing baseline fails the assertion with a pointer to this command;
 `verify` (per-combination run dirs under `matrix/`, variables seeded
 from the combination), saving each combination's baselines in
 baseline-update mode; the exit code is 0 iff every combination passed.
+`baselines` also accepts `--upload-dir <dir>` (env
+`QALOOP_UPLOAD_DIR`) with the same semantics as `verify`: the flag
+wins when both are set; when neither is declared, the runner is
+fail-closed (issue #76).
 
 ### Diff artifacts on mismatch
 

@@ -9682,6 +9682,212 @@ def test_issue_304_video_plumbing_contract():
         cli.run_flow = old_run_flow
 
 
+def test_issue_306_upload_dir_plumbing_contract():
+    """Issue #306: --upload-dir is resolved (flag wins over env
+    QALOOP_UPLOAD_DIR, via qaloop.env.resolve_upload_dir) and threaded
+    as the upload_dir kwarg into run_flow on the verify single path
+    (_cmd_verify_run), the baselines single path (_cmd_baselines_run,
+    with baseline_update=True preserved), and the baselines matrix
+    path (per combination). run_flow is stubbed throughout so no
+    browser is launched."""
+    import io
+    from types import SimpleNamespace
+
+    import qaloop.cli as cli
+    import qaloop.report as report_mod
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    calls = []
+
+    def echo_run_flow(spec, **kw):
+        calls.append(kw)
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed", duration_ms=1)]
+        return RunResult(flow_name=spec.name, target=kw.get("target", ""),
+                         status="passed", started=1.0, ended=1.001,
+                         steps=steps, failed_step=None, console_errors=[],
+                         page_errors=[], failed_requests=[],
+                         bad_responses=[], run_dir=kw.get("run_dir", ""))
+
+    old_run_flow = cli.run_flow
+    cli.run_flow = echo_run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "t306.yaml")
+            with open(flow_path, "w") as fh:
+                fh.write("name: t306\ntarget: http://spec-target\n"
+                         "steps:\n"
+                         "  - name: go\n    goto: /\n"
+                         "artifacts: {screenshot: none, ax_snapshot: "
+                         "on-failure, trace: false}\n")
+
+            def verify_args(upload_dir):
+                return SimpleNamespace(
+                    flow=flow_path, target=None, headed=False,
+                    executable_path=None, upload_dir=upload_dir,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None)
+
+            def baselines_args(upload_dir):
+                return SimpleNamespace(
+                    flow=flow_path, target=None, headed=False,
+                    executable_path=None, upload_dir=upload_dir)
+
+            try:
+                # --- (a) verify single: flag value threaded ---
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                calls.clear()
+                run_dir = os.path.join(d, "v-flag")
+                os.makedirs(run_dir)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_verify_run(verify_args("/flag/up"),
+                                             run_dir, FakeLedger(), d, 0)
+                check("verify upload flag exits 0", rc == 0, str(rc))
+                check("verify upload flag single run_flow call",
+                      len(calls) == 1, str(calls))
+                check("verify upload flag threads upload_dir",
+                      bool(calls) and "upload_dir" in calls[0]
+                      and calls[0]["upload_dir"] == "/flag/up",
+                      str(calls))
+
+                # --- (b) verify single: env fallback when flag None ---
+                os.environ["QALOOP_UPLOAD_DIR"] = "/env/up"
+                calls.clear()
+                run_dir = os.path.join(d, "v-env")
+                os.makedirs(run_dir)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_verify_run(verify_args(None),
+                                             run_dir, FakeLedger(), d, 0)
+                check("verify upload env exits 0", rc == 0, str(rc))
+                check("verify upload env single run_flow call",
+                      len(calls) == 1, str(calls))
+                check("verify upload env threads upload_dir",
+                      bool(calls) and "upload_dir" in calls[0]
+                      and calls[0]["upload_dir"] == "/env/up",
+                      str(calls))
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+
+                # --- (c) baselines single: flag, baseline_update kept ---
+                spec = load_spec(flow_path)
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_baselines_run(
+                        baselines_args("/flag/up"),
+                        os.path.join(d, "b-flag"), spec, FakeLedger(), d)
+                check("baselines upload flag exits 0", rc == 0, str(rc))
+                check("baselines upload flag single run_flow call",
+                      len(calls) == 1, str(calls))
+                check("baselines upload flag threads upload_dir",
+                      bool(calls) and "upload_dir" in calls[0]
+                      and calls[0]["upload_dir"] == "/flag/up",
+                      str(calls))
+                check("baselines upload flag keeps baseline_update=True",
+                      bool(calls)
+                      and calls[0].get("baseline_update") is True,
+                      str(calls))
+
+                # --- (d) baselines single: env fallback ---
+                os.environ["QALOOP_UPLOAD_DIR"] = "/env/up"
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._cmd_baselines_run(
+                        baselines_args(None),
+                        os.path.join(d, "b-env"), spec, FakeLedger(), d)
+                check("baselines upload env exits 0", rc == 0, str(rc))
+                check("baselines upload env single run_flow call",
+                      len(calls) == 1, str(calls))
+                check("baselines upload env threads upload_dir",
+                      bool(calls) and "upload_dir" in calls[0]
+                      and calls[0]["upload_dir"] == "/env/up",
+                      str(calls))
+                check("baselines upload env keeps baseline_update=True",
+                      bool(calls)
+                      and calls[0].get("baseline_update") is True,
+                      str(calls))
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+
+                # --- (e) baselines matrix: flag on every combination ---
+                matrix_path = os.path.join(d, "t306-matrix.yaml")
+                with open(matrix_path, "w") as fh:
+                    fh.write("name: t306-matrix\ntarget: http://h/${t}\n"
+                             "matrix:\n  t: [a, b]\n"
+                             "steps:\n"
+                             "  - name: go\n    goto: /${t}\n"
+                             "artifacts: {screenshot: none, ax_snapshot: "
+                             "on-failure, trace: false}\n")
+
+                def fake_write_matrix_summary(spec, results, run_dir):
+                    path = os.path.join(run_dir, "REPORT.md")
+                    with open(path, "w") as fh:
+                        fh.write("matrix summary\n")
+                    return path
+
+                old_write_report = cli.write_report
+                old_print_summary = cli.print_summary
+                old_wms = report_mod.write_matrix_summary
+                cli.write_report = lambda *a, **kw: {}
+                cli.print_summary = lambda result: None
+                report_mod.write_matrix_summary = fake_write_matrix_summary
+                try:
+                    calls.clear()
+                    matrix_run_dir = os.path.join(d, "b-matrix")
+                    os.makedirs(matrix_run_dir)
+                    matrix_args = SimpleNamespace(
+                        flow=matrix_path, target=None, headed=False,
+                        executable_path=None, upload_dir="/flag/up")
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = cli._cmd_baselines_run(
+                            matrix_args, matrix_run_dir,
+                            load_spec(matrix_path), FakeLedger(), d)
+                    check("baselines matrix upload exits 0",
+                          rc == 0, str(rc))
+                    check("baselines matrix upload ran every combination",
+                          len(calls) == 2, str(len(calls)))
+                    check("baselines matrix upload on both combinations",
+                          bool(calls)
+                          and all(c.get("upload_dir") == "/flag/up"
+                                  for c in calls),
+                          str(calls))
+                    check("baselines matrix upload keeps "
+                          "baseline_update=True",
+                          bool(calls)
+                          and all(c.get("baseline_update") is True
+                                  for c in calls),
+                          str(calls))
+                finally:
+                    cli.write_report = old_write_report
+                    cli.print_summary = old_print_summary
+                    report_mod.write_matrix_summary = old_wms
+            finally:
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+
+            # --- (f) parser: baselines --upload-dir parses, default None ---
+            parsed = cli.build_parser().parse_args(
+                ["baselines", "flows/x.yaml", "--upload-dir", "/flag/up"])
+            check("baselines parser threads --upload-dir",
+                  parsed.upload_dir == "/flag/up", str(parsed.upload_dir))
+            parsed_default = cli.build_parser().parse_args(
+                ["baselines", "flows/x.yaml"])
+            check("baselines parser --upload-dir defaults to None",
+                  parsed_default.upload_dir is None,
+                  str(parsed_default.upload_dir))
+    finally:
+        cli.run_flow = old_run_flow
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

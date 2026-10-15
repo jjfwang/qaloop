@@ -411,6 +411,7 @@ def cmd_baselines(args: argparse.Namespace) -> int:
 
 def _cmd_baselines_run(args: argparse.Namespace, run_dir: str, spec=None,
                        ledger=None, runs_root: str = None) -> int:
+    from qaloop.env import resolve_upload_dir
     if spec is None:
         try:
             spec = load_spec(args.flow)
@@ -420,7 +421,6 @@ def _cmd_baselines_run(args: argparse.Namespace, run_dir: str, spec=None,
     if getattr(spec, "matrix", None):
         # Issue #200: matrix flows run once per combination, each in
         # baseline-update mode — same dispatch as verify's matrix path.
-        from qaloop.env import resolve_upload_dir
         print(f"run dir: {run_dir}")
         print(f"target:  {args.target or spec.target}")
         print("baseline update mode — screenshots saved, not compared")
@@ -436,6 +436,8 @@ def _cmd_baselines_run(args: argparse.Namespace, run_dir: str, spec=None,
     result = run_flow(spec, run_dir=run_dir, target=target,
                       headless=not args.headed,
                       executable_path=args.executable_path,
+                      upload_dir=resolve_upload_dir(
+                          getattr(args, "upload_dir", None)),
                       baseline_update=True)
     print_summary(result)
     saved = [f"{a.name}: {a.detail}"
@@ -823,6 +825,10 @@ def build_parser() -> argparse.ArgumentParser:
     bl.add_argument("--target", default=None)
     bl.add_argument("--headed", action="store_true")
     bl.add_argument("--executable-path", default=None)
+    bl.add_argument("--upload-dir", default=None,
+                    help="directory file uploads are restricted to "
+                         "(env QALOOP_UPLOAD_DIR; fail-closed if neither "
+                         "is declared)")
     bl.set_defaults(fn=cmd_baselines)
 
     pf = sub.add_parser("perform",
