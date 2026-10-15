@@ -10032,6 +10032,116 @@ def test_issue_308_perform_cli_plumbing_contract():
         ledger_mod.append = old_append
 
 
+def test_issue_310_enqueue_cli_plumbing_contract():
+    """Issue #310: cmd_enqueue threads the documented enqueue flags
+    into qaloop.queue.enqueue (kind, payload built from --payload JSON
+    with setdefault flow and conditional target for verify-flow,
+    max_retries as kwarg), rejects a negative --max-retries with the
+    exact lowercase error line and exit 2 before any enqueue call,
+    and prints the exact enqueued job line. queue.enqueue is stubbed
+    throughout so no real queue row is written."""
+    import io
+
+    import qaloop.cli as cli
+    import qaloop.queue as queue_mod
+
+    calls = []
+
+    def fake_enqueue(kind, payload, max_retries=0):
+        calls.append((kind, dict(payload), max_retries))
+        return 4242
+
+    old_enqueue = queue_mod.enqueue
+    queue_mod.enqueue = fake_enqueue
+    try:
+        def run_cli(argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_enqueue(cli.build_parser().parse_args(argv))
+            return rc, buf.getvalue()
+
+        # --- (a) full verify-flow case ---
+        calls.clear()
+        rc, out = run_cli(
+            ["enqueue", "--kind", "verify-flow", "--flow", "f.yaml",
+             "--target", "http://x.test/",
+             "--payload", '{"extra":42,"repo":"r"}',
+             "--max-retries", "2"])
+        check("enqueue full exits 0", rc == 0, str(rc))
+        check("enqueue full single call", len(calls) == 1, str(calls))
+        kind, payload, mr = calls[0] if calls else (None, {}, None)
+        check("enqueue full kind verify-flow", kind == "verify-flow", str(calls))
+        check("enqueue full payload exact",
+              payload == {"extra": 42, "repo": "r", "flow": "f.yaml",
+                          "target": "http://x.test/"}, str(payload))
+        check("enqueue full max_retries 2", mr == 2, str(calls))
+        check("enqueue full printed line exact",
+              out.strip() == "enqueued job #4242 (verify-flow, max_retries=2)",
+              out)
+
+        # --- (b) setdefault: payload flow wins over --flow ---
+        calls.clear()
+        rc, out = run_cli(
+            ["enqueue", "--kind", "verify-flow", "--flow", "cli.yaml",
+             "--payload", '{"flow":"payload.yaml"}'])
+        check("enqueue setdefault exits 0", rc == 0, str(rc))
+        check("enqueue setdefault single call", len(calls) == 1, str(calls))
+        payload_b = calls[0][1] if calls else {}
+        check("enqueue setdefault flow stays payload.yaml",
+              payload_b.get("flow") == "payload.yaml", str(payload_b))
+
+        # --- (c) no --target: target key absent ---
+        calls.clear()
+        rc, out = run_cli(
+            ["enqueue", "--kind", "verify-flow", "--flow", "f.yaml"])
+        check("enqueue no-target exits 0", rc == 0, str(rc))
+        check("enqueue no-target single call", len(calls) == 1, str(calls))
+        payload_c = calls[0][1] if calls else {}
+        check("enqueue no-target target absent",
+              "target" not in payload_c, str(payload_c))
+
+        # --- (d) verify-repo: payload unchanged ---
+        calls.clear()
+        rc, out = run_cli(
+            ["enqueue", "--kind", "verify-repo",
+             "--payload", '{"repo":"ac","pr":7}'])
+        check("enqueue verify-repo exits 0", rc == 0, str(rc))
+        check("enqueue verify-repo single call", len(calls) == 1, str(calls))
+        kind_d, payload_d, mr_d = calls[0] if calls else (None, {}, None)
+        check("enqueue verify-repo kind", kind_d == "verify-repo", str(calls))
+        check("enqueue verify-repo payload unchanged",
+              payload_d == {"repo": "ac", "pr": 7}, str(payload_d))
+        check("enqueue verify-repo printed line exact",
+              out.strip() == "enqueued job #4242 (verify-repo, max_retries=0)",
+              out)
+
+        # --- (e) parser defaults ---
+        parsed = cli.build_parser().parse_args(["enqueue"])
+        check("enqueue defaults kind verify-flow",
+              parsed.kind == "verify-flow", str(parsed.kind))
+        check("enqueue defaults payload string {}",
+              parsed.payload == "{}" and isinstance(parsed.payload, str),
+              str(parsed.payload))
+        check("enqueue defaults max_retries 0",
+              parsed.max_retries == 0, str(parsed.max_retries))
+        check("enqueue defaults flow None", parsed.flow is None, str(parsed.flow))
+        check("enqueue defaults target None",
+              parsed.target is None, str(parsed.target))
+        check("enqueue defaults fn is cmd_enqueue",
+              parsed.fn is cli.cmd_enqueue, str(parsed.fn))
+
+        # --- (f) negative guard: exit 2, exact line, no call ---
+        calls.clear()
+        rc, out = run_cli(["enqueue", "--max-retries", "-1"])
+        check("enqueue negative exits 2", rc == 2, str(rc))
+        check("enqueue negative exact error line",
+              out.strip() == "error: --max-retries must be >= 0 (got -1)",
+              out)
+        check("enqueue negative stub not called", calls == [], str(calls))
+    finally:
+        queue_mod.enqueue = old_enqueue
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
