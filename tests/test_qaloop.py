@@ -10709,6 +10709,60 @@ def test_issue_320_dashboard_cli_plumbing_contract():
         os.environ.pop("QALOOP_RUNS", None) if old is None else os.environ.update({"QALOOP_RUNS": old})
 
 
+def test_issue_322_webhook_cli_plumbing_contract():
+    """Issue #322: cmd_webhook plumbing contract: parser wiring
+    (fn is cmd_webhook, --port defaults to int 8090, --host
+    defaults to 127.0.0.1), exit 0, and port/host passed through
+    verbatim as keyword-only arguments to qaloop.webhook.serve."""
+    import qaloop.cli as cli
+    import qaloop.webhook as webhook_mod
+
+    calls = []
+
+    def stub(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    real_serve = webhook_mod.serve
+    webhook_mod.serve = stub
+    try:
+        # --- parser defaults ---
+        parsed = cli.build_parser().parse_args(["webhook"])
+        check("webhook parser fn is cmd_webhook",
+              parsed.fn is cli.cmd_webhook, str(parsed.fn))
+        check("webhook parser port default 8090",
+              parsed.port == 8090, str(vars(parsed)))
+        check("webhook parser port default is int",
+              isinstance(parsed.port, int), str(type(parsed.port)))
+        check("webhook parser host default",
+              parsed.host == "127.0.0.1", str(vars(parsed)))
+        rc = parsed.fn(parsed)
+        check("webhook defaults rc 0", rc == 0, str(rc))
+        check("webhook defaults stub kwargs",
+              calls == [((), {"port": 8090, "host": "127.0.0.1"})],
+              str(calls))
+
+        # --- explicit --port/--host passthrough ---
+        calls.clear()
+        parsed = cli.build_parser().parse_args(
+            ["webhook", "--port", "9123", "--host", "0.0.0.0"])
+        check("webhook parser fn is cmd_webhook with args",
+              parsed.fn is cli.cmd_webhook, str(parsed.fn))
+        check("webhook parser port passthrough",
+              parsed.port == 9123, str(vars(parsed)))
+        check("webhook parser host passthrough",
+              parsed.host == "0.0.0.0", str(vars(parsed)))
+        rc = parsed.fn(parsed)
+        check("webhook explicit rc 0", rc == 0, str(rc))
+        check("webhook explicit stub kwargs",
+              calls == [((), {"port": 9123, "host": "0.0.0.0"})],
+              str(calls))
+    finally:
+        webhook_mod.serve = real_serve
+
+    check("webhook serve restored after test",
+          webhook_mod.serve is real_serve, str(webhook_mod.serve))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
