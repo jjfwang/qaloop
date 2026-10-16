@@ -2806,6 +2806,118 @@ def test_evaluate_evidence_fallbacks():
               ev["services"] == {}, repr(ev["services"]))
 
 
+def test_evaluate_user_message_sections():
+    from qaloop.evaluate import _user_message
+    ev = {
+        "diff_stat": "1 files, +1/-0",
+        "diff": "diff --git a/a.py b/a.py\n+x = 1\n",
+        "flow_name": "demo",
+        "target": "http://x/",
+        "status": "FAIL",
+        "failed_step": 0,
+        "error": "boom",
+        "steps": [
+            {"index": 0, "phase": "steps", "name": "load", "op": "goto",
+             "status": "FAIL", "error": "boom-step",
+             "assertions": [{"kind": "visible", "passed": False}],
+             "ax_snapshot": 'button "Save"'},
+            {"index": 1, "phase": "steps", "name": "plain", "op": "click",
+             "status": "PASS", "error": "", "assertions": [],
+             "ax_snapshot": ""},
+        ],
+        "console_errors": ["console boom"],
+        "page_errors": ["page boom"],
+        "failed_requests": [{"url": "http://x/api", "error": "net::ERR"}],
+        "bad_responses": [{"url": "http://x/api", "status": 500}],
+        "services": {"api": "api-log-line", "web": "web-log-line"},
+        "report": "# Report\nall good",
+    }
+    msg = _user_message("the claim", ev)
+    check("347 step line pins error and json assertions",
+          'STEP 0 [steps] load (goto): FAIL error=boom-step '
+          'assertions=[{"kind": "visible", "passed": false}]' in msg, msg)
+    check("347 AX block after STEP 0 and before STEP 1",
+          msg.index("STEP 0") < msg.index("  AX:") < msg.index("STEP 1"),
+          msg)
+    check("347 step without snapshot emits no AX block",
+          msg.count("  AX:") == 1, repr(msg.count("  AX:")))
+    check("347 AX snapshot content present",
+          '  AX:\nbutton "Save"' in msg, msg)
+    check("347 console errors rendered via json",
+          'CONSOLE ERRORS: ["console boom"]' in msg, msg)
+    check("347 page errors rendered as python repr not json",
+          "PAGE ERRORS: ['page boom']" in msg, msg)
+    check("347 failed requests rendered via json",
+          'FAILED REQUESTS: [{"url": "http://x/api", '
+          '"error": "net::ERR"}]' in msg, msg)
+    check("347 bad responses rendered via json",
+          'BAD RESPONSES: [{"url": "http://x/api", "status": 500}]' in msg,
+          msg)
+    check("347 service api log section present",
+          "SERVICE api LOG (tail):\napi-log-line" in msg, msg)
+    check("347 service web log section present",
+          "SERVICE web LOG (tail):\nweb-log-line" in msg, msg)
+    check("347 run report section present",
+          "RUN REPORT:\n# Report\nall good" in msg, msg)
+    ev_neg = {
+        "diff_stat": "1 files, +1/-0",
+        "diff": "diff --git a/a.py b/a.py\n+x = 1\n",
+        "flow_name": "demo",
+        "target": "http://x/",
+        "status": "PASS",
+        "failed_step": None,
+        "error": "",
+        "steps": [
+            {"index": 0, "phase": "steps", "name": "load", "op": "goto",
+             "status": "PASS", "error": "", "assertions": [],
+             "ax_snapshot": ""},
+        ],
+        "console_errors": [],
+        "page_errors": [],
+        "failed_requests": [],
+        "bad_responses": [],
+        "services": {},
+        "report": "",
+    }
+    msg_neg = _user_message("the claim", ev_neg)
+    for absent in ("CONSOLE ERRORS:", "PAGE ERRORS:", "FAILED REQUESTS:",
+                   "BAD RESPONSES:", "SERVICE ", "RUN REPORT:", "  AX:"):
+        check(f"347 empty evidence omits section {absent!r}",
+              absent not in msg_neg, msg_neg)
+    step_lines = [line for line in msg_neg.splitlines()
+                  if line.startswith("STEP 0")]
+    check("347 negative step line present exactly once",
+          len(step_lines) == 1, repr(step_lines))
+    check("347 negative step line is suffix-free",
+          step_lines and step_lines[0]
+          == "STEP 0 [steps] load (goto): PASS"
+          and " error=" not in step_lines[0]
+          and " assertions=" not in step_lines[0],
+          repr(step_lines))
+
+
+def test_write_evaluation_risks_section():
+    from qaloop.evaluate import write_evaluation
+    with tempfile.TemporaryDirectory() as run_dir:
+        md_path, _js = write_evaluation(
+            run_dir, "x does y",
+            {"verdict": "MAKES_SENSE", "confidence": "high",
+             "rationale": "r", "evidence": [],
+             "risks": ["risk one", "risk two"]})
+        md_text = open(md_path, encoding="utf-8").read()
+        check("347 risks section pins heading and dash lines in order",
+              "## Risks / missing coverage\n\n- risk one\n- risk two\n"
+              in md_text, md_text)
+    with tempfile.TemporaryDirectory() as run_dir:
+        md_path, _js = write_evaluation(
+            run_dir, "x does y",
+            {"verdict": "MAKES_SENSE", "confidence": "high",
+             "rationale": "r", "evidence": [], "risks": []})
+        md_text = open(md_path, encoding="utf-8").read()
+        check("347 empty risks omits risks heading",
+              "## Risks / missing coverage" not in md_text, md_text)
+
+
 def _stub_evaluate(verdict_dict):
     """Run evaluate() with _chat stubbed to return verdict_dict. Browser-free.
 
