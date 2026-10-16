@@ -10224,6 +10224,78 @@ def test_issue_312_compare_cli_plumbing_contract():
                 os.environ["QALOOP_RUNS"] = old_runs
 
 
+def test_issue_314_ledger_cli_plumbing_contract():
+    """Issue #314: cmd_ledger prints ledger.summarize() as indented
+    JSON to stdout and returns 0, dispatched by the ledger subparser
+    with no flags. The ledger path honors QALOOP_LEDGER; a missing
+    file summarizes to zeros. Mixed kinds pin the bucket rules:
+    scripted counts in scripted_runs, investigation counts in
+    investigations and its cost, perform and scripted-matrix count
+    toward runs and total cost only, and a missing cost_usd_est
+    counts 0."""
+    import io
+
+    import qaloop.cli as cli
+
+    def run_cli(argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_ledger(cli.build_parser().parse_args(argv))
+        return rc, buf.getvalue()
+
+    # --- parser wiring: ledger dispatches to cmd_ledger ---
+    parsed = cli.build_parser().parse_args(["ledger"])
+    check("ledger parser fn is cmd_ledger",
+          parsed.fn is cli.cmd_ledger, str(parsed.fn))
+
+    with tempfile.TemporaryDirectory() as root:
+        old_ledger = os.environ.get("QALOOP_LEDGER")
+        ledger_file = os.path.join(root, "ledger.jsonl")
+        try:
+            entries = [
+                {"kind": "scripted", "cost_usd_est": 0.0},
+                {"kind": "investigation", "cost_usd_est": 0.05},
+                {"kind": "perform", "cost_usd_est": 0.1},
+                {"kind": "scripted-matrix"},
+            ]
+            with open(ledger_file, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+            os.environ["QALOOP_LEDGER"] = ledger_file
+
+            rc, out = run_cli(["ledger"])
+            check("ledger cli mixed exits 0", rc == 0, str(rc))
+            check("ledger cli mixed exact summary",
+                  json.loads(out) == {"runs": 4, "scripted_runs": 1,
+                                      "investigations": 1,
+                                      "total_cost_usd_est": 0.15,
+                                      "investigation_cost_usd_est": 0.05},
+                  out)
+            check("ledger cli output multi-line",
+                  len(out.strip().splitlines()) > 1, out)
+            check("ledger cli output indented",
+                  any(line.startswith("  \"") for line in out.splitlines()),
+                  out)
+            check("ledger cli output ends newline",
+                  out.endswith("\n"), repr(out[-20:]))
+
+            # --- absent file: zeros summary, still exit 0 ---
+            os.environ["QALOOP_LEDGER"] = os.path.join(root, "nope.jsonl")
+            rc, out = run_cli(["ledger"])
+            check("ledger cli absent exits 0", rc == 0, str(rc))
+            check("ledger cli absent zeros summary",
+                  json.loads(out) == {"runs": 0, "scripted_runs": 0,
+                                      "investigations": 0,
+                                      "total_cost_usd_est": 0,
+                                      "investigation_cost_usd_est": 0},
+                  out)
+        finally:
+            if old_ledger is None:
+                os.environ.pop("QALOOP_LEDGER", None)
+            else:
+                os.environ["QALOOP_LEDGER"] = old_ledger
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
