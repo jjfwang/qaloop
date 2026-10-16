@@ -1524,6 +1524,104 @@ def test_report_generation():
               json.load(open(os.path.join(d, "run.json")))["status"] == "failed")
 
 
+def test_report_tail_contracts():
+    """Issue #351: pin the report.py tail contracts (lines 29, 102, 125,
+    128, 296, 298) - _rel falsy path, section truncation past 20, diagnosis
+    Suggested fix line, Run error line, print_summary page/network lines."""
+    import contextlib
+    import io
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.spec import load_spec
+    from qaloop.report import write_report, print_summary, _rel
+    spec = load_spec("flows/game-loading-frames.yaml", strict_env=False)
+
+    def make_result(**over):
+        kw = dict(flow_name="tail-flow", target="http://x", status="failed",
+                  started=1700000000.0, ended=1700000001.0,
+                  steps=[StepResult(index=0, phase="main", name="S-01",
+                                    op="goto", status="passed",
+                                    duration_ms=10)],
+                  failed_step=None, console_errors=[], page_errors=[],
+                  failed_requests=[], bad_responses=[], run_dir="")
+        kw.update(over)
+        return RunResult(**kw)
+
+    def report_md(result, diagnosis=None):
+        with tempfile.TemporaryDirectory() as d:
+            result.run_dir = d
+            paths = write_report(result, spec, d, diagnosis=diagnosis)
+            with open(paths["report_md"], encoding="utf-8") as f:
+                return f.read()
+
+    # _rel falsy path (line 29) + relative path shape
+    with tempfile.TemporaryDirectory() as d:
+        check("351 _rel None path returns None", _rel(d, None) is None)
+        check("351 _rel empty path returns None", _rel(d, "") is None)
+        check("351 _rel path under run dir is relative",
+              _rel(d, os.path.join(d, "REPORT.md")) == "REPORT.md")
+
+    # Section truncation past 20 items (line 102)
+    errs25 = [{"text": f"err-{i}"} for i in range(25)]
+    md = report_md(make_result(console_errors=errs25))
+    item_lines = [ln for ln in md.splitlines() if ln.startswith("- `err-")]
+    check("351 section header carries full count 25",
+          "## Console errors (25)" in md)
+    check("351 section renders exactly 20 item lines",
+          len(item_lines) == 20, str(len(item_lines)))
+    check("351 truncation line reports 5 more",
+          "- \u2026 and 5 more (see run.json)" in md)
+    md20 = report_md(make_result(
+        console_errors=[{"text": f"e{i}"} for i in range(20)]))
+    check("351 exactly 20 items renders no truncation line",
+          "more (see run.json)" not in md20)
+    md21 = report_md(make_result(
+        console_errors=[{"text": f"e{i}"} for i in range(21)]))
+    check("351 21 items reports exactly 1 more",
+          "- \u2026 and 1 more (see run.json)" in md21)
+
+    # Diagnosis Suggested fix line (line 125), positive and negative
+    md_fix = report_md(make_result(), diagnosis={
+        "likely_cause": "lc", "diagnosis": "dg",
+        "suggested_fix": "FIX-TEXT-351"})
+    check("351 diagnosis with suggested_fix renders the line",
+          "**Suggested fix:** FIX-TEXT-351" in md_fix)
+    md_nofix = report_md(make_result(), diagnosis={
+        "likely_cause": "lc", "diagnosis": "dg"})
+    check("351 diagnosis without suggested_fix renders no such line",
+          "Suggested fix" not in md_nofix)
+
+    # Run error line (line 128), verbatim
+    md_err = report_md(make_result(status="error", error="boom-351"))
+    check("351 non-empty error renders the Run error line verbatim",
+          "Run error: `boom-351`" in md_err)
+    md_noerr = report_md(make_result())
+    check("351 empty error renders no Run error line",
+          "Run error:" not in md_noerr)
+
+    # print_summary tail lines (lines 296, 298), positive and negative
+    def summary(result):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_summary(result)
+        return buf.getvalue()
+
+    out = summary(make_result(page_errors=[{"text": "pe1"},
+                                           {"text": "pe2"}]))
+    check("351 summary prints page errors count line",
+          "  page errors: 2" in out, out)
+    out = summary(make_result(
+        failed_requests=[{"method": "GET", "url": "http://x/a",
+                          "failure": "net::ERR"}],
+        bad_responses=[{"method": "GET", "url": "http://x/b", "status": 500},
+                       {"method": "GET", "url": "http://x/c",
+                        "status": 404}]))
+    check("351 summary prints network issues line with both counts",
+          "  network issues: 1 failed, 2 bad responses" in out, out)
+    out = summary(make_result(status="passed"))
+    check("351 clean summary prints neither tail line",
+          "page errors:" not in out and "network issues:" not in out, out)
+
+
 def test_report_junit_xml():
     import xml.etree.ElementTree as ET
     from qaloop.runner import RunResult, StepResult
