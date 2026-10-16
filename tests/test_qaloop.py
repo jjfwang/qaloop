@@ -271,6 +271,122 @@ def test_enqueue_stores_max_retries():
                 check(f"max_retries {bad!r} rejected", True)
 
 
+def test_queue_claim_rollback_on_error():
+    from qaloop import queue
+
+    class FakeCursor:
+        def fetchone(self):
+            return {"id": 1}
+
+    class FakeConn:
+        def __init__(self):
+            self.sql = []
+            self.closed = False
+
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            if "UPDATE" in sql:
+                raise RuntimeError("boom-update")
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeConn()
+    real_connect = queue.connect
+    queue.connect = lambda: fake
+    raised = None
+    try:
+        try:
+            queue.claim()
+        except RuntimeError as e:
+            raised = e
+    finally:
+        queue.connect = real_connect
+    check("claim rollback: original error propagates",
+          raised is not None and str(raised) == "boom-update", str(raised))
+    check("claim rollback: ROLLBACK attempted after UPDATE",
+          any("ROLLBACK" in s for s in fake.sql)
+          and any("UPDATE" in s for s in fake.sql)
+          and fake.sql.index(next(s for s in fake.sql if "ROLLBACK" in s))
+          > fake.sql.index(next(s for s in fake.sql if "UPDATE" in s)),
+          str(fake.sql))
+    check("claim rollback: connection closed", fake.closed is True)
+    check("claim rollback: connect stub restored", queue.connect is real_connect)
+
+
+def test_queue_claim_rollback_failure_swallowed():
+    from qaloop import queue
+
+    class FakeCursor:
+        def fetchone(self):
+            return {"id": 1}
+
+    class FakeConn:
+        def __init__(self):
+            self.sql = []
+            self.closed = False
+
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            if "UPDATE" in sql:
+                raise RuntimeError("boom-update")
+            if "ROLLBACK" in sql:
+                raise RuntimeError("boom-rollback")
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeConn()
+    real_connect = queue.connect
+    queue.connect = lambda: fake
+    raised = None
+    try:
+        try:
+            queue.claim()
+        except RuntimeError as e:
+            raised = e
+    finally:
+        queue.connect = real_connect
+    check("claim rollback-swallow: original error still propagates",
+          raised is not None and str(raised) == "boom-update", str(raised))
+    check("claim rollback-swallow: ROLLBACK attempted",
+          any("ROLLBACK" in s for s in fake.sql), str(fake.sql))
+    check("claim rollback-swallow: connection closed", fake.closed is True)
+    check("claim rollback-swallow: connect stub restored", queue.connect is real_connect)
+
+
+def test_queue_list_jobs_corrupt_payload():
+    from qaloop import queue
+    with temp_db():
+        valid_id = queue.enqueue("verify-flow", {"flow": "x.yaml"})
+        conn = queue.connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO jobs (created_at, kind, payload, status)"
+                " VALUES (0.0, 'verify-flow', 'not-json{', 'pending')")
+            corrupt_id = cur.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        jobs = queue.list_jobs()
+        by_id = {j["id"]: j for j in jobs}
+        check("list_jobs corrupt: both rows present",
+              len(by_id) == 2 and valid_id in by_id and corrupt_id in by_id,
+              str(list(by_id)))
+        corrupt = by_id.get(corrupt_id, {})
+        check("list_jobs corrupt: raw payload preserved",
+              corrupt.get("payload") == "not-json{", str(corrupt.get("payload")))
+        check("list_jobs corrupt: payload stays str",
+              isinstance(corrupt.get("payload"), str))
+        valid = by_id.get(valid_id, {})
+        check("list_jobs corrupt: valid payload parsed",
+              valid.get("payload") == {"flow": "x.yaml"}, str(valid.get("payload")))
+        check("list_jobs corrupt: valid payload is dict",
+              isinstance(valid.get("payload"), dict))
+
+
 def test_retry_migration_from_old_schema():
     import sqlite3
     from qaloop import queue
