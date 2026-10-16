@@ -3054,6 +3054,159 @@ def test_investigate_tool_dispatch():
         check("investigate: network tool routes", json.loads(got) == inv.network, got)
 
 
+def test_investigate_tool_browser_actions():
+    import types as _types
+    from qaloop.investigate import Investigator
+
+    class RecordingPage:
+        def __init__(self):
+            self.calls = []
+            self.handlers = {}
+            self.url = "about:blank"
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.calls.append(("goto", url, timeout, wait_until))
+            self.url = url
+
+        def click(self, target, timeout=None):
+            self.calls.append(("click", target, timeout))
+
+        def fill(self, target, text, timeout=None):
+            self.calls.append(("fill", target, text, timeout))
+
+        def press(self, target, key, timeout=None):
+            self.calls.append(("press", target, key, timeout))
+
+        def screenshot(self, path=None):
+            self.calls.append(("screenshot", path))
+
+    with tempfile.TemporaryDirectory() as run_dir:
+        page = RecordingPage()
+        inv = Investigator(page, run_dir, 20)
+        check("investigate: initial state zeroed",
+              inv.actions == 0 and inv.shots == 0 and inv.console == [] and inv.network == [],
+              f"actions={inv.actions} shots={inv.shots} console={inv.console} network={inv.network}")
+        check("investigate: four handlers registered",
+              set(page.handlers) == {"console", "pageerror", "requestfailed", "response"},
+              repr(sorted(page.handlers)))
+
+        out = inv.tool("goto", {"url": "http://x/page"})
+        check("investigate: goto return reads page url after nav",
+              out == "navigated to http://x/page", out)
+        check("investigate: goto call pinned",
+              page.calls[-1] == ("goto", "http://x/page", 20000, "domcontentloaded"),
+              repr(page.calls[-1]))
+        check("investigate: actions +1 after goto", inv.actions == 1, str(inv.actions))
+
+        out = inv.tool("click", {"target": "#btn"})
+        check("investigate: click return", out == "clicked", out)
+        check("investigate: click call pinned",
+              page.calls[-1] == ("click", "#btn", 10000), repr(page.calls[-1]))
+        check("investigate: actions +1 after click", inv.actions == 2, str(inv.actions))
+
+        out = inv.tool("fill", {"target": "#in", "text": "hello"})
+        check("investigate: fill return", out == "filled", out)
+        check("investigate: fill call pinned",
+              page.calls[-1] == ("fill", "#in", "hello", 10000), repr(page.calls[-1]))
+        check("investigate: actions +1 after fill", inv.actions == 3, str(inv.actions))
+
+        out = inv.tool("press", {"target": "#in", "key": "Enter"})
+        check("investigate: press return", out == "pressed", out)
+        check("investigate: press call pinned",
+              page.calls[-1] == ("press", "#in", "Enter", 10000), repr(page.calls[-1]))
+        check("investigate: actions +1 after press", inv.actions == 4, str(inv.actions))
+
+        out = inv.tool("screenshot", {})
+        exp1 = os.path.join(run_dir, "steps", "inv-01.png")
+        check("investigate: screenshot return basename only",
+              out == "screenshot saved to inv-01.png (for the human report)", out)
+        check("investigate: screenshot call path keyword pinned",
+              page.calls[-1] == ("screenshot", exp1), repr(page.calls[-1]))
+        check("investigate: actions +1 after screenshot 1", inv.actions == 5,
+              str(inv.actions))
+        check("investigate: shots == 1 after first screenshot", inv.shots == 1,
+              str(inv.shots))
+
+        out = inv.tool("screenshot", {})
+        exp2 = os.path.join(run_dir, "steps", "inv-02.png")
+        check("investigate: screenshot 2 return",
+              out == "screenshot saved to inv-02.png (for the human report)", out)
+        check("investigate: screenshot 2 call path",
+              page.calls[-1] == ("screenshot", exp2), repr(page.calls[-1]))
+        check("investigate: shots == 2 after second screenshot", inv.shots == 2,
+              str(inv.shots))
+        check("investigate: actions +1 per call across all five branches",
+              inv.actions == 6, str(inv.actions))
+
+
+def test_investigate_page_event_handlers():
+    import types as _types
+    from qaloop.investigate import Investigator
+
+    class RecordingPage:
+        def __init__(self):
+            self.handlers = {}
+            self.url = "about:blank"
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+    def fresh():
+        page = RecordingPage()
+        with tempfile.TemporaryDirectory() as run_dir:
+            inv = Investigator(page, run_dir, 20)
+        return page, inv
+
+    page, inv = fresh()
+    h = page.handlers["console"]
+    h(_types.SimpleNamespace(type="error", text="x" * 600))
+    check("investigate: console error appended truncated to 500",
+          inv.console == [{"type": "error", "text": "x" * 500}], repr(inv.console))
+    h(_types.SimpleNamespace(type="log", text="hello"))
+    check("investigate: console non-error ignored",
+          inv.console == [{"type": "error", "text": "x" * 500}], repr(inv.console))
+    h(_types.SimpleNamespace(type="warning", text="w"))
+    check("investigate: console warning ignored",
+          inv.console == [{"type": "error", "text": "x" * 500}], repr(inv.console))
+
+    page, inv = fresh()
+    page.handlers["pageerror"](Exception("y" * 600))
+    check("investigate: pageerror appended truncated to 500",
+          inv.console == [{"type": "pageerror", "text": "y" * 500}], repr(inv.console))
+
+    page, inv = fresh()
+    page.handlers["requestfailed"](
+        _types.SimpleNamespace(method="GET", url="u" * 400))
+    check("investigate: requestfailed appended truncated to 300 no status",
+          inv.network == [{"kind": "failed", "method": "GET", "url": "u" * 300}],
+          repr(inv.network))
+
+    page, inv = fresh()
+    h = page.handlers["response"]
+    h(_types.SimpleNamespace(status=404, url="v" * 400,
+                             request=_types.SimpleNamespace(method="POST")))
+    check("investigate: response >=400 appended truncated url request method",
+          inv.network == [{"kind": "bad", "method": "POST", "url": "v" * 300,
+                           "status": 404}], repr(inv.network))
+    h(_types.SimpleNamespace(status=200, url="http://x/ok",
+                             request=_types.SimpleNamespace(method="GET")))
+    check("investigate: response 200 ignored", len(inv.network) == 1,
+          repr(inv.network))
+    h(_types.SimpleNamespace(status=399, url="http://x/almost",
+                             request=_types.SimpleNamespace(method="GET")))
+    check("investigate: response 399 ignored", len(inv.network) == 1,
+          repr(inv.network))
+    h(_types.SimpleNamespace(status=400, url="http://x/bad",
+                             request=_types.SimpleNamespace(method="GET")))
+    check("investigate: response 400 boundary appended",
+          inv.network[-1] == {"kind": "bad", "method": "GET",
+                              "url": "http://x/bad", "status": 400},
+          repr(inv.network))
+
+
 def _investigate_failed_result():
     from qaloop.runner import RunResult
     return RunResult.from_dict({
