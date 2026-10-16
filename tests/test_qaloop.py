@@ -3342,6 +3342,49 @@ def test_investigate_manual_brief():
             os.environ["QALOOP_MODEL_API_KEY"] = old_key
 
 
+def test_investigate_manual_brief_artifact_lines():
+    from qaloop.investigate import write_manual_brief
+    spec = _investigate_minimal_spec()
+
+    def brief_md(run_dir, screenshot, ax_snapshot):
+        result = _investigate_failed_result()
+        artifacts = result.steps[result.failed_step].artifacts
+        try:
+            artifacts.screenshot = screenshot
+            artifacts.ax_snapshot = ax_snapshot
+            path = write_manual_brief(run_dir, spec, result, "http://x/")
+            return open(path, encoding="utf-8").read()
+        finally:
+            artifacts.screenshot = None
+            artifacts.ax_snapshot = None
+
+    with tempfile.TemporaryDirectory() as run_dir:
+        md = brief_md(run_dir, os.path.join(run_dir, "steps/shot-00.png"),
+                      os.path.join(run_dir, "steps/ax-00.txt"))
+        check("manual brief both artifacts: screenshot relpath line",
+              "Screenshot: `steps/shot-00.png`" in md, md)
+        check("manual brief both artifacts: ax snapshot relpath line",
+              "AX snapshot: `steps/ax-00.txt`" in md, md)
+    with tempfile.TemporaryDirectory() as run_dir:
+        md = brief_md(run_dir, os.path.join(run_dir, "steps/shot-00.png"), None)
+        check("manual brief screenshot only: screenshot line present",
+              "Screenshot: `steps/shot-00.png`" in md, md)
+        check("manual brief screenshot only: ax snapshot line absent",
+              "AX snapshot:" not in md, md)
+    with tempfile.TemporaryDirectory() as run_dir:
+        md = brief_md(run_dir, None, os.path.join(run_dir, "steps/ax-00.txt"))
+        check("manual brief ax only: ax snapshot line present",
+              "AX snapshot: `steps/ax-00.txt`" in md, md)
+        check("manual brief ax only: screenshot line absent",
+              "Screenshot:" not in md, md)
+    with tempfile.TemporaryDirectory() as run_dir:
+        md = brief_md(run_dir, None, None)
+        check("manual brief no artifacts: screenshot line absent",
+              "Screenshot:" not in md, md)
+        check("manual brief no artifacts: ax snapshot line absent",
+              "AX snapshot:" not in md, md)
+
+
 def test_step_retry_spec():
     """retry: accepted in steps, defaults 0, rejects <0 / non-int / setup+teardown."""
     from qaloop.spec import load_spec, SpecError
