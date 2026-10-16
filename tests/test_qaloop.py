@@ -10639,6 +10639,76 @@ def test_issue_318_evaluate_cli_plumbing_contract():
         ledger_mod.append = real_append
 
 
+def test_issue_320_dashboard_cli_plumbing_contract():
+    """Issue #320: cmd_dashboard plumbing contract: parser wiring
+    (fn is cmd_dashboard, --out defaults to
+    <QALOOP_HOME>/dashboard), exit 0, runs-root resolution from
+    QALOOP_RUNS when set and <QALOOP_HOME>/runs when unset, --out
+    passed through verbatim as the second positional argument to
+    qaloop.dashboard.build, and the exact printed dashboard: line
+    carrying the build return value."""
+    import io
+
+    import qaloop.cli as cli
+    import qaloop.dashboard as dash_mod
+
+    calls = []
+
+    def stub(runs_root, out_dir):
+        calls.append((runs_root, out_dir))
+        return "/sentinel-320/index.html"
+
+    real_build = dash_mod.build
+    old = os.environ.get("QALOOP_RUNS")
+    dash_mod.build = stub
+    try:
+        def run_parsed(parsed):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            return rc, buf.getvalue()
+
+        default_out = os.path.join(cli.QALOOP_HOME, "dashboard")
+
+        # --- QALOOP_RUNS set, parser default --out ---
+        os.environ["QALOOP_RUNS"] = "/sentinel-320/runs"
+        parsed = cli.build_parser().parse_args(["dashboard"])
+        check("dashboard parser fn is cmd_dashboard",
+              parsed.fn is cli.cmd_dashboard, str(parsed.fn))
+        check("dashboard parser out default",
+              parsed.out == default_out, str(vars(parsed)))
+        rc, out = run_parsed(parsed)
+        check("dashboard runs env set rc 0", rc == 0, str(rc))
+        check("dashboard runs env set stub args",
+              calls == [("/sentinel-320/runs", default_out)],
+              str(calls))
+        check("dashboard runs env set exact line",
+              out == "dashboard: /sentinel-320/index.html\n",
+              repr(out))
+
+        # --- QALOOP_RUNS unset, --out passthrough ---
+        os.environ.pop("QALOOP_RUNS", None)
+        parsed = cli.build_parser().parse_args(
+            ["dashboard", "--out", "/sentinel-320/out"])
+        check("dashboard parser fn is cmd_dashboard with out",
+              parsed.fn is cli.cmd_dashboard, str(parsed.fn))
+        check("dashboard parser out passthrough",
+              parsed.out == "/sentinel-320/out", str(vars(parsed)))
+        calls.clear()
+        rc, out = run_parsed(parsed)
+        check("dashboard runs env unset rc 0", rc == 0, str(rc))
+        check("dashboard runs env unset stub args",
+              calls == [(os.path.join(cli.QALOOP_HOME, "runs"),
+                         "/sentinel-320/out")],
+              str(calls))
+        check("dashboard runs env unset exact line",
+              out == "dashboard: /sentinel-320/index.html\n",
+              repr(out))
+    finally:
+        dash_mod.build = real_build
+        os.environ.pop("QALOOP_RUNS", None) if old is None else os.environ.update({"QALOOP_RUNS": old})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
