@@ -2242,6 +2242,9 @@ def test_screenshot_rms_diff():
         check("identical images diff ~0", screenshot_rms_diff(a, b) == 0.0)
         Image.new("RGB", (50, 50), (0, 0, 0)).save(b)
         check("different images diff > 0", screenshot_rms_diff(a, b) > 0.5)
+        Image.new("RGB", (20, 30), (200, 100, 50)).save(b)
+        check("size mismatch resizes b, same color diff ~0",
+              screenshot_rms_diff(a, b) == 0.0)
 
 
 
@@ -4987,6 +4990,112 @@ def test_network_jsonl_artifact():
               paths.get("network_jsonl") is None
               and os.path.exists(os.path.join(d, "REPORT.md"))
               and os.path.exists(os.path.join(d, "run.json")))
+
+
+def test_collectors_defensive_contracts():
+    from qaloop.artifacts import Collectors
+
+    class PlainConsoleMsg:
+        def __init__(self, type, text, location):
+            self.type = type
+            self.text = text
+            self.location = location
+
+    class RaisingLocationMsg:
+        type = "error"
+        text = "boom"
+
+        @property
+        def location(self):
+            raise RuntimeError("location unavailable")
+
+    class LongStrLocation:
+        def __str__(self):
+            return "L" * 250
+
+    # (1) dict location: only url/lineNumber/columnNumber survive, extras dropped
+    c = Collectors()
+    c._on_console(PlainConsoleMsg(
+        "error", "boom",
+        {"url": "http://x/a.js", "lineNumber": 3, "columnNumber": 7,
+         "extra": "drop-me"}))
+    check("console error recorded once", len(c.console_errors) == 1)
+    check("console location keeps only url/line/column",
+          c.console_errors[0]["location"] == {"url": "http://x/a.js",
+                                             "lineNumber": 3,
+                                             "columnNumber": 7},
+          str(c.console_errors[0]["location"]))
+
+    # (2) location property raises -> loc falls back to {} -> all-None dict
+    c2 = Collectors()
+    c2._on_console(RaisingLocationMsg())
+    check("raising location falls back to all-None location",
+          len(c2.console_errors) == 1
+          and c2.console_errors[0]["location"] == {"url": None,
+                                                   "lineNumber": None,
+                                                   "columnNumber": None},
+          str(c2.console_errors))
+
+    # (3) non-dict location -> str(location) truncated to exactly 200 chars
+    c3 = Collectors()
+    c3._on_console(PlainConsoleMsg("error", "boom", LongStrLocation()))
+    check("non-dict location stringified and capped at 200 chars",
+          c3.console_errors[0]["location"] == "L" * 200,
+          str(c3.console_errors[0]["location"])[:60])
+
+    # (4) non-error console types are ignored; error text capped at 2000
+    c4 = Collectors()
+    c4._on_console(PlainConsoleMsg("warning", "careful", {}))
+    check("warning console msg not recorded", c4.console_errors == [])
+    c4._on_console(PlainConsoleMsg("error", "e" * 2500, {}))
+    check("console error text capped at 2000 chars",
+          len(c4.console_errors) == 1
+          and len(c4.console_errors[0]["text"]) == 2000)
+
+    # (5) pageerror: one entry, text is str(err) truncated to 2000 chars
+    c5 = Collectors()
+    err = ValueError("x" * 2500)
+    c5._on_pageerror(err)
+    check("pageerror recorded with text capped at 2000 chars",
+          len(c5.page_errors) == 1
+          and c5.page_errors[0]["text"] == str(err)[:2000]
+          and len(c5.page_errors[0]["text"]) == 2000,
+          str(c5.page_errors)[:80])
+
+    # (6) requestfailed whose failure property raises -> failure None in both
+    #     failed_requests and the network_log line (status/ms also None)
+    class RaisingFailureRequest:
+        method = "GET"
+        url = "http://x/broken"
+
+        @property
+        def failure(self):
+            raise RuntimeError("failure unavailable")
+
+    c6 = Collectors()
+    c6._on_requestfailed(RaisingFailureRequest())
+    check("raising failure still appends failed_requests entry, failure None",
+          len(c6.failed_requests) == 1
+          and c6.failed_requests[0]["failure"] is None,
+          str(c6.failed_requests))
+    check("raising failure network_log line has failure/status/ms None",
+          len(c6.network_log) == 1
+          and c6.network_log[0]["failure"] is None
+          and c6.network_log[0]["status"] is None
+          and c6.network_log[0]["ms"] is None,
+          str(c6.network_log))
+
+    # (7) response whose status property raises -> handler returns early:
+    #     nothing appended to network_log or bad_responses
+    class RaisingStatusResponse:
+        @property
+        def status(self):
+            raise RuntimeError("status unavailable")
+
+    c7 = Collectors()
+    c7._on_response(RaisingStatusResponse())
+    check("raising status response logs nothing",
+          c7.network_log == [] and c7.bad_responses == [])
 
 
 def test_url_title_assertion_polling():
