@@ -427,6 +427,230 @@ def test_worker_concurrency_no_double_claim():
         check("all jobs done", all(s == "done" for s in statuses), str(statuses))
 
 
+
+class _FakeBootTarget:
+    """Browser-free stand-in for env.ProcTarget (records stop())."""
+
+    def __init__(self, url="http://primary/"):
+        self.url = url
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+@contextlib.contextmanager
+def _stub_verify_repo(results):
+    """Stub worker._run_one_flow (records calls, pops scripted results) and
+    worker.boot_repo_env (records profiles, returns one fake target plus a
+    fixed primary_url). Plain attribute swaps, restored in finally."""
+    from qaloop import worker
+    real_run, real_boot = worker._run_one_flow, worker.boot_repo_env
+    calls = {"runs": [], "boots": []}
+    targets = []
+
+    def fake_run(flow_path, target, runs_root, headless, executable_path,
+                 do_investigate, keep_runs=0):
+        calls["runs"].append((flow_path, target))
+        return results.pop(0)
+
+    def fake_boot(preset, profile=None):
+        calls["boots"].append(profile)
+        t = _FakeBootTarget()
+        targets.append(t)
+        return [t], "http://primary/"
+
+    worker._run_one_flow, worker.boot_repo_env = fake_run, fake_boot
+    try:
+        yield calls, targets
+    finally:
+        worker._run_one_flow, worker.boot_repo_env = real_run, real_boot
+
+
+def test_issue_331_worker_verify_repo_contract():
+    import yaml
+    from qaloop import queue, worker
+
+    def kwargs(cfg):
+        return dict(_handle_kwargs(), repos_config=cfg)
+
+    with temp_db():
+        # --- unknown repo: failure note names the missing preset ---
+        jid = queue.enqueue("verify-repo", {"repo": "ghost"})
+        with _stub_verify_repo([]):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {}}))
+        row = _job_row(jid)
+        check("verify-repo unknown repo fails the job", row["status"] == "failed",
+              row["status"])
+        check("verify-repo unknown repo note names the preset gap",
+              "no repo preset for 'ghost' (see repos.yaml)" in (row["note"] or ""),
+              row["note"] or "")
+
+        # --- preset with no flows: failure note names the gap ---
+        jid = queue.enqueue("verify-repo", {"repo": "r1"})
+        with _stub_verify_repo([]):
+            worker.handle_job(queue.claim(),
+                              **kwargs({"repos": {"r1": {"env": []}}}))
+        row = _job_row(jid)
+        check("verify-repo flowless preset fails the job",
+              row["status"] == "failed", row["status"])
+        check("verify-repo flowless preset note",
+              "no flows for repo 'r1'" in (row["note"] or ""), row["note"] or "")
+
+        # --- entry resolution + path fallback + all-pass done/last run_dir ---
+        preset = {"flows": ["flows/demo-mock-ux.yaml",
+                            {"flow": "bare.yaml", "env": "prof"}]}
+        jid = queue.enqueue("verify-repo", {"repo": "r1"})
+        with _stub_verify_repo([("passed", "/tmp/runs/a"),
+                                ("passed", "/tmp/runs/b")]) as (calls, targets):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {"r1": preset}}))
+        row = _job_row(jid)
+        check("verify-repo both entries ran", len(calls["runs"]) == 2,
+              str(calls["runs"]))
+        check("verify-repo home-relative flow resolves under QALOOP_HOME",
+              calls["runs"][0][0] == os.path.join(worker.QALOOP_HOME,
+                                                  "flows/demo-mock-ux.yaml"),
+              calls["runs"][0][0])
+        check("verify-repo bare flow falls back to flows_dir",
+              calls["runs"][1][0] == os.path.join("/tmp/flows", "bare.yaml"),
+              calls["runs"][1][0])
+        check("verify-repo boot profiles: string None, dict named",
+              calls["boots"] == [None, "prof"], str(calls["boots"]))
+        check("verify-repo all-pass completes done", row["status"] == "done",
+              row["status"])
+        check("verify-repo done run_dir is the last flow run_dir",
+              row["run_dir"] == "/tmp/runs/b", str(row["run_dir"]))
+        check("verify-repo booted targets all stopped",
+              len(targets) == 2 and all(t.stopped for t in targets),
+              str([t.stopped for t in targets]))
+
+        # --- target selection: payload wins, else boot primary_url ---
+        jid = queue.enqueue("verify-repo", {"repo": "r1", "flows": ["f.yaml"],
+                                            "target": "http://payload/"})
+        with _stub_verify_repo([("passed", "/tmp/runs/t")]) as (calls, _t):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {"r1": {"env": []}}}))
+        check("verify-repo payload target wins",
+              calls["runs"][0][1] == "http://payload/", str(calls["runs"]))
+        jid = queue.enqueue("verify-repo", {"repo": "r1", "flows": ["f.yaml"]})
+        with _stub_verify_repo([("passed", "/tmp/runs/t")]) as (calls, _t):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {"r1": {"env": []}}}))
+        check("verify-repo boot primary_url is the fallback target",
+              calls["runs"][0][1] == "http://primary/", str(calls["runs"]))
+
+        # --- payload flows override preset flows ---
+        jid = queue.enqueue("verify-repo",
+                            {"repo": "r1", "flows": ["payload.yaml"]})
+        with _stub_verify_repo([("passed", "/tmp/runs/o")]) as (calls, _t):
+            worker.handle_job(queue.claim(),
+                              **kwargs({"repos": {"r1": {"flows": ["preset.yaml"]}}}))
+        check("verify-repo payload flows override preset flows",
+              [r[0] for r in calls["runs"]] == [os.path.join("/tmp/flows",
+                                                             "payload.yaml")],
+              str(calls["runs"]))
+
+        # --- failed first flow stops without continue_on_failure ---
+        jid = queue.enqueue("verify-repo",
+                            {"repo": "r1", "flows": ["a.yaml", "b.yaml"]})
+        with _stub_verify_repo([("failed", "/tmp/runs/f1"),
+                                ("passed", "/tmp/runs/p2")]) as (calls, _t):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {"r1": {"env": []}}}))
+        row = _job_row(jid)
+        check("verify-repo failure stops after the first flow",
+              len(calls["runs"]) == 1, str(calls["runs"]))
+        check("verify-repo stopped run is failed, not done",
+              row["status"] == "failed", row["status"])
+
+        # --- continue_on_failure: all flows run, worst status kept ---
+        jid = queue.enqueue("verify-repo",
+                            {"repo": "r1", "flows": ["a.yaml", "b.yaml"],
+                             "continue_on_failure": True})
+        with _stub_verify_repo([("failed", "/tmp/runs/f1"),
+                                ("passed", "/tmp/runs/p2")]) as (calls, _t):
+            worker.handle_job(queue.claim(), **kwargs({"repos": {"r1": {"env": []}}}))
+        row = _job_row(jid)
+        check("verify-repo continue_on_failure runs every flow",
+              len(calls["runs"]) == 2, str(calls["runs"]))
+        check("verify-repo continue_on_failure keeps the worst status",
+              row["status"] == "failed", row["status"])
+
+        # --- unknown job kind: failure note names the kind ---
+        jid = queue.enqueue("bogus-kind", {"repo": "r1"})
+        with _stub_verify_repo([]):
+            worker.handle_job(queue.claim(),
+                              **kwargs({"repos": {"r1": {"env": []}}}))
+        row = _job_row(jid)
+        check("worker unknown job kind fails the job",
+              row["status"] == "failed", row["status"])
+        check("worker unknown job kind note names the kind",
+              "unknown job kind 'bogus-kind'" in (row["note"] or ""),
+              row["note"] or "")
+
+    # --- load_repos_config: missing file and real YAML ---
+    missing = worker.load_repos_config("/nonexistent-331/repos.yaml")
+    check("load_repos_config missing file returns empty repos",
+          missing == {"repos": {}}, str(missing))
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "repos.yaml")
+        with open(p, "w", encoding="utf-8") as f:
+            yaml.safe_dump({"repos": {"r1": {"flows": ["a.yaml"]}}}, f)
+        cfg = worker.load_repos_config(p)
+    check("load_repos_config parses a real YAML file",
+          cfg == {"repos": {"r1": {"flows": ["a.yaml"]}}}, str(cfg))
+
+    # --- boot seams (real functions, boot_static/boot_command stubbed) ---
+    real_static, real_command = worker.boot_static, worker.boot_command
+    booted = []
+
+    def fake_static(d, port=None):
+        t = _FakeBootTarget("http://static/")
+        t.boot_dir = d
+        booted.append(t)
+        return t
+
+    def fake_command(cmd, cwd=None, env=None, wait=None, timeout_s=90,
+                     name="cmd"):
+        t = _FakeBootTarget("http://cmd/")
+        booted.append(t)
+        return t
+
+    worker.boot_static, worker.boot_command = fake_static, fake_command
+    try:
+        targets, primary = worker.boot_repo_env(
+            {"env": [{"static": {"dir": "site"}}]}, None)
+        check("boot_repo_env default profile boots preset env",
+              len(targets) == 1 and primary == "http://static/"
+              and targets[0].boot_dir.endswith("site"),
+              f"{primary} {targets}")
+        targets, primary = worker.boot_repo_env(
+            {"workdir": "/wd",
+             "env_profiles": {"prof": [{"command": {"command": "run.sh"}}]}},
+            "prof")
+        check("boot_repo_env named profile boots its entries",
+              len(targets) == 1 and primary == "http://cmd/",
+              f"{primary} {targets}")
+        try:
+            worker.boot_repo_env({"env_profiles": {"a": []}}, "nope")
+            raised = ""
+        except ValueError as e:
+            raised = str(e)
+        check("boot_repo_env unknown profile raises naming the profile",
+              "no env profile 'nope'" in raised, raised)
+        before = len(booted)
+        try:
+            worker.boot_env_entries(
+                [{"static": {"dir": "site"}}, {"bogus": 1}], "/wd")
+            raised = ""
+        except ValueError as e:
+            raised = str(e)
+        check("boot_env_entries unknown entry raises",
+              "unknown env entry" in raised, raised)
+        check("boot_env_entries stops already-booted targets on error",
+              len(booted) == before + 1 and booted[-1].stopped,
+              str([t.stopped for t in booted]))
+    finally:
+        worker.boot_static, worker.boot_command = real_static, real_command
+
+
 def test_worker_concurrency_once_waits_for_inflight():
     import threading
     import time
