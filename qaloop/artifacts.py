@@ -84,7 +84,11 @@ class Collectors:
         # Per-step JS-dialog policy, set by the runner before each step's
         # action ("accept" | "dismiss"; default preserves Playwright behavior).
         self.dialog_policy: str = "dismiss"
-        self._mark = 0  # index into console_errors+page_errors for console_clean
+        # Per-list marks for console_clean: each list grows independently,
+        # so a single combined index into the concatenated list drifts
+        # whenever the two lists hold different counts at checkpoint time.
+        self._console_mark = 0  # index into console_errors
+        self._page_mark = 0  # index into page_errors
         self._dialog_mark = 0  # index into dialogs for the dialog assertion
 
     def attach(self, page) -> None:
@@ -95,11 +99,13 @@ class Collectors:
         page.on("dialog", self._on_dialog)
 
     def checkpoint(self) -> None:
-        self._mark = len(self.console_errors) + len(self.page_errors)
+        self._console_mark = len(self.console_errors)
+        self._page_mark = len(self.page_errors)
         self._dialog_mark = len(self.dialogs)
 
     def errors_since_checkpoint(self) -> list[dict]:
-        return (self.console_errors + self.page_errors)[self._mark:]
+        return (self.console_errors[self._console_mark:]
+                + self.page_errors[self._page_mark:])
 
     def dialogs_since_checkpoint(self) -> list[dict]:
         """Dialogs raised since the step started (for the dialog assertion)."""
