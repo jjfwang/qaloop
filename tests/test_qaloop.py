@@ -13400,6 +13400,417 @@ def test_issue_355_main_guard():
               repr(code))
 
 
+def test_issue_359_runner_unit_contracts():
+    """Issue #359: pin runner.py unit contracts — _resolve_url absolute
+    passthrough (138), _route_delay fallback sleep (240-241, 248),
+    _do_mock body forms (270-274), _do_action reload/back/unknown op
+    (425, 427, 436), and the hidden-assertion success path (609)."""
+    import time
+
+    from qaloop.runner import (_check_assertions, _do_action, _do_mock,
+                               _resolve_url, _route_delay)
+    from qaloop.spec import Step
+
+    # _resolve_url: absolute URLs pass through untouched
+    check("359 resolve_url absolute https passthrough",
+          _resolve_url("http://base/app", "https://other/x?q=1")
+          == "https://other/x?q=1")
+    check("359 resolve_url absolute http passthrough",
+          _resolve_url("http://base/app", "http://other/y")
+          == "http://other/y")
+
+    # _route_delay: no running loop and a route without _loop degrades
+    # to a blocking time.sleep of exactly delay_s
+    class BareRoute:
+        pass
+
+    sleeps = []
+    real_sleep = time.sleep
+    time.sleep = lambda s: sleeps.append(s)
+    try:
+        _route_delay(BareRoute(), 0.25)
+    finally:
+        time.sleep = real_sleep
+    check("359 route_delay fallback sleeps once with delay_s",
+          sleeps == [0.25], str(sleeps))
+
+    # _do_mock: body forms — str body is encoded, bytes body is served
+    # as-is, and a path body serves the fixture file's bytes
+    class FakeRoute:
+        def __init__(self):
+            self.fulfill_kwargs = []
+            self.fell_back = 0
+
+        def fallback(self):
+            self.fell_back += 1
+
+        def fulfill(self, **kw):
+            self.fulfill_kwargs.append(kw)
+
+    class FakeRequest:
+        def __init__(self, method):
+            self.method = method
+
+    class FakeMockPage:
+        def __init__(self):
+            self.routes = []
+
+        def route(self, url, handler):
+            self.routes.append((url, handler))
+
+    def serve(params):
+        page = FakeMockPage()
+        hits = {}
+        _do_mock(page, params, hits)
+        route = FakeRoute()
+        page.routes[0][1](route, FakeRequest("GET"))
+        return route, hits
+
+    route, hits = serve({"url": "**/a", "body": "text"})
+    check("359 mock str body served as utf-8 bytes",
+          route.fulfill_kwargs[0].get("body") == b"text",
+          str(route.fulfill_kwargs))
+    check("359 mock str body hit recorded",
+          hits == {"**/a": 1}, str(hits))
+    route, hits = serve({"url": "**/b", "body": b"raw"})
+    check("359 mock bytes body served unchanged",
+          route.fulfill_kwargs[0].get("body") == b"raw",
+          str(route.fulfill_kwargs))
+    check("359 mock bytes body hit recorded",
+          hits == {"**/b": 1}, str(hits))
+    with tempfile.TemporaryDirectory() as d:
+        fixture = os.path.join(d, "fixture.bin")
+        with open(fixture, "wb") as f:
+            f.write(b"file-bytes\x00\xff")
+        route, hits = serve({"url": "**/c", "path": fixture})
+    check("359 mock path body served as file bytes",
+          route.fulfill_kwargs[0].get("body") == b"file-bytes\x00\xff",
+          str(route.fulfill_kwargs))
+    check("359 mock path body hit recorded",
+          hits == {"**/c": 1}, str(hits))
+
+    # _do_action: reload/back use the default timeout and
+    # domcontentloaded; an unknown op raises ValueError naming the op
+    class FakeNavPage:
+        def __init__(self):
+            self.calls = []
+
+        def reload(self, timeout=None, wait_until=None):
+            self.calls.append(("reload", timeout, wait_until))
+
+        def go_back(self, timeout=None, wait_until=None):
+            self.calls.append(("back", timeout, wait_until))
+
+    def nav_step(op):
+        return Step(index=0, phase="steps", name="n", op=op, params={},
+                    expect={}, expect_items=[], continue_on_fail=False,
+                    timeout_ms=None, raw={})
+
+    page = FakeNavPage()
+    _do_action(page, nav_step("reload"), "http://x", {})
+    check("359 reload uses default timeout and domcontentloaded",
+          page.calls == [("reload", 15000, "domcontentloaded")],
+          str(page.calls))
+    page = FakeNavPage()
+    _do_action(page, nav_step("back"), "http://x", {})
+    check("359 back uses default timeout and domcontentloaded",
+          page.calls == [("back", 15000, "domcontentloaded")],
+          str(page.calls))
+    err = None
+    try:
+        _do_action(FakeNavPage(), nav_step("bogus"), "http://x", {})
+    except ValueError as e:
+        err = e
+    check("359 unknown op raises ValueError naming the op",
+          err is not None and str(err) == "unknown op bogus", repr(err))
+
+    # hidden assertion: a successful wait_for_selector(state="hidden")
+    # records a passed AssertionResult whose detail is the selector
+    class FakeHiddenPage:
+        def __init__(self):
+            self.calls = []
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            self.calls.append((selector, state, timeout))
+
+    page = FakeHiddenPage()
+    step = Step(index=0, phase="steps", name="h", op=None, params=None,
+                expect={}, expect_items=[("hidden", "#x")],
+                continue_on_fail=False, timeout_ms=None, raw={})
+    res = _check_assertions(page, step, None)
+    check("359 hidden assertion passes on successful wait",
+          len(res) == 1 and res[0].passed, str(res))
+    check("359 hidden assertion detail is the selector",
+          len(res) == 1 and res[0].name == "hidden"
+          and res[0].detail == "#x", str(res))
+    check("359 hidden assertion waited with hidden state",
+          page.calls == [("#x", "hidden", 8000)], str(page.calls))
+
+
+def test_issue_359_baseline_update():
+    """Issue #359: screenshot_matches with baseline_update=True saves
+    the captured screenshot as the baseline (runner.py 919-924), passes
+    with the 'baseline saved to ...' detail, and writes no diff file."""
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+    from PIL import Image
+
+    def make_step(params):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[("screenshot_matches", params)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+
+    class FakePage:
+        def __init__(self, png):
+            self.png = png
+
+        def screenshot(self, path):
+            Image.open(self.png).save(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        baseline_dir = os.path.join(d, "baselines")
+        os.makedirs(baseline_dir)
+        run_dir = os.path.join(d, "run")
+        shot_png = os.path.join(d, "shot.png")
+        Image.new("RGB", (8, 8), (30, 90, 160)).save(shot_png)
+        baseline = os.path.join(baseline_dir, "sub", "base.png")
+        res = _check_assertions(
+            FakePage(shot_png),
+            make_step({"baseline": "sub/base.png"}), None,
+            baseline_dir=baseline_dir, run_dir=run_dir,
+            baseline_update=True)
+        check("359 baseline update passes", res[0].passed, res[0].detail)
+        check("359 baseline update detail names the saved baseline",
+              res[0].detail == f"baseline saved to {baseline}",
+              res[0].detail)
+        shot_path = os.path.join(run_dir, "steps", "assert-steps-00.png")
+        check("359 baseline file exists with the screenshot bytes",
+              os.path.isfile(baseline)
+              and open(baseline, "rb").read()
+              == open(shot_path, "rb").read())
+        check("359 baseline update writes no diff file",
+              not os.path.exists(os.path.join(
+                  run_dir, "steps", "assert-steps-00-diff.png")))
+        # Without baseline_update, a missing baseline fails naming the
+        # baseline and the command that creates it (runner.py 925-926)
+        missing_dir = os.path.join(d, "missing")
+        os.makedirs(missing_dir)
+        missing = os.path.join(missing_dir, "gone.png")
+        res = _check_assertions(
+            FakePage(shot_png), make_step({"baseline": "gone.png"}), None,
+            baseline_dir=missing_dir, run_dir=run_dir)
+        check("359 missing baseline without update fails",
+              not res[0].passed, res[0].detail)
+        check("359 missing baseline detail names baseline and fix",
+              res[0].detail == f"baseline missing: {missing} "
+              f"(run `qaloop baselines <flow>` to create it)",
+              res[0].detail)
+
+
+def test_issue_359_run_flow_options():
+    """Issue #359: run_flow contracts with a faked browser —
+    executable_path reaches launch (1098), tracing start/stop when
+    trace is on (1112, 1235), the retry delay sleep (1203), the
+    ax-on-failure artifact write (1217-1220) and its error branch
+    (1221-1222), and teardown best-effort failure (1227)."""
+    import time
+
+    import playwright.sync_api as pw_sync
+
+    from qaloop.runner import run_flow
+    from qaloop.spec import load_spec
+
+    def load(body):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml",
+                                         delete=False) as f:
+            f.write(body)
+            p = f.name
+        try:
+            return load_spec(p)
+        finally:
+            os.unlink(p)
+
+    spec = load(
+        "name: runner-359\ntarget: http://h\n"
+        "artifacts: {screenshot: none, ax_snapshot: on-failure, "
+        "trace: true}\n"
+        "steps:\n"
+        "  - name: failing with retry\n"
+        "    timeout_ms: 100\n"
+        "    retry: 1\n"
+        "    retry_delay_ms: 1\n"
+        "    expect: [{visible: '#missing'}]\n")
+    teardown_spec = load(
+        "name: runner-359-teardown\ntarget: http://h\n"
+        "artifacts: {screenshot: none, ax_snapshot: none, trace: false}\n"
+        "steps:\n"
+        "  - name: passing step\n"
+        "    expect: [{noop: true}]\n"
+        "teardown:\n"
+        "  - name: failing teardown\n"
+        "    timeout_ms: 100\n"
+        "    expect: [{visible: '#missing'}]\n")
+
+    launch_calls = []
+    tracing_starts = []
+    tracing_stops = []
+    page_holder = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.send_calls = []
+            self.detach_calls = 0
+
+        def send(self, method, args):
+            self.send_calls.append((method, args))
+            return {"nodes": [
+                _ax_node("r", "document", name="Root"),
+                _ax_node("c", "button", name="Go", parent="r")]}
+
+        def detach(self):
+            self.detach_calls += 1
+
+    class FakeCDPContext:
+        def __init__(self, session):
+            self.session = session
+
+        def new_cdp_session(self, page):
+            return self.session
+
+    class FakePage:
+        def __init__(self):
+            self.context = FakeCDPContext(FakeSession())
+            self.video = None
+
+        def on(self, event, handler):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            raise TimeoutError("selector missing")
+
+        def screenshot(self, path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"fake-png")
+
+    class FakeTracing:
+        def start(self, screenshots=None, snapshots=None, sources=None):
+            tracing_starts.append((screenshots, snapshots, sources))
+
+        def stop(self, path=None):
+            tracing_stops.append(path)
+
+    class FakeCtx:
+        def new_page(self):
+            return page_holder["page"]
+
+        def close(self):
+            pass
+
+        tracing = None
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            ctx = FakeCtx()
+            ctx.tracing = FakeTracing()
+            return ctx
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                launch_calls.append(kw)
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    sleeps = []
+    real_sleep = time.sleep
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    time.sleep = lambda s: sleeps.append(s)
+    try:
+        # Run A: steps dir is never created (screenshot: none), so the
+        # ax artifact write fails and lands in the step error suffix
+        with tempfile.TemporaryDirectory() as run_dir:
+            page_holder["page"] = FakePage()
+            launch_calls.clear()
+            tracing_starts.clear()
+            tracing_stops.clear()
+            sleeps.clear()
+            result = run_flow(spec, run_dir=run_dir,
+                              executable_path="/fake/chrome")
+            sr = result.steps[0]
+            check("359 executable_path reaches chromium launch",
+                  launch_calls == [{"headless": True,
+                                    "executable_path": "/fake/chrome"}],
+                  str(launch_calls))
+            check("359 tracing starts with screenshots and snapshots",
+                  tracing_starts == [(True, True, False)],
+                  str(tracing_starts))
+            check("359 tracing stops to trace.zip in the run dir",
+                  tracing_stops == [os.path.join(run_dir, "trace.zip")],
+                  str(tracing_stops))
+            check("359 failing retried run is failed",
+                  result.status == "failed" and sr.status == "failed",
+                  result.status)
+            check("359 retry used both attempts",
+                  sr.attempts == 2, str(sr.attempts))
+            check("359 retry delay slept between attempts",
+                  sleeps == [0.001], str(sleeps))
+            check("359 ax artifact error appended to step error",
+                  " [artifact error: " in sr.error
+                  and sr.error.endswith("]"), sr.error)
+            check("359 ax artifact not recorded when its write fails",
+                  sr.artifacts.ax_snapshot is None,
+                  str(sr.artifacts.ax_snapshot))
+
+        # Run B: steps dir pre-created and a working CDP fake, so the
+        # ax snapshot is written and recorded with no artifact error
+        with tempfile.TemporaryDirectory() as run_dir:
+            os.makedirs(os.path.join(run_dir, "steps"))
+            page_holder["page"] = FakePage()
+            result = run_flow(spec, run_dir=run_dir,
+                              executable_path="/fake/chrome")
+            sr = result.steps[0]
+            ax_path = os.path.join(run_dir, "steps", "steps-00-ax.txt")
+            check("359 ax snapshot path recorded on the step",
+                  sr.artifacts.ax_snapshot == ax_path,
+                  str(sr.artifacts.ax_snapshot))
+            check("359 ax snapshot file exists with the tree text",
+                  os.path.isfile(ax_path)
+                  and 'document "Root"' in open(ax_path).read())
+            check("359 ax success leaves no artifact error suffix",
+                  "[artifact error:" not in sr.error, sr.error)
+
+        # Run C: a failing teardown step is recorded failed, but the
+        # run still completes as passed (teardown is best-effort)
+        with tempfile.TemporaryDirectory() as run_dir:
+            page_holder["page"] = FakePage()
+            result = run_flow(teardown_spec, run_dir=run_dir)
+            teardown = [s for s in result.steps if s.phase == "teardown"]
+            check("359 teardown failure is recorded failed",
+                  len(teardown) == 1 and teardown[0].status == "failed",
+                  str([(s.phase, s.status) for s in result.steps]))
+            check("359 teardown failure does not fail the run",
+                  result.status == "passed"
+                  and result.failed_step is None, result.status)
+    finally:
+        time.sleep = real_sleep
+        pw_sync.sync_playwright = old_pw
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
