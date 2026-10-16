@@ -10142,6 +10142,88 @@ def test_issue_310_enqueue_cli_plumbing_contract():
         queue_mod.enqueue = old_enqueue
 
 
+def test_issue_312_compare_cli_plumbing_contract():
+    """Issue #312: cmd_compare resolves both run arguments through
+    the compare module under the default runs root (QALOOP_RUNS),
+    prints the rendered diff, and maps the outcome to the SPEC
+    exit codes: 0 identical (duration drift alone tolerated), 1
+    differ (top-level status change or a step status change), 2
+    with exactly one ERROR line naming the unresolvable run.
+    Real fixtures go through cmd_compare only; the compare module
+    functions are never called directly and never stubbed."""
+    import io
+
+    import qaloop.cli as cli
+
+    def run_cli(argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_compare(cli.build_parser().parse_args(argv))
+        return rc, buf.getvalue()
+
+    # --- (0) parser wiring: compare dispatches to cmd_compare ---
+    parsed = cli.build_parser().parse_args(["compare", "x", "y"])
+    check("compare parser fn is cmd_compare",
+          parsed.fn is cli.cmd_compare, str(parsed.fn))
+
+    with tempfile.TemporaryDirectory() as root:
+        old_runs = os.environ.get("QALOOP_RUNS")
+        os.environ["QALOOP_RUNS"] = root
+        try:
+            steps = [_syn_step_91("load", "passed", 100),
+                     _syn_step_91("click", "passed", 200)]
+
+            # --- (a) identical: duration drift alone tolerated ---
+            _syn_run_dir_91(root, "312-ident-a", "f", "passed", 1.0, 300,
+                            steps)
+            _syn_run_dir_91(root, "312-ident-b", "f", "passed", 2.0, 340,
+                            steps)
+            rc, out = run_cli(["compare", "312-ident-a", "312-ident-b"])
+            check("compare cli identical exits 0", rc == 0, str(rc))
+            check("compare cli identical final line",
+                  out.strip().splitlines()[-1] == "identical", out)
+
+            # --- (b1) differ: top-level status change ---
+            _syn_run_dir_91(root, "312-top-a", "f", "passed", 1.0, 300,
+                            steps)
+            _syn_run_dir_91(root, "312-top-b", "f", "failed", 2.0, 300,
+                            steps)
+            rc, out = run_cli(["compare", "312-top-a", "312-top-b"])
+            check("compare cli status change exits 1", rc == 1, str(rc))
+            check("compare cli status change final line",
+                  out.strip().splitlines()[-1] == "differ", out)
+
+            # --- (b2) differ: one step status flipped ---
+            steps_b = [_syn_step_91("load", "passed", 100),
+                       _syn_step_91("click", "failed", 200)]
+            _syn_run_dir_91(root, "312-step-a", "f", "passed", 1.0, 300,
+                            steps)
+            _syn_run_dir_91(root, "312-step-b", "f", "passed", 2.0, 300,
+                            steps_b)
+            rc, out = run_cli(["compare", "312-step-a", "312-step-b"])
+            check("compare cli step change exits 1", rc == 1, str(rc))
+            check("compare cli step change final line",
+                  out.strip().splitlines()[-1] == "differ", out)
+
+            # --- (c) missing run: exit 2, exactly one ERROR line ---
+            rc, out = run_cli(["compare", "312-ident-a",
+                               "zzz-no-such-312"])
+            check("compare cli missing exits 2", rc == 2, str(rc))
+            lines = out.strip().splitlines()
+            check("compare cli missing exactly one line",
+                  len(lines) == 1, out)
+            line = lines[0] if lines else ""
+            check("compare cli missing ERROR line names run",
+                  line.startswith("ERROR: ")
+                  and "no run dir matching" in line
+                  and "'zzz-no-such-312'" in line, line)
+        finally:
+            if old_runs is None:
+                del os.environ["QALOOP_RUNS"]
+            else:
+                os.environ["QALOOP_RUNS"] = old_runs
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
