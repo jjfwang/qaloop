@@ -10296,6 +10296,140 @@ def test_issue_314_ledger_cli_plumbing_contract():
                 os.environ["QALOOP_LEDGER"] = old_ledger
 
 
+def test_issue_316_investigate_cli_plumbing_contract():
+    """Issue #316: cmd_investigate loads <run>/run.json as a
+    RunResult, loads the flow spec with strict_env=False, and calls
+    qaloop.investigate.investigate with keyword arguments only:
+    target falls back to the recorded run target when --target is
+    absent, --headed inverts to headless=False, the parser defaults
+    are target=None / max_actions=20 / headed=False /
+    executable_path=None, and the returned diagnosis is printed as
+    indented JSON with non-ASCII characters unescaped (exit 0)."""
+    import io
+
+    import qaloop.cli as cli
+    import qaloop.investigate as inv_mod
+    from qaloop.runner import RunResult, StepResult
+
+    diagnosis = {"mode": "stub-316",
+                 "diagnosis": "café — broken",
+                 "likely_cause": "boom-316"}
+    captured = []
+    real_inv = inv_mod.investigate
+
+    def stub(**kw):
+        captured.append(kw)
+        return diagnosis
+
+    inv_mod.investigate = stub
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            recorded = RunResult(
+                flow_name="inv-316", target="http://recorded-316/",
+                status="failed", started=0.0, ended=0.0,
+                steps=[StepResult(index=0, phase="steps",
+                                  name="only step", op="goto",
+                                  status="failed", duration_ms=0,
+                                  error="boom-316")],
+                failed_step=0, console_errors=[], page_errors=[],
+                failed_requests=[], bad_responses=[], run_dir=root)
+            with open(os.path.join(root, "run.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(recorded.to_dict(), f)
+            flow_path = os.path.join(root, "flow.yaml")
+            with open(flow_path, "w", encoding="utf-8") as f:
+                f.write("name: inv316flow\n"
+                        "target: http://spec-316/\n"
+                        "steps:\n"
+                        "  - name: go\n"
+                        "    goto: /\n")
+
+            def run_parsed(parsed):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue()
+
+            # --- parser wiring + defaults ---
+            parsed = cli.build_parser().parse_args(
+                ["investigate", "--run", root, "--flow", flow_path])
+            check("investigate parser fn is cmd_investigate",
+                  parsed.fn is cli.cmd_investigate, str(parsed.fn))
+            check("investigate parser defaults",
+                  parsed.target is None and parsed.max_actions == 20
+                  and parsed.headed is False
+                  and parsed.executable_path is None,
+                  str(vars(parsed)))
+
+            # --- (A) defaults: target fallback, headless on ---
+            rc, out = run_parsed(parsed)
+            check("investigate cli defaults exits 0", rc == 0, str(rc))
+            check("investigate cli defaults one call",
+                  len(captured) == 1, str(len(captured)))
+            kw = captured[0] if captured else {}
+            check("investigate cli kwargs are keyword-only set",
+                  set(kw) == {"result", "spec", "target", "max_actions",
+                              "headless", "executable_path", "run_dir"},
+                  str(sorted(kw)))
+            res = kw.get("result")
+            check("investigate cli result is recorded RunResult",
+                  isinstance(res, RunResult)
+                  and res.flow_name == "inv-316"
+                  and res.target == "http://recorded-316/"
+                  and res.status == "failed"
+                  and len(res.steps) == 1
+                  and res.steps[0].name == "only step"
+                  and res.steps[0].error == "boom-316",
+                  str(res))
+            check("investigate cli spec loaded",
+                  kw.get("spec") is not None
+                  and kw["spec"].name == "inv316flow",
+                  str(kw.get("spec")))
+            check("investigate cli target falls back to recorded",
+                  kw.get("target") == "http://recorded-316/",
+                  str(kw.get("target")))
+            check("investigate cli default plumbing",
+                  kw.get("max_actions") == 20
+                  and kw.get("headless") is True
+                  and kw.get("executable_path") is None
+                  and kw.get("run_dir") == root,
+                  str(kw))
+
+            # --- output pinning: indented, unescaped JSON ---
+            check("investigate cli output parses to diagnosis",
+                  json.loads(out) == diagnosis, out)
+            check("investigate cli output multi-line indented",
+                  "\n  \"" in out, out)
+            check("investigate cli output non-ascii literal",
+                  "café — broken" in out
+                  and "\\u00e9" not in out and "\\u2014" not in out,
+                  out)
+
+            # --- (B) overrides: target, budget, headed inversion ---
+            captured.clear()
+            parsed_b = cli.build_parser().parse_args(
+                ["investigate", "--run", root, "--flow", flow_path,
+                 "--target", "http://override-316/",
+                 "--max-actions", "7", "--headed",
+                 "--executable-path", "/sentinel/chrome-316"])
+            rc, out = run_parsed(parsed_b)
+            check("investigate cli overrides exits 0", rc == 0, str(rc))
+            check("investigate cli overrides one call",
+                  len(captured) == 1, str(len(captured)))
+            kw = captured[0] if captured else {}
+            check("investigate cli override plumbing",
+                  kw.get("target") == "http://override-316/"
+                  and kw.get("max_actions") == 7
+                  and kw.get("headless") is False
+                  and kw.get("executable_path") == "/sentinel/chrome-316"
+                  and kw.get("run_dir") == root,
+                  str(kw))
+            check("investigate cli overrides output is diagnosis",
+                  json.loads(out) == diagnosis, out)
+    finally:
+        inv_mod.investigate = real_inv
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
