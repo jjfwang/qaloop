@@ -1,5 +1,6 @@
 """qaloop unit tests (stdlib only). Run: python3 tests/test_qaloop.py"""
 import contextlib
+import io
 import json
 import os
 import sys
@@ -10860,6 +10861,85 @@ def test_issue_325_console_clean_contract():
     texts = [e["text"] for e in coll.errors_since_checkpoint()]
     check("errors_since_checkpoint never checkpointed",
           texts == ["c1", "p1"], str(texts))
+
+
+def _chat_fake_urlopen(captured, holder):
+    def fake(req, timeout=None):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return io.BytesIO(json.dumps(holder["payload"]).encode())
+    return fake
+
+
+def test_chat_transport_contract():
+    from qaloop import evaluate as ev_mod
+    from qaloop import investigate as inv_mod
+    from qaloop import perform as perf_mod
+    cfg = {"base_url": "https://model.example/v1",
+           "name": "fake-model-327", "api_key": "sk-test-327"}
+    messages = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "u"}]
+    modules = [("evaluate", ev_mod, 1200),
+               ("investigate", inv_mod, 1500),
+               ("perform", perf_mod, 1200)]
+    orig = urllib.request.urlopen
+    try:
+        for label, mod, max_tok in modules:
+            captured = {}
+            holder = {"payload": {
+                "choices": [{"message": {"content": "hello-327"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4}}}
+            urllib.request.urlopen = _chat_fake_urlopen(captured, holder)
+            result = mod._chat(cfg, messages)
+            req = captured.get("req")
+            check(label + " _chat url",
+                  req is not None
+                  and req.full_url == "https://model.example/v1/chat/completions",
+                  str(getattr(req, "full_url", None)))
+            check(label + " _chat authorization",
+                  req is not None
+                  and req.get_header("Authorization") == "Bearer sk-test-327",
+                  str(req.get_header("Authorization")) if req else "no req")
+            check(label + " _chat content-type",
+                  req is not None
+                  and req.get_header("Content-type") == "application/json",
+                  str(req.get_header("Content-type")) if req else "no req")
+            check(label + " _chat default timeout",
+                  captured.get("timeout") == 90, str(captured.get("timeout")))
+            body = json.loads(req.data) if req is not None else {}
+            check(label + " _chat body",
+                  body == {"model": "fake-model-327", "messages": messages,
+                           "temperature": 0.2, "max_tokens": max_tok},
+                  str(body))
+            check(label + " _chat max_tokens",
+                  body.get("max_tokens") == max_tok, str(body.get("max_tokens")))
+            check(label + " _chat return",
+                  result == ("hello-327",
+                             {"prompt_tokens": 3, "completion_tokens": 4}),
+                  str(result))
+            captured.clear()
+            mod._chat(cfg, messages, timeout_s=7)
+            check(label + " _chat explicit timeout",
+                  captured.get("timeout") == 7, str(captured.get("timeout")))
+            holder["payload"] = {
+                "choices": [{"message": {"content": None}}],
+                "usage": {"prompt_tokens": 1}}
+            result = mod._chat(cfg, messages)
+            check(label + " _chat none content",
+                  result == ("", {"prompt_tokens": 1}), str(result))
+            holder["payload"] = {"choices": [{"message": {}}]}
+            result = mod._chat(cfg, messages)
+            check(label + " _chat missing content and usage",
+                  result == ("", {}), str(result))
+            holder["payload"] = {
+                "choices": [{"message": {"content": "x-327"}}]}
+            result = mod._chat(cfg, messages)
+            check(label + " _chat missing usage",
+                  result == ("x-327", {}), str(result))
+    finally:
+        urllib.request.urlopen = orig
+    check("urlopen restored after chat contract test",
+          urllib.request.urlopen is orig)
 
 
 if __name__ == "__main__":
