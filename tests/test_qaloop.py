@@ -12044,6 +12044,134 @@ def test_issue_329_webhook_handler_http_contract():
           webhook.ThreadingHTTPServer is real_server_cls)
 
 
+def _ax_node(nid, role, name=None, value=None, desc=None, parent=None):
+    n = {"nodeId": nid, "role": {"value": role}}
+    if parent is not None:
+        n["parentId"] = parent
+    if name is not None:
+        n["name"] = {"value": name}
+    if value is not None:
+        n["value"] = {"value": value}
+    if desc is not None:
+        n["description"] = {"value": desc}
+    return n
+
+
+def test_artifacts_compact_ax_tree_contract():
+    from qaloop.artifacts import compact_ax_tree
+
+    def single(node):
+        return compact_ax_tree({"nodes": [node]})
+
+    check("343 value-only suffix form",
+          single(_ax_node("1", "button", name="Volume", value="42"))
+          == 'button "Volume" = 42')
+    check("343 description-only suffix form",
+          single(_ax_node("1", "button", name="Play",
+                          desc="Plays the media"))
+          == 'button "Play" (Plays the media)')
+    check("343 value suffix precedes description suffix",
+          single(_ax_node("1", "slider", name="Level", value="7",
+                          desc="Current level"))
+          == 'slider "Level" = 7 (Current level)')
+    check("343 value newline flattened",
+          single(_ax_node("1", "button", name="N", value="a\nb"))
+          == 'button "N" = a b')
+    check("343 value truncated at exactly 60 chars",
+          single(_ax_node("1", "button", name="N", value="v" * 100))
+          == 'button "N" = ' + "v" * 60)
+    check("343 description newline flattened and truncated at 60",
+          single(_ax_node("1", "button", name="N", desc="x\ny" + "d" * 100))
+          == 'button "N" (x y' + "d" * 57 + ")")
+    check("343 name truncated at exactly 80 chars",
+          single(_ax_node("1", "button", name="n" * 100))
+          == 'button "' + "n" * 80 + '"')
+
+    tree = {"nodes": [_ax_node("r", "document", name="Root")] + [
+        _ax_node(f"c{i}", "button", name=f"Child{i}", parent="r")
+        for i in range(5)]}
+    capped = compact_ax_tree(tree, max_nodes=3)
+    check("343 max_nodes stops at exactly the cap",
+          len(capped.split("\n")) == 3, capped)
+    check("343 max_nodes keeps first lines, later children absent",
+          capped.split("\n")[0] == 'document "Root"'
+          and "Child1" in capped and "Child3" not in capped, capped)
+    full = compact_ax_tree(tree)
+    check("343 child rendered indented under parent",
+          full.split("\n")[1] == '  button "Child0"', full)
+    trunc = compact_ax_tree(tree, max_chars=10)
+    check("343 max_chars truncates joined output exactly",
+          len(trunc) == 10 and trunc == full[:10], repr(trunc))
+
+
+def test_artifacts_ax_snapshot_wrapper():
+    from qaloop.artifacts import ax_snapshot, compact_ax_tree
+
+    tree = {"nodes": [_ax_node("r", "document", name="Root"),
+                      _ax_node("c", "button", name="Go", parent="r")]}
+
+    class FakeSession:
+        def __init__(self, detach_raises=False):
+            self.send_calls = []
+            self.detach_calls = 0
+            self.detach_raises = detach_raises
+
+        def send(self, method, args):
+            self.send_calls.append((method, args))
+            return tree
+
+        def detach(self):
+            self.detach_calls += 1
+            if self.detach_raises:
+                raise RuntimeError("detach boom")
+
+    class FakeContext:
+        def __init__(self, session):
+            self.session = session
+            self.session_pages = []
+
+        def new_cdp_session(self, page):
+            self.session_pages.append(page)
+            return self.session
+
+    class FakePage:
+        def __init__(self, session):
+            self.context = FakeContext(session)
+
+    session = FakeSession()
+    page = FakePage(session)
+    out = ax_snapshot(page)
+    check("343 ax_snapshot returns compact_ax_tree of the CDP tree",
+          out == compact_ax_tree(tree), out)
+    check("343 ax_snapshot sends getFullAXTree with empty args",
+          session.send_calls == [("Accessibility.getFullAXTree", {})],
+          str(session.send_calls))
+    check("343 ax_snapshot opens the session for the page itself",
+          page.context.session_pages == [page])
+    check("343 ax_snapshot detaches exactly once",
+          session.detach_calls == 1, str(session.detach_calls))
+
+    big = {"nodes": [_ax_node("r", "document", name="Root")] + [
+        _ax_node(f"c{i}", "button", name=f"B{i}", parent="r")
+        for i in range(6)]}
+
+    class BigSession(FakeSession):
+        def send(self, method, args):
+            self.send_calls.append((method, args))
+            return big
+
+    session2 = BigSession()
+    out2 = ax_snapshot(FakePage(session2), max_nodes=2)
+    check("343 ax_snapshot passes max_nodes through",
+          out2 == compact_ax_tree(big, max_nodes=2)
+          and len(out2.split("\n")) == 2, out2)
+
+    session3 = FakeSession(detach_raises=True)
+    out3 = ax_snapshot(FakePage(session3))
+    check("343 ax_snapshot swallows a detach failure",
+          out3 == compact_ax_tree(tree) and session3.detach_calls == 1, out3)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
