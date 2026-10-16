@@ -130,6 +130,233 @@ def test_spec_unknown_top_level_keys():
           spec is not None and spec.name == "all-keys", str(err))
 
 
+def test_spec_validation_top_level_contracts():
+    """Issue #357: pin SpecError messages for malformed top-level specs."""
+    from qaloop.spec import load_spec, SpecError
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    _, err = load("- a\n- b\n")
+    check("357 top-level list rejected as non-mapping",
+          err is not None and "top level must be a mapping" in err, str(err))
+    _, err = load("target: http://x\nsteps: []\n")
+    check("357 missing name rejected",
+          err is not None and "`name` is required" in err, str(err))
+    _, err = load("name: t\nversion: 99\ntarget: http://x\nsteps: []\n")
+    check("357 unsupported version rejected",
+          err is not None and "unsupported version" in err, str(err))
+    _, err = load("name: t\ntarget: http://x\n"
+                  "artifacts: {screenshot: sometimes}\nsteps:\n  - goto: /\n")
+    check("357 bad artifacts.screenshot rejected",
+          err is not None and "artifacts.screenshot must be per-step|on-failure|none" in err,
+          str(err))
+    _, err = load("name: t\ntarget: http://x\nservices: [just-a-string]\n"
+                  "steps:\n  - goto: /\n")
+    check("357 non-mapping service rejected",
+          err is not None and "service must be a mapping" in err, str(err))
+
+
+def test_spec_validation_services_light_contracts():
+    """Issue #357: pin load_services_light SpecError messages."""
+    from qaloop.spec import load_services_light, SpecError
+
+    def load_light(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_services_light(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    _, err = load_light("- a\n- b\n")
+    check("357 services-light top-level list rejected as non-mapping",
+          err is not None and "top level must be a mapping" in err, str(err))
+    _, err = load_light("target: http://x\nsteps: []\n")
+    check("357 services-light missing name rejected",
+          err is not None and "`name` is required" in err, str(err))
+
+
+def test_spec_validation_action_ops_contracts():
+    """Issue #357: pin SpecError messages for malformed action ops."""
+    from qaloop.spec import load_spec, SpecError
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    def step_err(step_line):
+        return load("name: t\ntarget: http://x\nsteps:\n  - " + step_line + "\n")[1]
+
+    def setup_err(step_line):
+        return load("name: t\ntarget: http://x\nsetup:\n  - " + step_line
+                    + "\nsteps:\n  - goto: /\n")[1]
+
+    err = step_err("click: 123")
+    check("357 click with non-string rejected",
+          err is not None and "needs a selector string" in err, str(err))
+    err = step_err("goto: 123")
+    check("357 goto with non-string rejected",
+          err is not None and "goto needs a URL string" in err, str(err))
+    err = step_err('fill: {target: "#x"}')
+    check("357 fill missing text rejected",
+          err is not None and "fill needs {target, text}" in err, str(err))
+    err = step_err('press: {target: "#x"}')
+    check("357 press missing key rejected",
+          err is not None and "press needs {target, key}" in err, str(err))
+    err = step_err('select: {target: "#x"}')
+    check("357 select missing value rejected",
+          err is not None and "select needs {target, value}" in err, str(err))
+    err = step_err('wait: "later"')
+    check("357 wait with non-mapping rejected",
+          err is not None and "wait needs a mapping" in err, str(err))
+    spec, err = load("name: t\ntarget: http://x\nsteps:\n  - wait:\n")
+    check("357 bare wait loads as a valid targetless wait",
+          spec is not None, str(err))
+    err = step_err('wait_ms: "500"')
+    check("357 wait_ms with string rejected",
+          err is not None and "wait_ms needs a non-negative integer" in err, str(err))
+    err = step_err("wait_ms: -5")
+    check("357 wait_ms negative rejected",
+          err is not None and "wait_ms needs a non-negative integer" in err, str(err))
+    err = step_err('reload: "now"')
+    check("357 reload with params rejected",
+          err is not None and "takes no params" in err, str(err))
+    err = step_err("seed: {css: x}")
+    check("357 seed without http/js rejected",
+          err is not None and "seed needs" in err, str(err))
+    err = step_err("script: {css: x}")
+    check("357 script without js rejected",
+          err is not None and "script needs {js:" in err, str(err))
+    err = setup_err("mock: {url: 123, json: {x: 1}}")
+    check("357 mock with non-string url rejected",
+          err is not None and "mock.url must be a non-empty string" in err, str(err))
+    err = setup_err('mock: {url: "**/a", json: {x: 1}, status: 99}')
+    check("357 mock with out-of-range status rejected",
+          err is not None and "mock.status must be an HTTP status int" in err, str(err))
+    err = setup_err('mock: {url: "**/a", json: {x: 1}, status: "200"}')
+    check("357 mock with string status rejected",
+          err is not None and "mock.status must be an HTTP status int" in err, str(err))
+
+
+def test_spec_validation_assertion_contracts():
+    """Issue #357: pin SpecError messages for malformed assertions."""
+    from qaloop.spec import load_spec, SpecError, _validate_expect
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    def expect_err(expect_yaml):
+        return load("name: t\ntarget: http://x\nsteps:\n  - goto: /\n"
+                    "    expect: " + expect_yaml + "\n")[1]
+
+    err = expect_err('["just-a-string"]')
+    check("357 expect list of strings rejected",
+          err is not None and "expect list items must be single-key mappings" in err,
+          str(err))
+    direct_err = None
+    try:
+        _validate_expect("hello", "steps[0]")
+    except SpecError as e:
+        direct_err = str(e)
+    check("357 direct _validate_expect scalar rejected",
+          direct_err is not None
+          and "expect must be a mapping or a list of mappings" in direct_err,
+          str(direct_err))
+    err = expect_err("{bogus_assert: true}")
+    check("357 unknown assertion rejected",
+          err is not None and "unknown assertion" in err, str(err))
+    err = expect_err('{text_contains: {selector: "#x"}}')
+    check("357 text_contains missing text/pattern rejected",
+          err is not None and "needs {selector, text|pattern}" in err, str(err))
+    err = expect_err("{visible: 123}")
+    check("357 visible with non-string rejected",
+          err is not None and "needs a selector string" in err, str(err))
+    err = expect_err('{count: {selector: "#x"}}')
+    check("357 count missing comparator rejected",
+          err is not None and "assertion count needs {selector, equals|gte|lte}" in err,
+          str(err))
+    err = expect_err("{url_contains: 123}")
+    check("357 url_contains with non-string rejected",
+          err is not None and "needs a string" in err, str(err))
+    err = expect_err("{noop: false}")
+    check("357 noop false rejected",
+          err is not None and "must be" in err, str(err))
+    err = expect_err('{js: {script: "1"}}')
+    check("357 js assertion missing contains rejected",
+          err is not None and "assertion js needs {script, contains}" in err, str(err))
+    err = expect_err("{screenshot_matches: {baseline: 123}}")
+    check("357 screenshot_matches non-string baseline rejected",
+          err is not None and "screenshot_matches.baseline must be a path string" in err,
+          str(err))
+    err = expect_err("{ax: {role: 123}}")
+    check("357 ax non-string role rejected",
+          err is not None and "ax.role must be an ARIA role string" in err, str(err))
+
+
+def test_spec_validation_step_structure_contracts():
+    """Issue #357: pin SpecError messages for malformed steps/phases."""
+    from qaloop.spec import load_spec, SpecError
+
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            return load_spec(path), None
+        except SpecError as e:
+            return None, str(e)
+        finally:
+            os.unlink(path)
+
+    base = "name: t\ntarget: http://x\n"
+    _, err = load(base + 'steps: ["just-a-string"]\n')
+    check("357 non-mapping step rejected",
+          err is not None and "step must be a mapping" in err, str(err))
+    _, err = load(base + "steps:\n  - {name: 123, goto: /}\n")
+    check("357 step with non-string name rejected",
+          err is not None and "name must be a string" in err, str(err))
+    _, err = load(base + "steps:\n  - goto: /\n    expect: hello\n")
+    check("357 step with scalar expect rejected",
+          err is not None and "expect must be a mapping or list of assertions" in err,
+          str(err))
+    _, err = load(base + 'steps:\n  - {goto: /, click: "#x"}\n')
+    check("357 step with two action ops rejected",
+          err is not None and "at most one action op per step" in err, str(err))
+    _, err = load(base + "steps:\n  - {name: only-a-name}\n")
+    check("357 step with no op and no expect rejected",
+          err is not None and "step has no action op and no expect" in err, str(err))
+    _, err = load(base + "steps: {goto: /}\n")
+    check("357 steps as mapping rejected",
+          err is not None and "must be a list of steps" in err, str(err))
+
+
 def test_queue_claim_complete():
     from qaloop import queue
     with temp_db():
