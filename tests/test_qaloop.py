@@ -10763,6 +10763,105 @@ def test_issue_322_webhook_cli_plumbing_contract():
           webhook_mod.serve is real_serve, str(webhook_mod.serve))
 
 
+def test_issue_325_console_clean_contract():
+    """Issue #325 (tests from #324): the console_clean assertion contract.
+
+    Pins runner._check_assertions' console_clean branch (detail exactly
+    "clean", combined console-first failure detail, true count with
+    first-3 naming and 120-char truncation, per-step checkpoint reset)
+    and Collectors.errors_since_checkpoint directly, including the
+    per-list-marks regression: with pre-step entries in BOTH lists, a
+    pre-step page error must not be reported as new and a new console
+    error must not be dropped (SPEC.md: console_clean is "no new
+    console/page errors since the step started").
+    """
+    from qaloop.artifacts import Collectors
+    from qaloop.runner import _check_assertions
+    from qaloop.spec import Step
+
+    def clean_result(coll):
+        step = Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=[("console_clean", True)],
+                    continue_on_fail=False, timeout_ms=None, raw={})
+        return _check_assertions(None, step, coll)[0]
+
+    # (a) clean: no errors -> passes, detail exactly "clean"
+    coll = Collectors(record_bodies=False)
+    res = clean_result(coll)
+    check("console_clean clean passes", res.passed is True, str(res))
+    check("console_clean clean detail", res.detail == "clean", res.detail)
+
+    # (b) one console + one page error since checkpoint -> fails with
+    # detail "2 error(s): " naming both texts in combined order
+    coll = Collectors(record_bodies=False)
+    coll.checkpoint()
+    coll.console_errors.append({"text": "boom console"})
+    coll.page_errors.append({"text": "boom page"})
+    res = clean_result(coll)
+    check("console_clean combined fails", res.passed is False, str(res))
+    check("console_clean combined detail",
+          res.detail == "2 error(s): boom console; boom page", res.detail)
+
+    # (c) checkpoint reset: the same errors no longer fail the assertion
+    coll.checkpoint()
+    res = clean_result(coll)
+    check("console_clean reset passes", res.passed is True, str(res))
+    check("console_clean reset detail", res.detail == "clean", res.detail)
+    check("console_clean reset direct empty",
+          coll.errors_since_checkpoint() == [],
+          str(coll.errors_since_checkpoint()))
+
+    # (d) 5 errors: true count, only the first 3 named, each text
+    # truncated to 120 chars
+    coll = Collectors(record_bodies=False)
+    coll.checkpoint()
+    long_text = "x" * 200
+    coll.console_errors.append({"text": long_text})
+    coll.console_errors.append({"text": "second"})
+    coll.page_errors.append({"text": "third"})
+    coll.page_errors.append({"text": "fourth"})
+    coll.console_errors.append({"text": "fifth"})
+    res = clean_result(coll)
+    # Combined order is console-first: [long, second, fifth, third,
+    # fourth], so the first 3 named are the three console errors.
+    expected = "5 error(s): " + "; ".join([long_text[:120], "second",
+                                           "fifth"])
+    check("console_clean five fails", res.passed is False, str(res))
+    check("console_clean five detail", res.detail == expected, res.detail)
+    check("console_clean five names only first 3",
+          "third" not in res.detail and "fourth" not in res.detail,
+          res.detail)
+
+    # (e) direct: mixed pre/post in both lists (the #325 reproduction)
+    coll = Collectors(record_bodies=False)
+    coll.console_errors.append({"text": "pre console"})
+    coll.page_errors.append({"text": "pre page"})
+    coll.checkpoint()
+    coll.console_errors.append({"text": "post console"})
+    coll.page_errors.append({"text": "post page"})
+    texts = [e["text"] for e in coll.errors_since_checkpoint()]
+    check("errors_since_checkpoint mixed pre/post",
+          texts == ["post console", "post page"], str(texts))
+
+    # (e2) direct: sharpest drift interleaving - pre-checkpoint page-only
+    # error, post-checkpoint console-only error
+    coll = Collectors(record_bodies=False)
+    coll.page_errors.append({"text": "pre page only"})
+    coll.checkpoint()
+    coll.console_errors.append({"text": "post console only"})
+    texts = [e["text"] for e in coll.errors_since_checkpoint()]
+    check("errors_since_checkpoint page-pre console-post",
+          texts == ["post console only"], str(texts))
+
+    # (f) direct: never checkpointed -> everything is new, console-first
+    coll = Collectors(record_bodies=False)
+    coll.console_errors.append({"text": "c1"})
+    coll.page_errors.append({"text": "p1"})
+    texts = [e["text"] for e in coll.errors_since_checkpoint()]
+    check("errors_since_checkpoint never checkpointed",
+          texts == ["c1", "p1"], str(texts))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
