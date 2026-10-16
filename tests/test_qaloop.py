@@ -2715,6 +2715,97 @@ def test_evaluate_collect_and_write():
               json.load(open(js))["verdict"]["verdict"] == "MAKES_SENSE")
 
 
+def test_evaluate_evidence_fallbacks():
+    from qaloop.evaluate import _read, collect_evidence
+    with tempfile.TemporaryDirectory() as run_dir:
+        missing = os.path.join(run_dir, "nope.txt")
+        check("345 _read missing path returns empty",
+              _read(missing, 5) == "")
+        path = os.path.join(run_dir, "data.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("123456789012")
+        check("345 _read over limit truncates with exact suffix",
+              _read(path, 5) == "12345\n…[truncated 7 chars]",
+              repr(_read(path, 5)))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("12345")
+        check("345 _read exactly at limit returned unchanged",
+              _read(path, 5) == "12345", repr(_read(path, 5)))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("123")
+        check("345 _read under limit returned unchanged",
+              _read(path, 5) == "123", repr(_read(path, 5)))
+    with tempfile.TemporaryDirectory() as run_dir:
+        steps_dir = os.path.join(run_dir, "steps")
+        os.makedirs(steps_dir)
+        with open(os.path.join(steps_dir, "instep.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("ax-from-steps")
+        with open(os.path.join(run_dir, "rootonly.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("ax-from-root")
+        abs_path = os.path.join(run_dir, "abs-ax.txt")
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write("ax-absolute")
+        base = {"phase": "steps", "op": "goto", "status": "PASS",
+                "duration_ms": 1, "error": "", "assertions": []}
+        run = {"flow_name": "demo", "target": "http://x/",
+               "status": "PASS", "failed_step": None, "error": "",
+               "steps": [
+                   dict(base, index=0, name="a", ax_snapshot="instep.txt"),
+                   dict(base, index=1, name="b", ax_snapshot="rootonly.txt"),
+                   dict(base, index=2, name="c", ax_snapshot="ghost.txt"),
+                   dict(base, index=3, name="d", ax_snapshot=abs_path)],
+               "console_errors": [], "page_errors": [],
+               "failed_requests": [], "bad_responses": []}
+        with open(os.path.join(run_dir, "run.json"), "w") as f:
+            json.dump(run, f)
+        ev = collect_evidence(run_dir, "")
+        check("345 AX relative name read from steps dir",
+              ev["steps"][0]["ax_snapshot"] == "ax-from-steps",
+              repr(ev["steps"][0]["ax_snapshot"]))
+        check("345 AX relative name falls back to run-dir root",
+              ev["steps"][1]["ax_snapshot"] == "ax-from-root",
+              repr(ev["steps"][1]["ax_snapshot"]))
+        check("345 AX missing in both places returns empty",
+              ev["steps"][2]["ax_snapshot"] == "",
+              repr(ev["steps"][2]["ax_snapshot"]))
+        check("345 AX absolute path read directly",
+              ev["steps"][3]["ax_snapshot"] == "ax-absolute",
+              repr(ev["steps"][3]["ax_snapshot"]))
+    with tempfile.TemporaryDirectory() as run_dir:
+        svc_dir = os.path.join(run_dir, "services")
+        os.makedirs(svc_dir)
+        with open(os.path.join(svc_dir, "b.log"), "w",
+                  encoding="utf-8") as f:
+            f.write("b-log-content")
+        with open(os.path.join(svc_dir, "a.log"), "w",
+                  encoding="utf-8") as f:
+            f.write("x" * 810)
+        with open(os.path.join(svc_dir, "notes.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("not a log")
+        with open(os.path.join(run_dir, "run.json"), "w") as f:
+            json.dump({}, f)
+        ev = collect_evidence(run_dir, "")
+        check("345 services keys are sorted log basenames, non-log ignored",
+              list(ev["services"].keys()) == ["a", "b"],
+              repr(list(ev["services"].keys())))
+        check("345 services long log truncated at 800 with exact suffix",
+              ev["services"]["a"] == "x" * 800
+              + "\n…[truncated 10 chars]",
+              repr(ev["services"]["a"][-40:]))
+        check("345 services short log returned unchanged",
+              ev["services"]["b"] == "b-log-content",
+              repr(ev["services"]["b"]))
+    with tempfile.TemporaryDirectory() as run_dir:
+        with open(os.path.join(run_dir, "run.json"), "w") as f:
+            json.dump({}, f)
+        ev = collect_evidence(run_dir, "")
+        check("345 no services dir yields empty services",
+              ev["services"] == {}, repr(ev["services"]))
+
+
 def _stub_evaluate(verdict_dict):
     """Run evaluate() with _chat stubbed to return verdict_dict. Browser-free.
 
