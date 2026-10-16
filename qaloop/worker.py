@@ -45,6 +45,16 @@ def _resolve_flow_entry(entry) -> tuple[str, str | None]:
     return entry["flow"], entry.get("env")
 
 
+def _stop_targets(targets) -> None:
+    """Stop each target, isolating failures so one raising stop()
+    cannot prevent stop attempts on the remaining targets."""
+    for t in targets:
+        try:
+            t.stop()
+        except Exception:  # noqa: BLE001 - cleanup must attempt every target
+            pass
+
+
 def boot_env_entries(entries: list[dict], workdir: str) -> tuple[list[ProcTarget], str]:
     """Boot env entries. Returns (targets, primary_url)."""
     targets: list[ProcTarget] = []
@@ -207,8 +217,7 @@ def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: boo
                                                     executable_path, do_investigate,
                                                     keep_runs)
                 finally:
-                    for t in flow_targets:
-                        t.stop()
+                    _stop_targets(flow_targets)
                     targets = [t for t in targets if t not in flow_targets]
                 if status != "passed":
                     worst = status
@@ -234,8 +243,7 @@ def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: boo
             _notify_failure(job["id"], kind, "",
                             f"worker error: {e} (attempt {attempts})"[:2000])
     finally:
-        for t in targets:
-            t.stop()
+        _stop_targets(targets)
 
 
 def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
