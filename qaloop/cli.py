@@ -529,7 +529,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                    "cost_usd_est": cost.get("cost_usd_est", 0)})
     print(f"verdict: {verdict['verdict']} (confidence: {verdict.get('confidence')})")
     print(f"rationale: {verdict.get('rationale')}")
-    print(f"cost: tokens {cost.get('tokens_in')}/{cost.get('tokens_out')}  "
+    print(f"cost: tokens {cost.get('tokens_in', 0)}/{cost.get('tokens_out', 0)}  "
           f"est ${cost.get('cost_usd_est', 0):.6f}")
     print(f"report: {md_path}")
     return 0
