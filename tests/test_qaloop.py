@@ -12922,6 +12922,257 @@ def test_env_flow_services_relative_cwd_353():
         env.boot_command = orig_boot
 
 
+def test_issue_355_baselines_spec_error():
+    """Issue #355: cmd_baselines turns a SpecError from the light flow
+    parse into "INVALID SPEC: ..." + exit 2 (cli.py lines 389-391) —
+    the baselines entry point shares validate's bad-spec contract."""
+    import argparse
+    import qaloop.cli as cli
+    orig_runs_root = cli.default_runs_root
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "bad.yaml")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("name: [unclosed\n")
+            cli.default_runs_root = lambda: os.path.join(d, "runs")
+            args = argparse.Namespace(flow=bad, target=None, headed=False,
+                                      executable_path=None, upload_dir=None)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_baselines(args)
+            out = buf.getvalue()
+            check("355 baselines invalid spec exits 2", rc == 2, f"rc={rc}")
+            check("355 baselines invalid spec prints INVALID SPEC prefix",
+                  out.startswith("INVALID SPEC: "), repr(out[:60]))
+    finally:
+        cli.default_runs_root = orig_runs_root
+
+
+def test_issue_355_baselines_boot_failure():
+    """Issue #355: cmd_baselines turns a service-boot failure into
+    "SERVICE BOOT FAILED: <type>: <err>" + exit 3 (cli.py lines
+    403-405) — distinct from the spec-error exit 2."""
+    import argparse
+    import qaloop.cli as cli
+
+    class BoomCtx:
+        def __enter__(self):
+            raise RuntimeError("boom-boot")
+
+        def __exit__(self, *a):
+            return False
+
+    orig_runs_root = cli.default_runs_root
+    orig_ctx = cli._service_ctx
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "good.yaml")
+            with open(good, "w", encoding="utf-8") as f:
+                f.write("name: probe355\ntarget: http://127.0.0.1:9/\n"
+                        "steps: []\n")
+            cli.default_runs_root = lambda: os.path.join(d, "runs")
+            cli._service_ctx = lambda flow, services, run_dir: BoomCtx()
+            args = argparse.Namespace(flow=good, target=None, headed=False,
+                                      executable_path=None, upload_dir=None)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_baselines(args)
+            out = buf.getvalue()
+            check("355 baselines boot failure exits 3", rc == 3, f"rc={rc}")
+            check("355 baselines boot failure prints SERVICE BOOT FAILED",
+                  out.startswith(
+                      "SERVICE BOOT FAILED: RuntimeError: boom-boot"),
+                  repr(out[:80]))
+    finally:
+        cli.default_runs_root = orig_runs_root
+        cli._service_ctx = orig_ctx
+
+
+def test_issue_355_baselines_run_saved_lines():
+    """Issue #355: _cmd_baselines_run echoes each saved screenshot
+    baseline as "  screenshot_matches: <detail>" (cli.py line 447);
+    other assertions' details are not echoed as saved lines."""
+    import argparse
+    from types import SimpleNamespace
+    import qaloop.cli as cli
+    from qaloop.runner import AssertionResult, RunResult, StepResult
+    orig_run_flow = cli.run_flow
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            step = StepResult(
+                index=0, phase="steps", name="shot", op="goto",
+                status="passed", duration_ms=1,
+                assertions=[
+                    AssertionResult(name="screenshot_matches", passed=True,
+                                    detail="saved baseline x.png"),
+                    AssertionResult(name="text", passed=True, detail="ok"),
+                ])
+            result = RunResult(
+                flow_name="probe355", target="http://example.test/",
+                status="passed", started=1.0, ended=1.001, steps=[step],
+                failed_step=None, console_errors=[], page_errors=[],
+                failed_requests=[], bad_responses=[],
+                run_dir=os.path.join(d, "rd"))
+            cli.run_flow = lambda spec, **kw: result
+            spec = SimpleNamespace(matrix=None,
+                                   target="http://example.test/")
+            args = argparse.Namespace(flow=os.path.join(d, "f.yaml"),
+                                      target=None, headed=False,
+                                      executable_path=None, upload_dir=None)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._cmd_baselines_run(args, os.path.join(d, "rd"),
+                                            spec=spec, ledger=None,
+                                            runs_root=d)
+            out = buf.getvalue()
+            check("355 baselines run exits 0", rc == 0, f"rc={rc}")
+            check("355 baselines run prints saved screenshot line",
+                  "  screenshot_matches: saved baseline x.png" in out,
+                  repr(out))
+            check("355 baselines run does not echo text assertion as saved",
+                  "text: ok" not in out, repr(out))
+    finally:
+        cli.run_flow = orig_run_flow
+
+
+def test_issue_355_resolve_diff():
+    """Issue #355: _resolve_diff shells out for a git range and returns
+    the unified diff (cli.py lines 492-498); an unresolvable range
+    raises RuntimeError naming the range."""
+    import subprocess
+    import qaloop.cli as cli
+    with tempfile.TemporaryDirectory() as d:
+        repo = os.path.join(d, "repo")
+        os.makedirs(repo)
+
+        def git(*a):
+            subprocess.run(["git", "-C", repo, *a], check=True,
+                           capture_output=True, text=True)
+
+        git("init", "-q")
+        git("config", "user.email", "p@p")
+        git("config", "user.name", "p")
+        with open(os.path.join(repo, "f.txt"), "w", encoding="utf-8") as f:
+            f.write("one\n")
+        git("add", ".")
+        git("commit", "-qm", "one")
+        with open(os.path.join(repo, "f.txt"), "w", encoding="utf-8") as f:
+            f.write("two\n")
+        git("add", ".")
+        git("commit", "-qm", "two")
+        diff = cli._resolve_diff("HEAD~1..HEAD", repo)
+        check("355 resolve_diff range returns the change",
+              "-one" in diff and "+two" in diff, repr(diff[:60]))
+        err = None
+        try:
+            cli._resolve_diff("deadbeef..cafe1234", repo)
+        except RuntimeError as e:
+            err = e
+        check("355 resolve_diff bad range raises RuntimeError",
+              err is not None, repr(err))
+        check("355 resolve_diff bad range error names the range",
+              err is not None
+              and str(err).startswith("git diff deadbeef..cafe1234:"),
+              repr(err))
+
+
+def test_issue_355_worker_negative_keep_runs():
+    """Issue #355: cmd_worker rejects a negative --keep-runs with
+    "ERROR: ... cannot be negative ..." + exit 2 (cli.py lines
+    559-561) before any worker starts."""
+    import argparse
+    import qaloop.cli as cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_worker(argparse.Namespace(keep_runs=-1, concurrency=1,
+                                               job_timeout=1800))
+    out = buf.getvalue()
+    check("355 worker negative keep-runs exits 2", rc == 2, f"rc={rc}")
+    check("355 worker negative keep-runs prints ERROR prefix",
+          out.startswith("ERROR: "), repr(out[:60]))
+    check("355 worker negative keep-runs explains the rejection",
+          "cannot be negative" in out, repr(out[:80]))
+
+
+def test_issue_355_doctor_default_chromium():
+    """Issue #355: with QALOOP_EXECUTABLE_PATH unset, cmd_doctor
+    resolves the default chromium via Playwright (cli.py line 651)
+    and reports it as the chromium PASS detail."""
+    from playwright import sync_api
+
+    class FakeChromium:
+        executable_path = "/bin/true"
+
+    class FakePW:
+        chromium = FakeChromium()
+
+    class FakeCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_env = os.environ.get("QALOOP_EXECUTABLE_PATH")
+    old_sp = sync_api.sync_playwright
+    os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+    sync_api.sync_playwright = lambda: FakeCM()
+    try:
+        _rc, out = _run_doctor()
+    finally:
+        sync_api.sync_playwright = old_sp
+        if old_env is None:
+            os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        else:
+            os.environ["QALOOP_EXECUTABLE_PATH"] = old_env
+    check("355 doctor resolves default chromium via Playwright",
+          "PASS chromium: /bin/true" in out,
+          repr([ln for ln in out.splitlines() if "chromium" in ln][:1]))
+
+
+def test_issue_355_main_dispatch():
+    """Issue #355: main() parses argv and dispatches to the subcommand
+    (cli.py lines 869-870) — validate on a valid flow exits 0."""
+    import qaloop.cli as cli
+    with tempfile.TemporaryDirectory() as d:
+        flow = os.path.join(d, "v.yaml")
+        with open(flow, "w", encoding="utf-8") as f:
+            f.write("name: v355\ntarget: http://127.0.0.1:9/\n"
+                    "steps:\n  - goto: /\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["validate", flow])
+        check("355 main dispatches validate and exits 0", rc == 0,
+              f"rc={rc}")
+        check("355 main validate prints VALID line",
+              buf.getvalue().startswith("VALID: "),
+              repr(buf.getvalue()[:60]))
+
+
+def test_issue_355_main_guard():
+    """Issue #355: the __main__ guard (cli.py line 874) raises
+    SystemExit with main()'s code — 0 for a valid validate run."""
+    import runpy
+    with tempfile.TemporaryDirectory() as d:
+        flow = os.path.join(d, "v.yaml")
+        with open(flow, "w", encoding="utf-8") as f:
+            f.write("name: v355\ntarget: http://127.0.0.1:9/\n"
+                    "steps:\n  - goto: /\n")
+        old_argv = sys.argv
+        sys.argv = ["qaloop", "validate", flow]
+        code = "no-exit"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    runpy.run_module("qaloop.cli", run_name="__main__")
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            sys.argv = old_argv
+        check("355 __main__ guard exits 0 on validate", code == 0,
+              repr(code))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
