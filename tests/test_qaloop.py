@@ -651,6 +651,104 @@ def test_issue_331_worker_verify_repo_contract():
         worker.boot_static, worker.boot_command = real_static, real_command
 
 
+def test_issue_335_worker_target_cleanup_isolation():
+    from qaloop import queue, worker
+
+    class _StopTarget:
+        """Fake boot target: records every stop() attempt in a shared
+        order list; a target flagged raises=True always raises."""
+
+        def __init__(self, name, order, raises=False):
+            self.name = name
+            self.order = order
+            self.raises = raises
+            self.url = "http://primary/"
+
+        def stop(self):
+            self.order.append(self.name)
+            if self.raises:
+                raise RuntimeError(f"stop boom: {self.name}")
+
+    @contextlib.contextmanager
+    def stub(run_behavior, bad_raises=True):
+        """Stub worker._run_one_flow / worker.boot_repo_env (plain
+        attribute swaps, restored in finally). boot returns TWO targets
+        from ONE boot: [bad, good]. run_behavior is a (status, run_dir)
+        tuple to return, or an exception instance to raise."""
+        real_run, real_boot = worker._run_one_flow, worker.boot_repo_env
+        order, calls = [], {"runs": 0}
+        bad = _StopTarget("bad", order, raises=bad_raises)
+        good = _StopTarget("good", order)
+
+        def fake_run(flow_path, target, runs_root, headless, executable_path,
+                     do_investigate, keep_runs=0):
+            calls["runs"] += 1
+            if isinstance(run_behavior, Exception):
+                raise run_behavior
+            return run_behavior
+
+        def fake_boot(preset, profile=None):
+            return [bad, good], "http://primary/"
+
+        worker._run_one_flow, worker.boot_repo_env = fake_run, fake_boot
+        try:
+            yield order, calls
+        finally:
+            worker._run_one_flow, worker.boot_repo_env = real_run, real_boot
+
+    def kwargs():
+        return dict(_handle_kwargs(),
+                    repos_config={"repos": {"r1": {"env": []}}})
+
+    with temp_db():
+        # --- case 1: a raising stop() in the per-flow cleanup cannot
+        # prevent the stop attempt on the remaining target; because the
+        # failure is isolated, the job still completes through the
+        # normal path and the shared list is emptied (each target is
+        # attempted exactly once, no outer-finally re-stop) ---
+        jid = queue.enqueue("verify-repo", {"repo": "r1", "flows": ["f.yaml"]})
+        with stub(("passed", "/tmp/runs/x")) as (order, calls):
+            worker.handle_job(queue.claim(), **kwargs())
+        row = _job_row(jid)
+        check("335 raising stop does not block remaining target stop",
+              order == ["bad", "good"], str(order))
+        check("335 raising-stop job ran the flow exactly once",
+              calls["runs"] == 1, str(calls["runs"]))
+        check("335 raising-stop job completes done via the flow status",
+              row["status"] == "done", row["status"])
+
+        # --- case 2: the flow itself raises after boot extended the
+        # shared target list: cleanup still attempts every target
+        # exactly once (the raising stop included) and the job is
+        # recorded failed through the worker-error path ---
+        jid = queue.enqueue("verify-repo", {"repo": "r1", "flows": ["f.yaml"]})
+        with stub(RuntimeError("run boom")) as (order, calls):
+            worker.handle_job(queue.claim(), **kwargs())
+        row = _job_row(jid)
+        check("335 run-error cleanup attempts every target once",
+              order == ["bad", "good"], str(order))
+        check("335 run-error job ran the flow exactly once",
+              calls["runs"] == 1, str(calls["runs"]))
+        check("335 run-error job is failed", row["status"] == "failed",
+              row["status"])
+        check("335 run-error job note records the worker error",
+              "worker error" in (row["note"] or "")
+              and "run boom" in (row["note"] or ""), row["note"] or "")
+
+        # --- case 3 (normal): two well-behaved targets (bad_raises
+        # off) are each stopped exactly once: no outer-finally
+        # double-stop, and the job completes done ---
+        jid = queue.enqueue("verify-repo", {"repo": "r1", "flows": ["f.yaml"]})
+        with stub(("passed", "/tmp/runs/x"), bad_raises=False) as (order, calls):
+            worker.handle_job(queue.claim(), **kwargs())
+        row = _job_row(jid)
+        check("335 normal cleanup stops each target exactly once",
+              order == ["bad", "good"] and order.count("bad") == 1
+              and order.count("good") == 1, str(order))
+        check("335 normal job completes done", row["status"] == "done",
+              row["status"])
+
+
 def test_worker_concurrency_once_waits_for_inflight():
     import threading
     import time
