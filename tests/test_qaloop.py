@@ -10430,6 +10430,215 @@ def test_issue_316_investigate_cli_plumbing_contract():
         inv_mod.investigate = real_inv
 
 
+def test_issue_318_evaluate_cli_plumbing_contract():
+    """Issue #318: cmd_evaluate plumbing contract: parser wiring
+    (fn is cmd_evaluate, --repo defaults to None, --claim/--run/
+    --diff required), missing run dir / unresolvable diff / empty
+    diff / judge RuntimeError all exit 2 with one exact ERROR line
+    and no evaluate/write/ledger side effects, and on success the
+    claim, run dir (as passed) and diff text reach evaluate
+    positionally and verbatim, write_evaluation gets (run_dir,
+    claim, verdict), exactly four verdict lines are printed, and
+    exactly one exact ledger row is appended (claim truncated to
+    120 chars in the ledger only; missing _cost defaults to 0)."""
+    import io
+
+    import qaloop.cli as cli
+    import qaloop.evaluate as eval_mod
+    import qaloop.ledger as ledger_mod
+
+    eval_calls = []
+    write_calls = []
+    ledger_rows = []
+    state = {"raise": False, "verdict": None}
+
+    def stub_evaluate(claim, run_dir, diff):
+        eval_calls.append((claim, run_dir, diff))
+        if state["raise"]:
+            raise RuntimeError("boom-318")
+        return state["verdict"]
+
+    def stub_write(run_dir, claim, verdict):
+        write_calls.append((run_dir, claim, verdict))
+        return ("/sentinel-318/EVALUATION.md",
+                "/sentinel-318/evaluation.json")
+
+    def stub_append(entry):
+        ledger_rows.append(entry)
+
+    real_evaluate = eval_mod.evaluate
+    real_write = eval_mod.write_evaluation
+    real_append = ledger_mod.append
+    eval_mod.evaluate = stub_evaluate
+    eval_mod.write_evaluation = stub_write
+    ledger_mod.append = stub_append
+    try:
+        def run_parsed(parsed):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            return rc, buf.getvalue()
+
+        def parse(claim, run_dir, diff):
+            return cli.build_parser().parse_args(
+                ["evaluate", "--claim", claim, "--run", run_dir,
+                 "--diff", diff])
+
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "run-318")
+            os.makedirs(run_dir)
+            diff_text = ("diff --git a/x.py b/x.py\n"
+                         "--- a/x.py\n+++ b/x.py\n"
+                         "@@ -1 +1 @@\n-old\n+new 318\n")
+            diff_path = os.path.join(root, "change-318.diff")
+            with open(diff_path, "w", encoding="utf-8") as f:
+                f.write(diff_text)
+            claim = "the change does the 318 thing"
+
+            # --- parser wiring + defaults + required ---
+            parsed = parse(claim, run_dir, diff_path)
+            check("evaluate parser fn is cmd_evaluate",
+                  parsed.fn is cli.cmd_evaluate, str(parsed.fn))
+            check("evaluate parser repo default None",
+                  parsed.repo is None, str(vars(parsed)))
+            check("evaluate parser values",
+                  parsed.claim == claim and parsed.run == run_dir
+                  and parsed.diff == diff_path, str(vars(parsed)))
+            for missing in (["--claim"], ["--run"], ["--diff"]):
+                argv = ["evaluate", "--claim", claim, "--run", run_dir,
+                        "--diff", diff_path]
+                idx = argv.index(missing[0])
+                argv = argv[:idx] + argv[idx + 2:]
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        cli.build_parser().parse_args(argv)
+                    req_ok = False
+                except SystemExit:
+                    req_ok = True
+                check(f"evaluate parser {missing[0]} required",
+                      req_ok, str(argv))
+
+            # --- (1) missing run dir ---
+            missing_run = os.path.join(root, "no-such-318")
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, missing_run, diff_path))
+            check("evaluate missing run rc 2", rc == 2, str(rc))
+            check("evaluate missing run exact line",
+                  out == f"ERROR: run dir not found: {missing_run}\n",
+                  repr(out))
+            check("evaluate missing run no side effects",
+                  eval_calls == [] and write_calls == []
+                  and ledger_rows == [],
+                  f"{eval_calls} {write_calls} {ledger_rows}")
+
+            # --- (2) unresolvable --diff ---
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, run_dir, "bogus-318"))
+            check("evaluate bogus diff rc 2", rc == 2, str(rc))
+            check("evaluate bogus diff exact line",
+                  out == ("ERROR: --diff must be a diff file or a git "
+                          "range, got 'bogus-318'\n"), repr(out))
+            check("evaluate bogus diff no side effects",
+                  eval_calls == [] and write_calls == []
+                  and ledger_rows == [],
+                  f"{eval_calls} {write_calls} {ledger_rows}")
+
+            # --- (3) empty diff ---
+            empty_path = os.path.join(root, "empty-318.diff")
+            with open(empty_path, "w", encoding="utf-8") as f:
+                f.write("  \n\t \n")
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, run_dir, empty_path))
+            check("evaluate empty diff rc 2", rc == 2, str(rc))
+            check("evaluate empty diff exact line",
+                  out == "ERROR: empty diff — nothing to evaluate\n",
+                  repr(out))
+            check("evaluate empty diff no side effects",
+                  eval_calls == [] and write_calls == []
+                  and ledger_rows == [],
+                  f"{eval_calls} {write_calls} {ledger_rows}")
+
+            # --- (4) judge raises ---
+            state["raise"] = True
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, run_dir, diff_path))
+            state["raise"] = False
+            check("evaluate judge raises rc 2", rc == 2, str(rc))
+            check("evaluate judge raises exact line",
+                  out == "ERROR: boom-318\n", repr(out))
+            check("evaluate judge raises no write or ledger",
+                  write_calls == [] and ledger_rows == [],
+                  f"{write_calls} {ledger_rows}")
+
+            # --- (5) success ---
+            verdict = {"verdict": "MAKES_SENSE", "confidence": "high",
+                       "rationale": "looks right",
+                       "_cost": {"tokens_in": 123, "tokens_out": 45,
+                                 "cost_usd_est": 0.0012}}
+            state["verdict"] = verdict
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, run_dir, diff_path))
+            check("evaluate success rc 0", rc == 0, str(rc))
+            check("evaluate success stub positional verbatim",
+                  eval_calls == [(claim, run_dir, diff_text)],
+                  str(eval_calls))
+            check("evaluate success write args",
+                  write_calls == [(run_dir, claim, verdict)],
+                  str(write_calls))
+            check("evaluate success stdout exactly 4 lines",
+                  out.splitlines() == [
+                      "verdict: MAKES_SENSE (confidence: high)",
+                      "rationale: looks right",
+                      "cost: tokens 123/45  est $0.001200",
+                      "report: /sentinel-318/EVALUATION.md"],
+                  repr(out))
+            check("evaluate success ledger exact row",
+                  ledger_rows == [{"kind": "evaluate",
+                                   "run_dir": os.path.abspath(run_dir),
+                                   "claim": claim,
+                                   "verdict": "MAKES_SENSE",
+                                   "tokens_in": 123, "tokens_out": 45,
+                                   "cost_usd_est": 0.0012}],
+                  str(ledger_rows))
+
+            # --- (5b) truncation: ledger 120, stub full 150 ---
+            claim150 = "c" * 150
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim150, run_dir, diff_path))
+            check("evaluate long claim rc 0", rc == 0, str(rc))
+            check("evaluate long claim stub verbatim 150",
+                  len(eval_calls) == 1
+                  and eval_calls[0][0] == claim150
+                  and len(eval_calls[0][0]) == 150,
+                  str(eval_calls))
+            check("evaluate long claim ledger truncated 120",
+                  len(ledger_rows) == 1
+                  and ledger_rows[0]["claim"] == claim150[:120]
+                  and len(ledger_rows[0]["claim"]) == 120,
+                  str(ledger_rows))
+
+            # --- (6) no _cost ---
+            verdict6 = {"verdict": "INSUFFICIENT_EVIDENCE",
+                        "confidence": "low", "rationale": "thin"}
+            state["verdict"] = verdict6
+            eval_calls.clear(); write_calls.clear(); ledger_rows.clear()
+            rc, out = run_parsed(parse(claim, run_dir, diff_path))
+            check("evaluate no-cost rc 0", rc == 0, str(rc))
+            check("evaluate no-cost ledger zeros",
+                  len(ledger_rows) == 1
+                  and ledger_rows[0]["tokens_in"] == 0
+                  and ledger_rows[0]["tokens_out"] == 0
+                  and ledger_rows[0]["cost_usd_est"] == 0,
+                  str(ledger_rows))
+            check("evaluate no-cost printed cost line",
+                  "cost: tokens 0/0  est $0.000000" in out.splitlines(),
+                  repr(out))
+    finally:
+        eval_mod.evaluate = real_evaluate
+        eval_mod.write_evaluation = real_write
+        ledger_mod.append = real_append
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
