@@ -12582,6 +12582,346 @@ def test_artifacts_ax_snapshot_wrapper():
           out3 == compact_ax_tree(tree) and session3.detach_calls == 1, out3)
 
 
+def test_env_wait_for_http_wrong_status_353():
+    from qaloop import env
+
+    class FakeResp:
+        def __init__(self, status):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    orig_urlopen = env.urlopen
+    try:
+        env.urlopen = lambda url, timeout=None: FakeResp(500)
+        err = None
+        try:
+            env.wait_for_http("http://127.0.0.1:9/", timeout_s=1.0)
+        except TimeoutError as e:
+            err = e
+        check("353 wait_for_http wrong status times out",
+              isinstance(err, TimeoutError), repr(err))
+        check("353 wait_for_http timeout names the last HTTP status",
+              err is not None and "HTTP 500" in str(err), repr(err))
+
+        env.urlopen = lambda url, timeout=None: FakeResp(200)
+        ok = True
+        try:
+            env.wait_for_http("http://127.0.0.1:9/", timeout_s=5)
+        except Exception:  # noqa: BLE001
+            ok = False
+        check("353 wait_for_http expected status returns", ok)
+    finally:
+        env.urlopen = orig_urlopen
+
+
+def test_env_proc_target_stop_fallbacks_353():
+    from qaloop import env
+
+    class FakeProc:
+        def __init__(self, terminate_raises=False, wait_raises=False,
+                     kill_raises=False):
+            self.terminate_raises = terminate_raises
+            self.wait_raises = wait_raises
+            self.kill_raises = kill_raises
+            self.kill_calls = 0
+
+        def terminate(self):
+            if self.terminate_raises:
+                raise RuntimeError("terminate boom")
+
+        def wait(self, timeout=None):
+            if self.wait_raises:
+                raise RuntimeError("wait boom")
+
+        def kill(self):
+            self.kill_calls += 1
+            if self.kill_raises:
+                raise RuntimeError("kill boom")
+
+    class FakeLog:
+        def __init__(self, close_raises=False):
+            self.close_raises = close_raises
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_raises:
+                raise RuntimeError("close boom")
+
+    # clean stop: terminate+wait succeed, kill untouched, log closed
+    proc = FakeProc()
+    log = FakeLog()
+    env.ProcTarget(url="http://x/", proc=proc, log_path=None,
+                   _log_file=log).stop()
+    check("353 stop clean path skips kill and closes log",
+          proc.kill_calls == 0 and log.close_calls == 1)
+
+    # terminate raises -> kill fallback, stop returns normally
+    proc = FakeProc(terminate_raises=True)
+    env.ProcTarget(url="http://x/", proc=proc, log_path=None,
+                   _log_file=None).stop()
+    check("353 stop falls back to kill when terminate raises",
+          proc.kill_calls == 1, str(proc.kill_calls))
+
+    # wait raises -> same kill fallback
+    proc = FakeProc(wait_raises=True)
+    env.ProcTarget(url="http://x/", proc=proc, log_path=None,
+                   _log_file=None).stop()
+    check("353 stop falls back to kill when wait raises",
+          proc.kill_calls == 1, str(proc.kill_calls))
+
+    # kill also raises -> swallowed, stop still returns
+    proc = FakeProc(terminate_raises=True, kill_raises=True)
+    raised = False
+    try:
+        env.ProcTarget(url="http://x/", proc=proc, log_path=None,
+                       _log_file=None).stop()
+    except Exception:  # noqa: BLE001
+        raised = True
+    check("353 stop swallows a failing kill", not raised
+          and proc.kill_calls == 1)
+
+    # log close raises -> swallowed
+    raised = False
+    try:
+        env.ProcTarget(url="http://x/", proc=FakeProc(), log_path=None,
+                       _log_file=FakeLog(close_raises=True)).stop()
+    except Exception:  # noqa: BLE001
+        raised = True
+    check("353 stop swallows a failing log close", not raised)
+
+
+def _fake_popen_factory(captured, proc):
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return proc
+    return fake_popen
+
+
+def test_env_boot_command_env_merge_353():
+    import subprocess
+    from qaloop import env
+
+    class FakeProc:
+        returncode = None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return None
+
+    captured = {}
+    orig_popen = subprocess.Popen
+    orig_wait = env.wait_for_port
+    old_sentinel = os.environ.get("QALOOP_TEST_SENTINEL")
+    os.environ["QALOOP_TEST_SENTINEL"] = "inherited"
+    try:
+        subprocess.Popen = _fake_popen_factory(captured, FakeProc())
+        env.wait_for_port = lambda port, timeout_s: None
+        target = env.boot_command("echo hi", env={"QALOOP_TEST_N": 123},
+                                  wait={"port": 4321})
+        penv = captured["kwargs"].get("env") or {}
+        check("353 boot_command merges inherited environ",
+              penv.get("QALOOP_TEST_SENTINEL") == "inherited",
+              str(sorted(penv)[:5]))
+        check("353 boot_command stringifies env override values",
+              penv.get("QALOOP_TEST_N") == "123",
+              repr(penv.get("QALOOP_TEST_N")))
+        check("353 boot_command port wait yields the port URL",
+              target.url == "http://127.0.0.1:4321/", target.url)
+        target.stop()
+    finally:
+        subprocess.Popen = orig_popen
+        env.wait_for_port = orig_wait
+        if old_sentinel is None:
+            os.environ.pop("QALOOP_TEST_SENTINEL", None)
+        else:
+            os.environ["QALOOP_TEST_SENTINEL"] = old_sentinel
+
+
+def test_env_boot_command_wait_errors_353():
+    import subprocess
+    from qaloop import env
+
+    class FakeProc:
+        returncode = None
+
+        def __init__(self, terminate_raises=False):
+            self.terminate_raises = terminate_raises
+            self.terminate_calls = 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+            if self.terminate_raises:
+                raise RuntimeError("terminate boom")
+
+        def poll(self):
+            return None
+
+    orig_popen = subprocess.Popen
+    try:
+        # no wait at all -> ValueError naming wait.port, proc terminated
+        proc = FakeProc()
+        subprocess.Popen = _fake_popen_factory({}, proc)
+        err = None
+        try:
+            env.boot_command("echo hi", wait=None)
+        except ValueError as e:
+            err = e
+        check("353 boot_command without wait raises ValueError naming wait.port",
+              err is not None and "wait.port" in str(err), repr(err))
+        check("353 boot_command no-wait failure terminates the proc",
+              proc.terminate_calls == 1, str(proc.terminate_calls))
+
+        # unknown wait spec -> ValueError naming the spec, proc terminated
+        proc = FakeProc()
+        subprocess.Popen = _fake_popen_factory({}, proc)
+        err = None
+        try:
+            env.boot_command("echo hi", wait={"bogus": 1})
+        except ValueError as e:
+            err = e
+        check("353 boot_command unknown wait spec raises ValueError",
+              err is not None and "unknown wait spec" in str(err), repr(err))
+        check("353 boot_command unknown-spec failure terminates the proc",
+              proc.terminate_calls == 1, str(proc.terminate_calls))
+
+        # cleanup terminate itself raises -> original error still propagates
+        proc = FakeProc(terminate_raises=True)
+        subprocess.Popen = _fake_popen_factory({}, proc)
+        err = None
+        try:
+            env.boot_command("echo hi", wait=None)
+        except ValueError as e:
+            err = e
+        check("353 boot_command failing cleanup keeps the original ValueError",
+              err is not None and "wait.port" in str(err)
+              and proc.terminate_calls == 1, repr(err))
+    finally:
+        subprocess.Popen = orig_popen
+
+
+def test_env_boot_command_log_contains_353():
+    import subprocess
+    from qaloop import env
+
+    class ExitedProc:
+        returncode = 3
+
+        def __init__(self):
+            self.terminate_calls = 0
+
+        def poll(self):
+            return 3
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+    orig_popen = subprocess.Popen
+    try:
+        proc = ExitedProc()
+        subprocess.Popen = _fake_popen_factory({}, proc)
+        err = None
+        try:
+            env.boot_command("echo hi", wait={"log_contains": "NEVER"},
+                             timeout_s=5)
+        except RuntimeError as e:
+            err = e
+        check("353 log_contains exited proc raises RuntimeError naming the code",
+              err is not None and "exited (3)" in str(err), repr(err))
+        check("353 log_contains exit failure terminates the proc",
+              proc.terminate_calls == 1, str(proc.terminate_calls))
+    finally:
+        subprocess.Popen = orig_popen
+
+    # success shape: a real command prints the needle, target comes back
+    with tempfile.TemporaryDirectory() as d:
+        script = os.path.join(d, "svc.py")
+        with open(script, "w") as f:
+            f.write("import time\n"
+                    "print('READY_NEEDLE_353', flush=True)\n"
+                    "time.sleep(30)\n")
+        target = env.boot_command(f"{sys.executable} {script}",
+                                  wait={"log_contains": "READY_NEEDLE_353"},
+                                  timeout_s=30, name="needle353")
+        try:
+            check("353 log_contains success returns a ProcTarget",
+                  isinstance(target, env.ProcTarget))
+        finally:
+            target.stop()
+        check("353 log_contains target stopped cleanly",
+              target.proc.poll() is not None)
+
+
+def test_env_flow_services_relative_cwd_353():
+    from qaloop import env
+
+    class FakeTarget:
+        def __init__(self):
+            self.url = "http://127.0.0.1:1234/"
+            self.log_path = None
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    captured = []
+    fake = FakeTarget()
+    orig_boot = env.boot_command
+
+    def fake_boot(command, cwd=None, env=None, wait=None, timeout_s=90,
+                  name="cmd"):
+        captured.append({"command": command, "cwd": cwd, "wait": wait})
+        return fake
+
+    try:
+        env.boot_command = fake_boot
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            specs = [{"name": "svc", "command": "run it",
+                      "wait": {"port": 1234}, "cwd": "sub"}]
+            with env.flow_services(specs, d, run_dir) as targets:
+                check("353 flow_services yields the booted target",
+                      targets.get("svc") is fake)
+                check("353 flow_services exports the service URL",
+                      os.environ.get("QALOOP_SERVICE_SVC_URL")
+                      == "http://127.0.0.1:1234/")
+            check("353 flow_services resolves relative cwd against base_dir",
+                  captured[-1]["cwd"] == os.path.join(d, "sub"),
+                  repr(captured[-1]["cwd"]))
+            check("353 flow_services stops targets on exit",
+                  fake.stop_calls == 1, str(fake.stop_calls))
+            check("353 flow_services unexports the service URL",
+                  "QALOOP_SERVICE_SVC_URL" not in os.environ)
+
+            abs_cwd = os.path.join(d, "abs")
+            specs = [{"name": "svc", "command": "run it",
+                      "wait": {"port": 1234}, "cwd": abs_cwd}]
+            with env.flow_services(specs, d, run_dir):
+                pass
+            check("353 flow_services passes absolute cwd through unchanged",
+                  captured[-1]["cwd"] == abs_cwd, repr(captured[-1]["cwd"]))
+
+            specs = [{"name": "svc", "command": "run it",
+                      "wait": {"port": 1234}}]
+            with env.flow_services(specs, d, run_dir):
+                pass
+            check("353 flow_services leaves a missing cwd as None",
+                  captured[-1]["cwd"] is None, repr(captured[-1]["cwd"]))
+    finally:
+        env.boot_command = orig_boot
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
