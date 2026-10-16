@@ -10942,6 +10942,287 @@ def test_chat_transport_contract():
           urllib.request.urlopen is orig)
 
 
+def test_issue_329_webhook_handler_http_contract():
+    """Issue #329: pin the webhook Handler HTTP contract with real
+    round-trip tests against a real ThreadingHTTPServer."""
+    import hashlib
+    import hmac
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from qaloop import webhook
+    from qaloop import queue as q
+
+    prior_secret = os.environ.get("QALOOP_WEBHOOK_SECRET")
+    prior_token = os.environ.get("QALOOP_ENQUEUE_TOKEN")
+    os.environ.pop("QALOOP_WEBHOOK_SECRET", None)
+    os.environ.pop("QALOOP_ENQUEUE_TOKEN", None)
+    try:
+        with temp_db():
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), webhook.Handler)
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def req(method, path, body=None, headers=None):
+                    hdrs = dict(headers or {})
+                    if method == "POST":
+                        hdrs.setdefault("Content-Type", "application/json")
+                    r = urllib.request.Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=body if method == "POST" else None,
+                        method=method, headers=hdrs)
+                    try:
+                        with urllib.request.urlopen(r, timeout=5) as resp:
+                            raw = resp.read().decode()
+                            return resp.status, json.loads(raw) if raw else {}
+                    except urllib.error.HTTPError as e:
+                        raw = e.read().decode()
+                        try:
+                            parsed = json.loads(raw) if raw else {}
+                        except Exception:
+                            parsed = {}
+                        return e.code, parsed
+
+                def jobs_by_id():
+                    return {j["id"]: j for j in q.list_jobs(limit=100)}
+
+                def job_count():
+                    return len(q.list_jobs(limit=100))
+
+                # (1) health + unknown GET
+                status, body = req("GET", "/health")
+                check("329 health status", status == 200, str(status))
+                check("329 health body", body == {"ok": True, "pending": 0},
+                      str(body))
+                status, body = req("GET", "/nope")
+                check("329 get unknown status", status == 404, str(status))
+                check("329 get unknown body",
+                      body == {"ok": False, "error": "not found"}, str(body))
+
+                # (2) ping + malformed JSON (no secret set)
+                ping_body = json.dumps({"zen": "hi"}).encode()
+                status, body = req("POST", "/webhook/github", ping_body,
+                                   {"X-GitHub-Event": "ping"})
+                check("329 ping status", status == 200, str(status))
+                check("329 ping body", body == {"ok": True, "msg": "pong"},
+                      str(body))
+                status, body = req("POST", "/webhook/github", b"{not json",
+                                   {"X-GitHub-Event": "ping"})
+                check("329 webhook bad json status", status == 400,
+                      str(status))
+                check("329 webhook bad json body",
+                      body == {"ok": False, "error": "bad json"}, str(body))
+
+                # (3) pull_request opened enqueues verify-repo
+                pr_payload = {"action": "opened",
+                              "repository": {"full_name": "jjfwang/qaloop"},
+                              "pull_request": {"number": 329,
+                                               "head": {"sha": "abc123"}}}
+                pr_body = json.dumps(pr_payload).encode()
+                status, body = req("POST", "/webhook/github", pr_body,
+                                   {"X-GitHub-Event": "pull_request"})
+                check("329 pr opened status", status == 200, str(status))
+                check("329 pr opened ok", body.get("ok") is True, str(body))
+                job_id = body.get("job_id")
+                check("329 pr opened job_id present", job_id is not None,
+                      str(body))
+                jobs = q.list_jobs(limit=100)
+                check("329 pr opened exactly one job", len(jobs) == 1,
+                      str(len(jobs)))
+                if jobs:
+                    job = jobs[0]
+                    check("329 pr opened job id matches",
+                          job["id"] == job_id, str(job))
+                    check("329 pr opened job kind",
+                          job["kind"] == "verify-repo", str(job))
+                    check("329 pr opened job status",
+                          job["status"] == "pending", str(job))
+                    check("329 pr opened job payload",
+                          job["payload"] == {"repo": "qaloop",
+                                             "repo_full": "jjfwang/qaloop",
+                                             "pr": 329, "sha": "abc123",
+                                             "source": "github-webhook"},
+                          str(job["payload"]))
+                status, body = req("GET", "/health")
+                check("329 health pending after enqueue",
+                      body == {"ok": True, "pending": 1}, str(body))
+
+                # (4) ignored action + ignored event
+                closed_payload = dict(pr_payload, action="closed")
+                status, body = req(
+                    "POST", "/webhook/github",
+                    json.dumps(closed_payload).encode(),
+                    {"X-GitHub-Event": "pull_request"})
+                check("329 pr closed status", status == 200, str(status))
+                check("329 pr closed body",
+                      body == {"ok": True, "msg": "ignored action closed"},
+                      str(body))
+                check("329 pr closed count unchanged", job_count() == 1,
+                      str(job_count()))
+                status, body = req("POST", "/webhook/github",
+                                   json.dumps({}).encode(),
+                                   {"X-GitHub-Event": "push"})
+                check("329 push status", status == 200, str(status))
+                check("329 push body",
+                      body == {"ok": True, "msg": "ignored event push"},
+                      str(body))
+                check("329 push count unchanged", job_count() == 1,
+                      str(job_count()))
+
+                # (5) webhook secret enforcement
+                secret = "test-secret-329"
+                os.environ["QALOOP_WEBHOOK_SECRET"] = secret
+                before = job_count()
+                status, body = req("POST", "/webhook/github", pr_body,
+                                   {"X-GitHub-Event": "pull_request"})
+                check("329 unsigned status", status == 401, str(status))
+                check("329 unsigned body",
+                      body == {"ok": False, "error": "bad signature"},
+                      str(body))
+                status, body = req(
+                    "POST", "/webhook/github", pr_body,
+                    {"X-GitHub-Event": "pull_request",
+                     "X-Hub-Signature-256": "sha256=nope"})
+                check("329 bad signature status", status == 401, str(status))
+                check("329 bad signature body",
+                      body == {"ok": False, "error": "bad signature"},
+                      str(body))
+                check("329 bad signature count unchanged",
+                      job_count() == before, str(job_count()))
+                sig = "sha256=" + hmac.new(
+                    secret.encode(), pr_body, hashlib.sha256).hexdigest()
+                status, body = req(
+                    "POST", "/webhook/github", pr_body,
+                    {"X-GitHub-Event": "pull_request",
+                     "X-Hub-Signature-256": sig})
+                check("329 signed status", status == 200, str(status))
+                check("329 signed ok with job_id",
+                      body.get("ok") is True and body.get("job_id") is not None,
+                      str(body))
+                check("329 signed exactly one new job",
+                      job_count() == before + 1, str(job_count()))
+                os.environ.pop("QALOOP_WEBHOOK_SECRET", None)
+
+                # (6) /enqueue without token
+                before = job_count()
+                enq_body = json.dumps(
+                    {"kind": "verify-repo", "repo": "qaloop"}).encode()
+                status, body = req("POST", "/enqueue", enq_body)
+                check("329 enqueue status", status == 200, str(status))
+                enq_id = body.get("job_id")
+                check("329 enqueue job_id present", enq_id is not None,
+                      str(body))
+                job = jobs_by_id().get(enq_id)
+                check("329 enqueue job kind",
+                      job is not None and job["kind"] == "verify-repo",
+                      str(job))
+                check("329 enqueue job payload",
+                      job is not None and job["payload"] == {"repo": "qaloop"},
+                      str(job))
+                status, body = req("POST", "/enqueue",
+                                   json.dumps({"flow": "x.yaml"}).encode())
+                check("329 enqueue default status", status == 200,
+                      str(status))
+                def_id = body.get("job_id")
+                job = jobs_by_id().get(def_id)
+                check("329 enqueue default kind",
+                      job is not None and job["kind"] == "verify-flow",
+                      str(job))
+                check("329 enqueue default payload",
+                      job is not None and job["payload"] == {"flow": "x.yaml"},
+                      str(job))
+                check("329 enqueue added two jobs",
+                      job_count() == before + 2, str(job_count()))
+                status, body = req("POST", "/enqueue", b"{not json")
+                check("329 enqueue bad json status", status == 400,
+                      str(status))
+                check("329 enqueue bad json body",
+                      body == {"ok": False, "error": "bad json"}, str(body))
+
+                # (7) enqueue token enforcement
+                token = "enqueue-token-329"
+                os.environ["QALOOP_ENQUEUE_TOKEN"] = token
+                before = job_count()
+                status, body = req("POST", "/enqueue", enq_body)
+                check("329 enqueue missing token status", status == 401,
+                      str(status))
+                check("329 enqueue missing token body",
+                      body == {"ok": False, "error": "bad token"}, str(body))
+                status, body = req("POST", "/enqueue", enq_body,
+                                   {"X-QALoop-Token": "wrong"})
+                check("329 enqueue wrong token status", status == 401,
+                      str(status))
+                check("329 enqueue wrong token body",
+                      body == {"ok": False, "error": "bad token"}, str(body))
+                check("329 enqueue token count unchanged",
+                      job_count() == before, str(job_count()))
+                status, body = req("POST", "/enqueue", enq_body,
+                                   {"X-QALoop-Token": token})
+                check("329 enqueue token ok status", status == 200,
+                      str(status))
+                check("329 enqueue token ok job_id",
+                      body.get("ok") is True and body.get("job_id") is not None,
+                      str(body))
+                check("329 enqueue token added one job",
+                      job_count() == before + 1, str(job_count()))
+                os.environ.pop("QALOOP_ENQUEUE_TOKEN", None)
+
+                # (8) unknown POST
+                status, body = req("POST", "/nope", json.dumps({}).encode())
+                check("329 post unknown status", status == 404, str(status))
+                check("329 post unknown body",
+                      body == {"ok": False, "error": "not found"}, str(body))
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                thread.join(timeout=5)
+    finally:
+        if prior_secret is None:
+            os.environ.pop("QALOOP_WEBHOOK_SECRET", None)
+        else:
+            os.environ["QALOOP_WEBHOOK_SECRET"] = prior_secret
+        if prior_token is None:
+            os.environ.pop("QALOOP_ENQUEUE_TOKEN", None)
+        else:
+            os.environ["QALOOP_ENQUEUE_TOKEN"] = prior_token
+    check("329 webhook secret env restored",
+          os.environ.get("QALOOP_WEBHOOK_SECRET") == prior_secret)
+    check("329 enqueue token env restored",
+          os.environ.get("QALOOP_ENQUEUE_TOKEN") == prior_token)
+
+    # Coverage for serve / serve_in_thread without leaking a listener.
+    recorded = {}
+
+    class FakeServer:
+        def __init__(self, address, handler_class):
+            recorded["address"] = address
+            recorded["handler_class"] = handler_class
+
+        def serve_forever(self):
+            recorded["serve_forever"] = True
+
+    real_server_cls = webhook.ThreadingHTTPServer
+    chosen_port = 18099
+    try:
+        webhook.ThreadingHTTPServer = FakeServer
+        t = webhook.serve_in_thread(port=chosen_port, host="127.0.0.1")
+        t.join(timeout=5)
+        check("329 serve_in_thread thread finished", not t.is_alive())
+        check("329 serve_in_thread fake server args",
+              recorded.get("address") == ("127.0.0.1", chosen_port)
+              and recorded.get("handler_class") is webhook.Handler,
+              str(recorded))
+        check("329 serve_in_thread serve_forever called",
+              recorded.get("serve_forever") is True, str(recorded))
+    finally:
+        webhook.ThreadingHTTPServer = real_server_cls
+    check("329 ThreadingHTTPServer restored",
+          webhook.ThreadingHTTPServer is real_server_cls)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
