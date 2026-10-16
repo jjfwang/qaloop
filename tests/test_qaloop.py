@@ -909,6 +909,193 @@ def test_worker_target_url_isolation_under_threads():
           str(captured))
 
 
+def test_issue_333_worker_run_one_flow_investigate_contract():
+    """Pin worker._run_one_flow's investigate-on-failure contract: the
+    investigator is called exactly once with the exact kwargs only when the
+    flow failed AND do_investigate AND spec.investigate_on_failure; a truthy
+    diagnosis lands in the ledger (investigation entry BEFORE scripted) and
+    in write_report; the four negative cases stay scripted-only."""
+    import types
+    import qaloop.investigate as inv_mod
+    from qaloop import worker
+    saved = {k: getattr(worker, k) for k in
+             ("load_spec", "run_flow", "new_run_dir", "write_report",
+              "print_summary", "prune_old_runs")}
+    saved_ledger_append = worker.ledger.append
+    saved_investigate = inv_mod.investigate
+    old_target = os.environ.get("TARGET_URL")
+    run_dir = os.path.join("/tmp/runs333", "flow-333")
+    diagnosis = {"model": "model-333", "tokens_in": 111, "tokens_out": 22,
+                 "cost_usd_est": 0.0033, "mode": "agent"}
+    current, captures = {}, {}
+
+    def fake_load_spec(path):
+        captures["load_spec"].append(path)
+        return current["spec"]
+
+    def fake_run_flow(spec, run_dir=None, target=None, headless=None,
+                      executable_path=None):
+        captures["run_flow"].append((spec, run_dir, target, headless,
+                                     executable_path))
+        return current["result"]
+
+    def fake_write_report(*args, **kwargs):
+        captures["write_report"].append((args, kwargs))
+
+    def fake_print_summary(*args, **kwargs):
+        captures["print_summary"].append((args, kwargs))
+
+    def fake_prune(*args, **kwargs):
+        captures["prune"].append((args, kwargs))
+
+    def fake_ledger_append(entry):
+        captures["ledger"].append(entry)
+
+    def fake_investigate(**kwargs):
+        captures["investigate"].append(kwargs)
+        return current["diagnosis"]
+
+    def drive(status, do_investigate, spec_flag, diagnosis_return):
+        current["spec"] = types.SimpleNamespace(
+            name="flow-333", investigate_on_failure=spec_flag,
+            max_investigation_actions=7)
+        current["result"] = types.SimpleNamespace(status=status,
+                                                  duration_ms=123)
+        current["diagnosis"] = diagnosis_return
+        captures.clear()
+        captures.update({"load_spec": [], "run_flow": [], "write_report": [],
+                         "print_summary": [], "prune": [], "ledger": [],
+                         "investigate": []})
+        return worker._run_one_flow(
+            "/tmp/flows/f333.yaml", "http://target-333/", "/tmp/runs333",
+            headless=False, executable_path="/fake/chrome-333",
+            do_investigate=do_investigate, keep_runs=3)
+
+    def scripted(status):
+        return {"kind": "scripted", "run_dir": run_dir, "flow": "flow-333",
+                "status": status, "duration_ms": 123, "cost_usd_est": 0.0}
+
+    worker.load_spec = fake_load_spec
+    worker.run_flow = fake_run_flow
+    worker.new_run_dir = lambda root, name: os.path.join(root, name)
+    worker.write_report = fake_write_report
+    worker.print_summary = fake_print_summary
+    worker.prune_old_runs = fake_prune
+    worker.ledger.append = fake_ledger_append
+    inv_mod.investigate = fake_investigate
+    try:
+        # --- positive: failed + both gates on + truthy diagnosis ---
+        ret = drive("failed", True, True, diagnosis)
+        spec, result = current["spec"], current["result"]
+        check("333 investigator called exactly once",
+              len(captures["investigate"]) == 1, str(captures["investigate"]))
+        inv_kwargs = captures["investigate"][0]
+        check("333 investigator kwargs key set exact",
+              set(inv_kwargs) == {"result", "spec", "target", "max_actions",
+                                  "headless", "executable_path", "run_dir"},
+              str(sorted(inv_kwargs)))
+        check("333 investigator result/spec by identity",
+              inv_kwargs["result"] is result and inv_kwargs["spec"] is spec)
+        check("333 investigator target/max/headless/exe/run_dir passthrough",
+              inv_kwargs["target"] == "http://target-333/"
+              and inv_kwargs["max_actions"] == 7
+              and inv_kwargs["max_actions"] == spec.max_investigation_actions
+              and inv_kwargs["headless"] is False
+              and inv_kwargs["executable_path"] == "/fake/chrome-333"
+              and inv_kwargs["run_dir"] == run_dir, str(inv_kwargs))
+        check("333 ledger investigation entry before scripted, exact",
+              captures["ledger"] == [
+                  {"kind": "investigation", "run_dir": run_dir,
+                   "flow": "flow-333", "model": "model-333", "tokens_in": 111,
+                   "tokens_out": 22, "cost_usd_est": 0.0033},
+                  scripted("failed")], str(captures["ledger"]))
+        wr = captures["write_report"]
+        check("333 write_report once, positional + diagnosis identity",
+              len(wr) == 1 and len(wr[0][0]) == 3 and wr[0][0][0] is result
+              and wr[0][0][1] is spec and wr[0][0][2] == run_dir
+              and wr[0][1].get("diagnosis") is diagnosis, str(wr))
+        check("333 positive return is (failed, run_dir)",
+              ret == ("failed", run_dir), str(ret))
+        check("333 TARGET_URL set to the flow target after the call",
+              os.environ.get("TARGET_URL") == "http://target-333/",
+              str(os.environ.get("TARGET_URL")))
+        check("333 load_spec got the flow path",
+              captures["load_spec"] == ["/tmp/flows/f333.yaml"],
+              str(captures["load_spec"]))
+        rf = captures["run_flow"]
+        check("333 run_flow got spec identity + run_dir/target/headless/exe",
+              len(rf) == 1 and rf[0][0] is spec and rf[0][1] == run_dir
+              and rf[0][2] == "http://target-333/" and rf[0][3] is False
+              and rf[0][4] == "/fake/chrome-333", str(rf))
+        check("333 prune_old_runs got (runs_root, keep_runs, current=run_dir)",
+              captures["prune"] == [(("/tmp/runs333", 3),
+                                      {"current_run_dir": run_dir})],
+              str(captures["prune"]))
+
+        # --- (a) None diagnosis: gate fully on, investigator returns None ---
+        ret = drive("failed", True, True, None)
+        check("333 none-diagnosis investigator still called once",
+              len(captures["investigate"]) == 1, str(captures["investigate"]))
+        check("333 none-diagnosis ledger is scripted-only",
+              captures["ledger"] == [scripted("failed")],
+              str(captures["ledger"]))
+        check("333 none-diagnosis write_report diagnosis is None",
+              len(captures["write_report"]) == 1
+              and captures["write_report"][0][1].get("diagnosis") is None,
+              str(captures["write_report"]))
+        check("333 none-diagnosis return is (failed, run_dir)",
+              ret == ("failed", run_dir), str(ret))
+
+        # --- (b) passed result: gate on, investigator never called ---
+        ret = drive("passed", True, True, diagnosis)
+        check("333 passed investigator never called",
+              captures["investigate"] == [], str(captures["investigate"]))
+        check("333 passed ledger scripted-only with status passed",
+              captures["ledger"] == [scripted("passed")],
+              str(captures["ledger"]))
+        check("333 passed write_report diagnosis is None",
+              len(captures["write_report"]) == 1
+              and captures["write_report"][0][1].get("diagnosis") is None,
+              str(captures["write_report"]))
+        check("333 passed return is (passed, run_dir)",
+              ret == ("passed", run_dir), str(ret))
+
+        # --- (c) do_investigate=False: failed + spec flag on, never called ---
+        ret = drive("failed", False, True, diagnosis)
+        check("333 do_investigate=False investigator never called",
+              captures["investigate"] == [], str(captures["investigate"]))
+        check("333 do_investigate=False ledger scripted-only",
+              captures["ledger"] == [scripted("failed")],
+              str(captures["ledger"]))
+        check("333 do_investigate=False write_report diagnosis is None",
+              len(captures["write_report"]) == 1
+              and captures["write_report"][0][1].get("diagnosis") is None,
+              str(captures["write_report"]))
+        check("333 do_investigate=False return is (failed, run_dir)",
+              ret == ("failed", run_dir), str(ret))
+
+        # --- (d) spec.investigate_on_failure=False: never called ---
+        ret = drive("failed", True, False, diagnosis)
+        check("333 spec-flag=False investigator never called",
+              captures["investigate"] == [], str(captures["investigate"]))
+        check("333 spec-flag=False ledger scripted-only",
+              captures["ledger"] == [scripted("failed")],
+              str(captures["ledger"]))
+        check("333 spec-flag=False write_report diagnosis is None",
+              len(captures["write_report"]) == 1
+              and captures["write_report"][0][1].get("diagnosis") is None,
+              str(captures["write_report"]))
+        check("333 spec-flag=False return is (failed, run_dir)",
+              ret == ("failed", run_dir), str(ret))
+    finally:
+        for k, v in saved.items():
+            setattr(worker, k, v)
+        worker.ledger.append = saved_ledger_append
+        inv_mod.investigate = saved_investigate
+        os.environ.pop("TARGET_URL", None) if old_target is None else \
+            os.environ.__setitem__("TARGET_URL", old_target)
+
+
 @contextlib.contextmanager
 def _notify_env(url):
     """Set QALOOP_NOTIFY_URL, restoring the old value on exit."""
