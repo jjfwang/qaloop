@@ -17132,6 +17132,202 @@ def test_issue_399_worker_loop_e2e():
           no_static_server(port), f"http.server still on {port}")
 
 
+def test_issue_401_webhook_to_worker_e2e():
+    """Issue #401: pin the webhook-to-worker composition end to end.
+    Issue #329 pins the webhook Handler HTTP contract and issue #399
+    pins the worker loop, but the seam between them - a signed GitHub
+    pull_request delivery enqueuing a verify-repo job whose payload
+    repo basename must match a repos.yaml preset key, with the
+    preset's flows running because the webhook payload carries no
+    flows key - could rot unobserved. This test stubs NOTHING: it
+    POSTs a signed pull_request delivery to the real webhook Handler
+    over real HTTP, pins the pending verify-repo row's parsed
+    payload, then drives the real worker.run_worker(once=True) with
+    a temp repos config whose only preset is keyed by that basename,
+    and pins the job row done, run.json passed, and no http.server
+    process left behind for the booted port."""
+    import hashlib
+    import hmac
+    import socket
+    import subprocess
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    import yaml
+
+    from qaloop import webhook, worker
+    from qaloop import queue as q
+    from qaloop.env import find_free_port
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def webhook_worker_mismatch(job_status, run_status, exp_job_status,
+                                exp_run_status):
+        if job_status != exp_job_status: return (
+            f"job status: expected {exp_job_status}, got {job_status}")
+        if run_status != exp_run_status: return (
+            f"run.json status: expected {exp_run_status}, "
+            f"got {run_status}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    check("401 webhook-to-worker e2e: exact expectations return no "
+          "mismatch",
+          webhook_worker_mismatch("done", "passed", "done", "passed")
+          is None)
+    probe = webhook_worker_mismatch("failed", "passed", "done",
+                                    "passed")
+    check("401 webhook-to-worker e2e: corrupted job status caught, "
+          "names field", probe is not None and "job status" in probe,
+          probe or "")
+    probe = webhook_worker_mismatch("done", "failed", "done",
+                                    "passed")
+    check("401 webhook-to-worker e2e: corrupted run.json status "
+          "caught, names field",
+          probe is not None and "run.json status" in probe,
+          probe or "")
+    if not os.path.exists(exe): check("401 webhook-to-worker e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("401 webhook-to-worker e2e: booted port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("401 webhook-to-worker e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    prior_secret = os.environ.get("QALOOP_WEBHOOK_SECRET")
+    secret = "test-secret-401"
+    try:
+        os.environ["QALOOP_WEBHOOK_SECRET"] = secret
+        with temp_db():
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                preset = {"workdir": root,
+                          "env": [{"static": {"dir": root,
+                                              "port": port}}],
+                          "flows": ["flows/demo-login-a.yaml"]}
+                repos_path = os.path.join(td, "repos.yaml")
+                with open(repos_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump({"repos": {"qaloop": preset}}, f)
+                srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                          webhook.Handler)
+                wh_port = srv.server_address[1]
+                thread = threading.Thread(target=srv.serve_forever,
+                                          daemon=True)
+                thread.start()
+                try:
+                    body = json.dumps(
+                        {"action": "opened",
+                         "repository": {"full_name": "jjfwang/qaloop"},
+                         "pull_request": {"number": 401,
+                                          "head": {"sha": "401probe"}}}
+                        ).encode()
+                    sig = "sha256=" + hmac.new(
+                        secret.encode(), body,
+                        hashlib.sha256).hexdigest()
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{wh_port}/webhook/github",
+                        data=body, method="POST",
+                        headers={"X-GitHub-Event": "pull_request",
+                                 "X-Hub-Signature-256": sig,
+                                 "Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        status = resp.status
+                        resp_body = json.loads(
+                            resp.read().decode() or "{}")
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                    thread.join(timeout=5)
+                check("401 webhook-to-worker e2e: webhook status 200",
+                      status == 200, str(status))
+                check("401 webhook-to-worker e2e: webhook ok",
+                      resp_body.get("ok") is True, str(resp_body))
+                job_id = resp_body.get("job_id")
+                check("401 webhook-to-worker e2e: webhook job_id "
+                      "present", job_id is not None, str(resp_body))
+                check("401 webhook-to-worker e2e: webhook server "
+                      "thread stopped", not thread.is_alive())
+                jobs = q.list_jobs(limit=100)
+                check("401 webhook-to-worker e2e: exactly one job "
+                      "enqueued", len(jobs) == 1, str(len(jobs)))
+                if jobs:
+                    job = jobs[0]
+                    check("401 webhook-to-worker e2e: pending job id "
+                          "matches", job["id"] == job_id, str(job))
+                    check("401 webhook-to-worker e2e: pending job "
+                          "kind", job["kind"] == "verify-repo",
+                          str(job))
+                    check("401 webhook-to-worker e2e: pending job "
+                          "status", job["status"] == "pending",
+                          str(job))
+                    check("401 webhook-to-worker e2e: pending job "
+                          "payload",
+                          job["payload"] == {
+                              "repo": "qaloop",
+                              "repo_full": "jjfwang/qaloop",
+                              "pr": 401, "sha": "401probe",
+                              "source": "github-webhook"},
+                          str(job["payload"]))
+                if job_id is not None:
+                    worker.run_worker(
+                        flows_dir=os.path.join(root, "flows"),
+                        runs_root=runs_root, once=True, poll_s=0.01,
+                        headless=True, executable_path=exe,
+                        repos_config_path=repos_path)
+                    row = _job_row(job_id)
+                    run_dir = row["run_dir"] or ""
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    run_data = {}
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            run_data = json.load(f)
+                    mismatch = webhook_worker_mismatch(
+                        row["status"], run_data.get("status"),
+                        "done", "passed")
+                    check("401 webhook-to-worker e2e: real worker "
+                          "completes job done with run.json passed",
+                          mismatch is None, mismatch or "")
+                    check("401 webhook-to-worker e2e: run_dir is a "
+                          "real directory under the runs root",
+                          bool(run_dir) and os.path.isdir(run_dir)
+                          and os.path.abspath(run_dir).startswith(
+                              os.path.abspath(runs_root) + os.sep),
+                          run_dir)
+                    check("401 webhook-to-worker e2e: run.json exists "
+                          "in the run dir",
+                          bool(run_json) and os.path.exists(run_json),
+                          run_json)
+                    check("401 webhook-to-worker e2e: booted static "
+                          "server stopped after the job",
+                          no_static_server(port),
+                          f"http.server still running on {port}")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+        os.environ.pop("QALOOP_WEBHOOK_SECRET", None) if prior_secret is None else os.environ.update({"QALOOP_WEBHOOK_SECRET": prior_secret})
+    check("401 webhook-to-worker e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
