@@ -994,6 +994,153 @@ def test_issue_331_worker_verify_repo_contract():
         worker.boot_static, worker.boot_command = real_static, real_command
 
 
+def test_issue_371_worker_branch_coverage():
+    """Pin the 6 untaken branch sides in worker.py (issue #371): absolute
+    static dir, dict payloads in _handle_job_body/handle_job, absolute flow
+    paths in verify-flow/verify-repo, and the except-path requeue."""
+    import threading
+    import time
+    from qaloop import queue, worker
+
+    @contextlib.contextmanager
+    def _recording_run(result):
+        real = worker._run_one_flow
+        calls = []
+
+        def fake(flow_path, target, runs_root, headless, executable_path,
+                 do_investigate, keep_runs=0):
+            calls.append((flow_path, target))
+            return result
+
+        worker._run_one_flow = fake
+        try:
+            yield calls
+        finally:
+            worker._run_one_flow = real
+
+    # (a) 67->69: absolute static dir skips the workdir join.
+    real_static = worker.boot_static
+    captured = {}
+    fake_target = _FakeBootTarget("http://abs-static/")
+
+    def fake_static(d, port=None):
+        captured["dir"] = d
+        captured["port"] = port
+        return fake_target
+
+    worker.boot_static = fake_static
+    try:
+        targets, primary = worker.boot_env_entries(
+            [{"static": {"dir": "/abs/site", "port": 8123}}], "/wd")
+    finally:
+        worker.boot_static = real_static
+    check("371 absolute static dir passed verbatim",
+          captured.get("dir") == "/abs/site", str(captured))
+    check("371 absolute static port passed through",
+          captured.get("port") == 8123, str(captured))
+    check("371 absolute static primary_url is the booted target url",
+          primary == fake_target.url and targets == [fake_target],
+          f"{primary} {targets}")
+
+    # (b) 181->184: dict payload in _handle_job_body skips the JSON decode.
+    with temp_db():
+        jid = queue.enqueue("verify-flow",
+                            {"flow": "x.yaml", "target": "http://x"})
+        job = {"id": jid, "kind": "verify-flow",
+               "payload": {"flow": "x.yaml", "target": "http://x"},
+               "attempts": 0}
+        with _recording_run(("passed", "/tmp/runs/demo")) as calls:
+            worker._handle_job_body(job, **_handle_kwargs())
+        row = _job_row(jid)
+        check("371 dict-payload body job done", row["status"] == "done",
+              row["status"])
+        check("371 dict-payload body records run_dir",
+              row["run_dir"] == "/tmp/runs/demo", str(row["run_dir"]))
+        check("371 dict-payload body joins relative flow to flows_dir",
+              calls and calls[0][0] == os.path.join("/tmp/flows", "x.yaml"),
+              str(calls))
+
+    # (c) 190->192: absolute flow in verify-flow skips the flows_dir join.
+    with temp_db():
+        jid = queue.enqueue("verify-flow",
+                            {"flow": "/abs/flows/x.yaml",
+                             "target": "http://x"})
+        with _recording_run(("passed", "/tmp/runs/demo")) as calls:
+            worker.handle_job(queue.claim(), **_handle_kwargs())
+        row = _job_row(jid)
+        check("371 absolute verify-flow path passed verbatim",
+              calls and calls[0][0] == "/abs/flows/x.yaml", str(calls))
+        check("371 absolute verify-flow job done", row["status"] == "done",
+              row["status"])
+
+    # (d) 207->212: absolute flow in verify-repo skips the home/flows_dir
+    # resolution.
+    with temp_db():
+        cfg = {"repos": {"r1": {"env": []}}}
+        jid = queue.enqueue("verify-repo",
+                            {"repo": "r1", "flows": ["/abs/flows/x.yaml"]})
+        with _stub_verify_repo([("passed", "/tmp/runs/a")]) as (calls, targets):
+            worker.handle_job(queue.claim(),
+                              **dict(_handle_kwargs(), repos_config=cfg))
+        row = _job_row(jid)
+        check("371 absolute verify-repo path passed verbatim",
+              calls["runs"] and calls["runs"][0][0] == "/abs/flows/x.yaml",
+              str(calls["runs"]))
+        check("371 absolute verify-repo boots default profile",
+              calls["boots"] == [None], str(calls["boots"]))
+        check("371 absolute verify-repo booted target stopped",
+              len(targets) == 1 and targets[0].stopped,
+              str([t.stopped for t in targets]))
+        check("371 absolute verify-repo job done", row["status"] == "done",
+              row["status"])
+        check("371 absolute verify-repo records run_dir",
+              row["run_dir"] == "/tmp/runs/a", str(row["run_dir"]))
+
+    # (e) 242->246: except-path record_failure returning "requeued" stays
+    # silent (no notification) and leaves the job pending.
+    with temp_db(), _notify_stub() as (received, url):
+        with _notify_env(url):
+            jid = queue.enqueue("verify-flow",
+                                {"flow": "x.yaml", "target": "http://x"},
+                                max_retries=2)
+            with _raise_run_one_flow():
+                worker.handle_job(queue.claim(), **_handle_kwargs())
+            row = _job_row(jid)
+            check("371 except-path requeue leaves job pending",
+                  row["status"] == "pending", row["status"])
+            check("371 except-path requeue counts one attempt",
+                  row["attempts"] == 1, str(row["attempts"]))
+            check("371 except-path requeue note names the worker error",
+                  "worker error" in (row["note"] or "")
+                  and "boom" in (row["note"] or ""), row["note"] or "")
+            check("371 except-path requeue sends no notification",
+                  received == [], str(received))
+
+    # (f) 264->267: dict payload in handle_job skips the JSON decode, so
+    # _resolve_job_timeout reads timeout_s straight from the dict.
+    with temp_db():
+        release = threading.Event()
+        with _stub_run_one_flow_blocking(release) as threads:
+            jid = queue.enqueue("verify-flow",
+                                {"flow": "x.yaml", "target": "http://x"})
+            job = queue.claim()
+            job["payload"] = {"flow": "x.yaml", "target": "http://x",
+                              "timeout_s": 0.5}
+            start = time.monotonic()
+            worker.handle_job(job, **_handle_kwargs())
+            elapsed = time.monotonic() - start
+            row = _job_row(jid)
+            _release_threads(release, threads)
+        check("371 dict-payload handle_job returns promptly on timeout_s",
+              elapsed < 5, f"elapsed={elapsed:.2f}s")
+        check("371 dict-payload timed-out job failed",
+              row["status"] == "failed", row["status"])
+        check("371 dict-payload timed-out note contains 'timeout'",
+              "timeout" in (row["note"] or ""), (row["note"] or "")[:80])
+        check("371 dict-payload timed-out counts one attempt",
+              row["attempts"] == 1, str(row["attempts"]))
+
+
 def test_issue_335_worker_target_cleanup_isolation():
     from qaloop import queue, worker
 
