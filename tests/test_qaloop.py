@@ -14775,6 +14775,265 @@ def test_perform_main_loop_contract():
         pw_sync.sync_playwright = old_pw
 
 
+
+def test_perform_inloop_remainder_contract():
+    # Pins the perform() in-loop remainder (issue 367): executable_path
+    # launch kwarg, CDP attach, pre-call and inner cost-ceiling breaks,
+    # vision retry on image/400 errors, harness PermissionError observation,
+    # and the PERFORM.md ceiling stop-reason line.
+    import copy
+    import playwright.sync_api as pw_sync
+    import qaloop.perform as perf_mod
+    from qaloop.perform import perform
+
+    png_bytes = b"\x89PNG\r\n\x1a\nfake-perform-shot"
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.handlers = {}
+        def on(self, event, handler):
+            self.handlers[event] = handler
+        def title(self):
+            return "Fake Title"
+        def goto(self, url, timeout=None, wait_until=None):
+            self.url = url
+        def screenshot(self, path=None, **kw):
+            with open(path, "wb") as f:
+                f.write(png_bytes)
+
+    def make_pw(page, cdp_browser=None, launched_ctx_pages=None):
+        state = {"launch": [], "cdp": [], "ctx_new": [], "closed": [],
+                 "entered": []}
+        class FakeCtx:
+            def __init__(self, pages):
+                self.pages = list(pages)
+                self.new_page_calls = []
+            def new_page(self):
+                self.new_page_calls.append(True)
+                return page
+        class FakeBrowser:
+            def __init__(self, contexts):
+                self.contexts = list(contexts)
+                self.new_context_calls = []
+            def new_context(self, **kw):
+                self.new_context_calls.append(kw)
+                ctx = FakeCtx([page])
+                self.contexts.append(ctx)
+                return ctx
+            def close(self):
+                state["closed"].append(True)
+        launched_ctx = FakeCtx([page])
+        launched_browser = FakeBrowser([launched_ctx])
+        class FakeChromium:
+            def launch(self, **kw):
+                state["launch"].append(copy.deepcopy(kw))
+                return launched_browser
+            def connect_over_cdp(self, url):
+                state["cdp"].append(url)
+                return cdp_browser
+        class FakePW:
+            chromium = FakeChromium()
+        class FakePWCM:
+            def __enter__(self):
+                state["entered"].append(True)
+                return FakePW()
+            def __exit__(self, *a):
+                return False
+        state["FakeCtx"] = FakeCtx
+        state["FakeBrowser"] = FakeBrowser
+        return FakePWCM, state
+
+    def make_chat(items):
+        calls = []
+        def fake_chat(cfg, messages, timeout_s=90):
+            calls.append(copy.deepcopy(messages))
+            item = items[len(calls) - 1]
+            if isinstance(item, Exception):
+                raise item
+            return item, {"prompt_tokens": 100, "completion_tokens": 50}
+        return fake_chat, calls
+
+    done = json.dumps({"action": "done", "summary": "did the thing"})
+    nav = json.dumps({"action": "navigate", "url": "http://x/next"})
+    shot = json.dumps({"action": "screenshot"})
+    good_cfg = {"base_url": "http://x", "name": "stub-model",
+                "api_key": "test", "price_in": 1.0, "price_out": 2.0}
+    old_chat = perf_mod._chat
+    old_cfg = perf_mod._model_config
+    old_ax = perf_mod.ax_snapshot
+    old_pw = pw_sync.sync_playwright
+    old_ceiling = perf_mod.Performer._ceiling_hit
+    old_act = perf_mod.Performer.act
+    perf_mod._model_config = lambda: dict(good_cfg)
+    perf_mod.ax_snapshot = lambda page, **kw: "AX TREE"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # S1: executable_path lands in launch kwargs (line 358).
+            page = FakePage()
+            cm, st = make_pw(page)
+            chat, calls = make_chat([done])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            r = perform(task="t", target="http://x/", max_actions=5,
+                        runs_root=tmp, executable_path="/fake/chrome")
+            check("perform remainder S1: launch kwargs carry executable_path",
+                  st["launch"] == [{"headless": True,
+                                    "executable_path": "/fake/chrome"}],
+                  repr(st["launch"]))
+            check("perform remainder S1: completed", r["status"] == "completed",
+                  str(r["status"]))
+
+            # S2: CDP attach (lines 360-364), three sub-cases.
+            for label, mode in (("reuse", "reuse"), ("new_context", "noctx"),
+                                ("new_page", "nopage")):
+                page = FakePage()
+                # Build the CDP browser with the shared fakes.
+                cm0, st0 = make_pw(page)
+                FakeCtx = st0["FakeCtx"]; FakeBrowser = st0["FakeBrowser"]
+                if mode == "reuse":
+                    cdp_browser = FakeBrowser([FakeCtx([page])])
+                elif mode == "noctx":
+                    cdp_browser = FakeBrowser([])
+                else:
+                    cdp_browser = FakeBrowser([FakeCtx([])])
+                cm, st = make_pw(page, cdp_browser=cdp_browser)
+                chat, calls = make_chat([done])
+                perf_mod._chat = chat
+                pw_sync.sync_playwright = lambda: cm()
+                r = perform(task="t", target="http://x/", max_actions=5,
+                            runs_root=tmp, cdp_url="http://127.0.0.1:9222")
+                check(f"perform remainder S2-{label}: cdp url verbatim",
+                      st["cdp"] == ["http://127.0.0.1:9222"], repr(st["cdp"]))
+                check(f"perform remainder S2-{label}: attached True",
+                      r["attached"] is True, repr(r.get("attached")))
+                check(f"perform remainder S2-{label}: browser NOT closed",
+                      st["closed"] == [], repr(st["closed"]))
+                if mode == "noctx":
+                    check("perform remainder S2-new_context: new_context called",
+                          len(cdp_browser.new_context_calls) == 1,
+                          repr(cdp_browser.new_context_calls))
+                if mode == "nopage":
+                    check("perform remainder S2-new_page: new_page called",
+                          len(cdp_browser.contexts[0].new_page_calls) == 1,
+                          repr(cdp_browser.contexts[0].new_page_calls))
+
+            # S3: pre-call ceiling break (393-395) + PERFORM.md suffix (473).
+            page = FakePage()
+            cm, st = make_pw(page)
+            chat, calls = make_chat([nav, nav])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            r = perform(task="t", target="http://x/", max_actions=5,
+                        runs_root=tmp, max_cost_usd=0.00015)
+            check("perform remainder S3: exactly 1 chat call",
+                  len(calls) == 1, str(len(calls)))
+            check("perform remainder S3: status blocked",
+                  r["status"] == "blocked", str(r["status"]))
+            check("perform remainder S3: summary verbatim",
+                  r["summary"] == "cost ceiling reached (max-cost-usd 0.00015)",
+                  str(r["summary"]))
+            check("perform remainder S3: ceiling_hit True",
+                  r["ceiling_hit"] is True, repr(r.get("ceiling_hit")))
+            md = open(os.path.join(r["run_dir"], "PERFORM.md"),
+                      encoding="utf-8").read()
+            check("perform remainder S3: PERFORM.md ceiling stop reason",
+                  "stop reason: cost ceiling reached" in md, md[:400])
+
+            # S4: vision retry on image/400 (398-410), then completes.
+            page = FakePage()
+            cm, st = make_pw(page)
+            chat, calls = make_chat(
+                [shot, RuntimeError("image content rejected 400"), done])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            r = perform(task="t", target="http://x/", max_actions=5,
+                        runs_root=tmp)
+            check("perform remainder S4: 3 chat calls (shot, fail, retry)",
+                  len(calls) == 3, str(len(calls)))
+            check("perform remainder S4: completed after retry",
+                  r["status"] == "completed", str(r["status"]))
+            if len(calls) == 3:
+                check("perform remainder S4: vision call used list content",
+                      isinstance(calls[1][-1].get("content"), list),
+                      repr(calls[1][-1])[:200])
+                check("perform remainder S4: retry downgraded to plain text",
+                      isinstance(calls[2][-1].get("content"), str) and
+                      calls[2][-1]["content"].startswith("URL:"),
+                      repr(calls[2][-1])[:200])
+
+            # S4b: non-image error re-raises, no retry.
+            page = FakePage()
+            cm, st = make_pw(page)
+            chat, calls = make_chat([RuntimeError("boom 500")])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            raised = ""
+            try:
+                perform(task="t", target="http://x/", max_actions=5,
+                        runs_root=tmp)
+            except RuntimeError as e:
+                raised = str(e)
+            check("perform remainder S4b: non-image error re-raises",
+                  raised == "boom 500", raised)
+            check("perform remainder S4b: exactly 1 chat call",
+                  len(calls) == 1, str(len(calls)))
+
+            # S5: inner ceiling re-check (403-407). The loop passes unchanged
+            # cost values to both checks, so this defensive break is reachable
+            # only via a stateful _ceiling_hit stub: False, False, True.
+            page = FakePage()
+            cm, st = make_pw(page)
+            seq = iter([False, False, True])
+            perf_mod.Performer._ceiling_hit = (
+                lambda self, cs, est: next(seq))
+            chat, calls = make_chat(
+                [shot, RuntimeError("image content rejected 400"), done])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            try:
+                r = perform(task="t", target="http://x/", max_actions=5,
+                            runs_root=tmp, max_cost_usd=1.0)
+            finally:
+                perf_mod.Performer._ceiling_hit = old_ceiling
+            check("perform remainder S5: blocked by inner ceiling re-check",
+                  r["status"] == "blocked", str(r["status"]))
+            check("perform remainder S5: summary verbatim",
+                  r["summary"] == "cost ceiling reached (max-cost-usd 1.0)",
+                  str(r["summary"]))
+            check("perform remainder S5: ceiling_hit True",
+                  r["ceiling_hit"] is True, repr(r.get("ceiling_hit")))
+            check("perform remainder S5: retry chat call never made",
+                  len(calls) == 2, str(len(calls)))
+
+            # S6: harness PermissionError (440-441) becomes transcript result.
+            page = FakePage()
+            cm, st = make_pw(page)
+            def raising_act(self, action):
+                raise PermissionError("destructive click blocked")
+            perf_mod.Performer.act = raising_act
+            chat, calls = make_chat([nav, done])
+            perf_mod._chat = chat
+            pw_sync.sync_playwright = lambda: cm()
+            try:
+                r = perform(task="t", target="http://x/", max_actions=5,
+                            runs_root=tmp)
+            finally:
+                perf_mod.Performer.act = old_act
+            check("perform remainder S6: BLOCKED BY HARNESS verbatim",
+                  [rec.get("result") for rec in r["actions"]][:1] ==
+                  ["BLOCKED BY HARNESS: destructive click blocked"],
+                  repr(r["actions"])[:300])
+            check("perform remainder S6: loop continues to completed",
+                  r["status"] == "completed", str(r["status"]))
+    finally:
+        perf_mod._chat = old_chat
+        perf_mod._model_config = old_cfg
+        perf_mod.ax_snapshot = old_ax
+        pw_sync.sync_playwright = old_pw
+        perf_mod.Performer._ceiling_hit = old_ceiling
+        perf_mod.Performer.act = old_act
+
 def test_perform_model_config_contract():
     import qaloop.perform as perf_mod
     keys = ["QALOOP_MODEL_BASE_URL", "QALOOP_MODEL_NAME",
