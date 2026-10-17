@@ -4866,6 +4866,149 @@ def test_investigate_manual_brief_artifact_lines():
               "AX snapshot:" not in md, md)
 
 
+def test_issue_373_investigate_branch_coverage():
+    import copy
+    import playwright.sync_api as pw_sync
+    import qaloop.investigate as mod
+    from qaloop.investigate import investigate, write_manual_brief
+    from qaloop.runner import AssertionResult
+
+    spec = _investigate_minimal_spec()
+
+    # Scenario 1: write_manual_brief with no failing step (failed_step None)
+    result_no_step = _investigate_failed_result()
+    result_no_step.failed_step = None
+    with tempfile.TemporaryDirectory() as run_dir:
+        path = write_manual_brief(run_dir, spec, result_no_step, "http://x/")
+        md = open(path, encoding="utf-8").read()
+        check("issue373 manual brief no failing step: header present",
+              "Investigation brief (manual mode)" in md, md[:500])
+        check("issue373 manual brief no failing step: failing step absent",
+              "## Failing step" not in md, md[:500])
+        check("issue373 manual brief no failing step: console errors present",
+              "## Console errors" in md, md[:500])
+        check("issue373 manual brief no failing step: console error text present",
+              "boom: TypeError" in md, md[:500])
+
+    # Helper to drive investigate() in agent mode and capture first user msg
+    class StubPage:
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.url = url
+
+    stub = StubPage()
+
+    class _Ctx:
+        def new_page(self):
+            return stub
+
+    class _FakeBrowser:
+        def new_context(self, **kw):
+            return _Ctx()
+
+        def close(self):
+            pass
+
+    class _FakeChromium:
+        def launch(self, **kw):
+            return _FakeBrowser()
+
+    class _FakePW:
+        chromium = _FakeChromium()
+
+    class _FakePWCM:
+        def __enter__(self):
+            return _FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    def run_agent(result):
+        chat_calls = []
+
+        def fake_chat(cfg, messages, timeout_s=90):
+            chat_calls.append(copy.deepcopy(messages))
+            raw = json.dumps({"thought": "t", "tool": "done",
+                              "args": {"diagnosis": "d",
+                                       "likely_cause": "c",
+                                       "suggested_fix": "f"}})
+            return raw, {"prompt_tokens": 1, "completion_tokens": 1}
+
+        old_chat = mod._chat
+        old_ax = mod.ax_snapshot
+        old_cfg = mod._model_config
+        old_pw = pw_sync.sync_playwright
+        mod._chat = fake_chat
+        mod.ax_snapshot = lambda page, **kw: "AX TREE"
+        mod._model_config = lambda: {"base_url": "http://x",
+                                     "name": "stub-model",
+                                     "api_key": "test", "price_in": 1.0,
+                                     "price_out": 2.0}
+        pw_sync.sync_playwright = lambda: _FakePWCM()
+        try:
+            with tempfile.TemporaryDirectory() as run_dir:
+                diag = investigate(result=result, spec=spec,
+                                   target="http://x/", max_actions=5,
+                                   run_dir=run_dir)
+        finally:
+            mod._chat, mod.ax_snapshot, mod._model_config = old_chat, old_ax, old_cfg
+            pw_sync.sync_playwright = old_pw
+        first_user = ""
+        if chat_calls:
+            users = [m["content"] for m in chat_calls[0]
+                     if m.get("role") == "user"]
+            if users:
+                first_user = users[0]
+        return first_user, diag
+
+    # Scenario 2: failing step with empty assertions list
+    result_empty = _investigate_failed_result()
+    result_empty.steps[0].assertions = []
+    first_user_empty, diag_empty = run_agent(result_empty)
+    check("issue373 agent empty assertions: mode agent",
+          diag_empty["mode"] == "agent", repr(diag_empty))
+    check("issue373 agent empty assertions: failing step present",
+          "Failing step: load page (op goto)" in first_user_empty,
+          repr(first_user_empty))
+    check("issue373 agent empty assertions: no failed assertion text",
+          "Failed assertion" not in first_user_empty,
+          repr(first_user_empty))
+
+    # Scenario 2b: agent mode with no failing step (failed_step None)
+    # covers the 215->219 branch (if s: false) in investigate()
+    result_no_step_agent = _investigate_failed_result()
+    result_no_step_agent.failed_step = None
+    first_user_none, diag_none = run_agent(result_no_step_agent)
+    check("issue373 agent no failing step: mode agent",
+          diag_none["mode"] == "agent", repr(diag_none))
+    check("issue373 agent no failing step: no step info present",
+          "no step info" in first_user_none, repr(first_user_none))
+    check("issue373 agent no failing step: no failed assertion text",
+          "Failed assertion" not in first_user_none,
+          repr(first_user_none))
+    check("issue373 agent no failing step: failing step line absent",
+          "Failing step: load page" not in first_user_none,
+          repr(first_user_none))
+
+    # Scenario 3: passed assertion filtered, failed assertion kept
+    result_mixed = _investigate_failed_result()
+    result_mixed.steps[0].assertions = [
+        AssertionResult("should-not-appear", True, "fine"),
+        AssertionResult("real-failure", False, "broke"),
+    ]
+    first_user_mixed, diag_mixed = run_agent(result_mixed)
+    check("issue373 agent mixed assertions: mode agent",
+          diag_mixed["mode"] == "agent", repr(diag_mixed))
+    check("issue373 agent mixed assertions: failed assertion present",
+          "Failed assertion real-failure: broke" in first_user_mixed,
+          repr(first_user_mixed))
+    check("issue373 agent mixed assertions: passed assertion filtered",
+          "should-not-appear" not in first_user_mixed,
+          repr(first_user_mixed))
+
+
 def test_step_retry_spec():
     """retry: accepted in steps, defaults 0, rejects <0 / non-int / setup+teardown."""
     from qaloop.spec import load_spec, SpecError
