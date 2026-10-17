@@ -13945,6 +13945,318 @@ def test_issue_359_run_flow_options():
         pw_sync.sync_playwright = old_pw
 
 
+def test_perform_main_loop_contract():
+    import base64
+    import copy
+    import playwright.sync_api as pw_sync
+    import qaloop.perform as perf_mod
+    from qaloop.perform import perform
+
+    png_bytes = b"\x89PNG\r\n\x1a\nfake-perform-shot"
+
+    class _ConsoleMsg:
+        type = "error"
+        text = "boom"
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.handlers = {}
+            self._fired = False
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        def title(self):
+            return "Fake Title"
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.url = url
+            if not self._fired:
+                self._fired = True
+                if "console" in self.handlers:
+                    self.handlers["console"](_ConsoleMsg())
+                if "pageerror" in self.handlers:
+                    self.handlers["pageerror"](Exception("page boom"))
+
+        def screenshot(self, path=None, **kw):
+            with open(path, "wb") as f:
+                f.write(png_bytes)
+
+    def make_pw(page):
+        state = {"launch": [], "ctx": [], "closed": [], "entered": []}
+
+        class FakeCtx:
+            def new_page(self):
+                return page
+
+        class FakeBrowser:
+            def new_context(self, **kw):
+                state["ctx"].append(copy.deepcopy(kw))
+                return FakeCtx()
+
+            def close(self):
+                state["closed"].append(True)
+
+        class FakeChromium:
+            def launch(self, **kw):
+                state["launch"].append(copy.deepcopy(kw))
+                return FakeBrowser()
+
+        class FakePW:
+            chromium = FakeChromium()
+
+        class FakePWCM:
+            def __enter__(self):
+                state["entered"].append(True)
+                return FakePW()
+
+            def __exit__(self, *a):
+                return False
+
+        return FakePWCM, state
+
+    def make_chat(replies):
+        calls = []
+
+        def fake_chat(cfg, messages, timeout_s=90):
+            calls.append(copy.deepcopy(messages))
+            raw = replies[len(calls) - 1]
+            return raw, {"prompt_tokens": 100, "completion_tokens": 50}
+
+        return fake_chat, calls
+
+    good_cfg = {"base_url": "http://x", "name": "stub-model",
+                "api_key": "test", "price_in": 1.0, "price_out": 2.0}
+    old_chat = perf_mod._chat
+    old_cfg = perf_mod._model_config
+    old_ax = perf_mod.ax_snapshot
+    old_pw = pw_sync.sync_playwright
+    perf_mod._model_config = lambda: dict(good_cfg)
+    perf_mod.ax_snapshot = lambda page, **kw: "AX TREE"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Scenario A: completed, with invalid JSON, navigate,
+            # console, screenshot (vision), done.
+            page_a = FakePage()
+            cm_a, state_a = make_pw(page_a)
+            replies_a = [
+                "this is not json",
+                json.dumps({"action": "navigate", "url": "http://x/next"}),
+                json.dumps({"action": "console"}),
+                json.dumps({"action": "screenshot"}),
+                json.dumps({"action": "done", "summary": "did the thing"}),
+            ]
+            chat_a, calls_a = make_chat(replies_a)
+            perf_mod._chat = chat_a
+            pw_sync.sync_playwright = lambda: cm_a()
+            result_a = perform(task="do the thing", target="http://x/",
+                               max_actions=10, runs_root=tmp)
+            check("perform loop A: 5 chat calls", len(calls_a) == 5,
+                  str(len(calls_a)))
+            if calls_a:
+                check("perform loop A: system prompt",
+                      calls_a[0][0].get("content") ==
+                      perf_mod.SYSTEM.replace("{max_actions}", "10"),
+                      repr(calls_a[0][0])[:300])
+                check("perform loop A: initial user message",
+                      len(calls_a[0]) > 1 and calls_a[0][1] ==
+                      {"role": "user",
+                       "content": "TASK: do the thing\n"
+                                  "STARTING URL: http://x/\n"
+                                  "Begin. Reply with exactly one JSON action."},
+                      repr(calls_a[0][1])[:300] if len(calls_a[0]) > 1 else "short")
+            if len(calls_a) > 1:
+                check("perform loop A: invalid JSON retry prompt",
+                      any(m.get("role") == "user" and m.get("content") ==
+                          "That was not a valid JSON action "
+                          "(model did not return a JSON action). "
+                          "Reply with exactly one JSON action."
+                          for m in calls_a[1]),
+                      repr(calls_a[1])[:500])
+            check("perform loop A: status completed",
+                  result_a["status"] == "completed", str(result_a["status"]))
+            check("perform loop A: summary",
+                  result_a["summary"] == "did the thing",
+                  str(result_a["summary"]))
+            check("perform loop A: action_count 4 (invalid adds none)",
+                  result_a["action_count"] == 4, str(result_a["action_count"]))
+            results_a = [r.get("result") for r in result_a["actions"]]
+            check("perform loop A: transcript results in order",
+                  results_a == ["navigated to http://x/next",
+                                '[{"type": "error", "text": "boom"}, '
+                                '{"type": "pageerror", "text": "page boom"}]',
+                                "screenshot saved (perform-03.png)",
+                                "done"],
+                  repr(results_a))
+            check("perform loop A: record n values 1-4",
+                  [r.get("n") for r in result_a["actions"]] == [1, 2, 3, 4],
+                  repr([r.get("n") for r in result_a["actions"]]))
+            if len(calls_a) == 5:
+                last_msg = calls_a[4][-1]
+                content = last_msg.get("content")
+                check("perform loop A: vision message is list content",
+                      isinstance(content, list) and len(content) == 2,
+                      repr(content)[:300])
+                if isinstance(content, list) and len(content) == 2:
+                    check("perform loop A: vision text part",
+                          content[0].get("type") == "text" and
+                          content[0].get("text", "").startswith(
+                              "URL: http://x/next"),
+                          repr(content[0])[:300])
+                    check("perform loop A: vision image part",
+                          content[1] == {"type": "image_url",
+                                         "image_url": {"url":
+                                                       "data:image/png;base64," +
+                                                       base64.b64encode(png_bytes).decode()}},
+                          repr(content[1])[:300])
+            check("perform loop A: tokens 500/250",
+                  result_a["tokens_in"] == 500 and result_a["tokens_out"] == 250,
+                  f"{result_a['tokens_in']}/{result_a['tokens_out']}")
+            check("perform loop A: cost 0.001",
+                  result_a["cost_usd_est"] == 0.001,
+                  str(result_a["cost_usd_est"]))
+            check("perform loop A: final url/title/attached",
+                  result_a["final_url"] == "http://x/next" and
+                  result_a["final_title"] == "Fake Title" and
+                  result_a["attached"] is False,
+                  repr({k: result_a[k] for k in
+                        ("final_url", "final_title", "attached")}))
+            check("perform loop A: launch recorded",
+                  state_a["launch"] == [{"headless": True}],
+                  repr(state_a["launch"]))
+            check("perform loop A: context viewport",
+                  state_a["ctx"] == [{"viewport": {"width": 1280,
+                                                   "height": 800}}],
+                  repr(state_a["ctx"]))
+            check("perform loop A: browser closed",
+                  state_a["closed"] == [True], repr(state_a["closed"]))
+            pj_path = os.path.join(result_a["run_dir"], "perform.json")
+            check("perform loop A: perform.json exists",
+                  os.path.exists(pj_path))
+            if os.path.exists(pj_path):
+                saved = json.load(open(pj_path, encoding="utf-8"))
+                check("perform loop A: perform.json matches result",
+                      saved.get("status") == result_a["status"] and
+                      saved.get("summary") == result_a["summary"] and
+                      saved.get("tokens_in") == result_a["tokens_in"] and
+                      saved.get("tokens_out") == result_a["tokens_out"] and
+                      saved.get("cost_usd_est") == result_a["cost_usd_est"] and
+                      saved.get("attached") == result_a["attached"],
+                      repr(saved)[:300])
+            md_path = os.path.join(result_a["run_dir"], "PERFORM.md")
+            check("perform loop A: PERFORM.md exists",
+                  os.path.exists(md_path))
+            if os.path.exists(md_path):
+                md = open(md_path, encoding="utf-8").read()
+                check("perform loop A: PERFORM.md status line",
+                      "status: **completed**" in md and
+                      "did the thing" in md, md[:300])
+                check("perform loop A: PERFORM.md tokens",
+                      "500/250" in md, md[:300])
+
+            # Scenario B: blocked.
+            page_b = FakePage()
+            cm_b, state_b = make_pw(page_b)
+            chat_b, calls_b = make_chat(
+                [json.dumps({"action": "blocked", "reason": "captcha wall"})])
+            perf_mod._chat = chat_b
+            pw_sync.sync_playwright = lambda: cm_b()
+            result_b = perform(task="do the thing", target="http://x/",
+                               max_actions=10, runs_root=tmp)
+            check("perform loop B: status blocked",
+                  result_b["status"] == "blocked", str(result_b["status"]))
+            check("perform loop B: summary is reason",
+                  result_b["summary"] == "captcha wall",
+                  str(result_b["summary"]))
+            check("perform loop B: action_count 1",
+                  result_b["action_count"] == 1, str(result_b["action_count"]))
+            check("perform loop B: record result blocked",
+                  [r.get("result") for r in result_b["actions"]] == ["blocked"],
+                  repr(result_b["actions"]))
+            check("perform loop B: browser closed",
+                  state_b["closed"] == [True], repr(state_b["closed"]))
+
+            # Scenario C: exhaustion.
+            page_c = FakePage()
+            cm_c, state_c = make_pw(page_c)
+            chat_c, calls_c = make_chat(
+                [json.dumps({"action": "navigate", "url": "http://x/next"}),
+                 json.dumps({"action": "navigate", "url": "http://x/next"})])
+            perf_mod._chat = chat_c
+            pw_sync.sync_playwright = lambda: cm_c()
+            result_c = perform(task="do the thing", target="http://x/",
+                               max_actions=2, runs_root=tmp)
+            check("perform loop C: status incomplete",
+                  result_c["status"] == "incomplete", str(result_c["status"]))
+            check("perform loop C: summary exact",
+                  result_c["summary"] == "used all 2 actions without finishing",
+                  str(result_c["summary"]))
+            check("perform loop C: action_count 2",
+                  result_c["action_count"] == 2, str(result_c["action_count"]))
+
+            # Scenario D: no API key raises before any browser launch.
+            page_d = FakePage()
+            cm_d, state_d = make_pw(page_d)
+            perf_mod._model_config = lambda: {
+                "base_url": "http://x", "name": "stub-model",
+                "api_key": "", "price_in": 1.0, "price_out": 2.0}
+            pw_sync.sync_playwright = lambda: cm_d()
+            try:
+                perform(task="do the thing", target="http://x/",
+                        max_actions=10, runs_root=tmp)
+                check("perform loop D: RuntimeError raised", False,
+                      "no error raised")
+            except RuntimeError as e:
+                check("perform loop D: RuntimeError names env var",
+                      "QALOOP_MODEL_API_KEY" in str(e), str(e))
+            finally:
+                perf_mod._model_config = lambda: dict(good_cfg)
+            check("perform loop D: playwright never entered",
+                  state_d["entered"] == [] and state_d["launch"] == [],
+                  repr(state_d))
+    finally:
+        perf_mod._chat = old_chat
+        perf_mod._model_config = old_cfg
+        perf_mod.ax_snapshot = old_ax
+        pw_sync.sync_playwright = old_pw
+
+
+def test_perform_model_config_contract():
+    import qaloop.perform as perf_mod
+    keys = ["QALOOP_MODEL_BASE_URL", "QALOOP_MODEL_NAME",
+            "QALOOP_MODEL_API_KEY", "QALOOP_MODEL_PRICE_IN",
+            "QALOOP_MODEL_PRICE_OUT"]
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["QALOOP_MODEL_BASE_URL"] = "http://host.test/v1/"
+        os.environ["QALOOP_MODEL_NAME"] = "stub-model"
+        os.environ["QALOOP_MODEL_API_KEY"] = "sk-x"
+        os.environ["QALOOP_MODEL_PRICE_IN"] = "1.5"
+        os.environ["QALOOP_MODEL_PRICE_OUT"] = "2.5"
+        check("perform model_config: overrides exact dict",
+              perf_mod._model_config() ==
+              {"base_url": "http://host.test/v1", "name": "stub-model",
+               "api_key": "sk-x", "price_in": 1.5, "price_out": 2.5},
+              repr(perf_mod._model_config()))
+        for k in keys:
+            if k in os.environ:
+                del os.environ[k]
+        check("perform model_config: defaults exact dict",
+              perf_mod._model_config() ==
+              {"base_url": "https://api.openai.com/v1",
+               "name": "gpt-4o-mini", "api_key": "",
+               "price_in": 0.15, "price_out": 0.60},
+              repr(perf_mod._model_config()))
+    finally:
+        for k in keys:
+            if saved[k] is None:
+                if k in os.environ:
+                    del os.environ[k]
+            else:
+                os.environ[k] = saved[k]
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
