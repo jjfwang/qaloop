@@ -16016,8 +16016,14 @@ def test_issue_383_spec_branch_coverage():
 def test_issue_385_smoke_corpus_execute():
     """Issue #385: execute the smoke-tagged shipped flows against the proof
     server. Default mode (QALOOP_SMOKE_CORPUS_FULL unset) really executes a
-    pinned 7-flow subset covering every outcome class (passed, failed,
-    error, boot_failed, matrix). QALOOP_SMOKE_CORPUS_FULL=1/true selects the
+    pinned 10-flow subset covering every outcome class (passed, failed,
+    error, boot_failed, matrix). The subset also includes demo-services-port,
+    demo-services-log, and demo-services-env: they pin the services SUCCESS
+    paths for the port, log_contains, and env wait forms, previously
+    executed by no default-suite test while only the http-fail boot_failed
+    path was pinned. Their inclusion adds about 35s of honest runtime in
+    total (about 10-12s per added flow).
+    QALOOP_SMOKE_CORPUS_FULL=1/true selects the
     full enumerated corpus; this test asserts that selection under the flag
     and drives the full-mode loop with a fake executor so the suite stays
     fast, while the real subset execution proves the executor end to end.
@@ -16050,7 +16056,8 @@ def test_issue_385_smoke_corpus_execute():
     smoke_subset = ["demo-seed-http-json", "demo-mock-method",
                     "demo-matrix-list", "demo-setup-fail",
                     "demo-run-timeout", "demo-services-http-fail",
-                    "demo-wait-ms"]
+                    "demo-wait-ms", "demo-services-port",
+                    "demo-services-log", "demo-services-env"]
 
     def smoke_mismatch(flow_name, outcome, table):
         expected_status, expected_sub = table.get(
@@ -16102,6 +16109,12 @@ def test_issue_385_smoke_corpus_execute():
     check("385 smoke corpus: wrong error text caught, names flow",
           sub_probe is not None and "demo-run-timeout" in sub_probe,
           sub_probe or "")
+    bad_svc = dict(smoke_expectations)
+    bad_svc["demo-services-port"] = ("failed", None)
+    svc_probe = smoke_mismatch("demo-services-port", ("passed", ""), bad_svc)
+    check("385 smoke corpus: corrupted services expectation caught, names flow",
+          svc_probe is not None and "demo-services-port" in svc_probe,
+          svc_probe or "")
     if not os.path.exists(exe): check("385 smoke corpus execution skipped (no browser)", True); return
 
     env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
