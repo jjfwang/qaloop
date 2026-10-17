@@ -3962,6 +3962,140 @@ def test_investigate_budget_enforcement():
           inspect.signature(investigate).parameters["max_actions"].default == 20)
 
 
+def test_investigate_agent_loop_remainder():
+    import copy
+    import playwright.sync_api as pw_sync
+    import qaloop.investigate as mod
+    from qaloop.investigate import investigate
+
+    class StubPage:
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.url = url
+
+    stub = StubPage()
+    launch_kw_recorded = []
+    browser_closed = []
+
+    class _Ctx:
+        def new_page(self):
+            return stub
+
+    class _FakeBrowser:
+        def new_context(self, **kw):
+            return _Ctx()
+
+        def close(self):
+            browser_closed.append(True)
+
+    class _FakeChromium:
+        def launch(self, **kw):
+            launch_kw_recorded.append(copy.deepcopy(kw))
+            return _FakeBrowser()
+
+    class _FakePW:
+        chromium = _FakeChromium()
+
+    class _FakePWCM:
+        def __enter__(self):
+            return _FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    replies = [
+        "this is not json",
+        json.dumps({"thought": "t", "tool": "frobnicate", "args": {}}),
+        json.dumps({"tool": "done", "args": {"diagnosis": "d",
+                                             "likely_cause": "c",
+                                             "suggested_fix": "f"}}),
+    ]
+    chat_calls = []
+
+    def fake_chat(cfg, messages, timeout_s=90):
+        chat_calls.append(copy.deepcopy(messages))
+        raw = replies[len(chat_calls) - 1]
+        return raw, {"prompt_tokens": 100, "completion_tokens": 50}
+
+    old_chat = mod._chat
+    old_ax = mod.ax_snapshot
+    old_cfg = mod._model_config
+    old_pw = pw_sync.sync_playwright
+    mod._chat = fake_chat
+    mod.ax_snapshot = lambda page, **kw: "AX TREE"
+    mod._model_config = lambda: {"base_url": "http://x", "name": "stub-model",
+                                 "api_key": "test", "price_in": 1.0,
+                                 "price_out": 2.0}
+    pw_sync.sync_playwright = lambda: _FakePWCM()
+    try:
+        result = _investigate_failed_result()
+        result.failed_requests = [{"method": "GET", "url": "http://x/api"}]
+        result.bad_responses = [{"method": "GET", "url": "http://x/bad",
+                                 "status": 500}]
+        with tempfile.TemporaryDirectory() as run_dir:
+            diag = investigate(result=result,
+                               spec=_investigate_minimal_spec(),
+                               target="http://x/", max_actions=5,
+                               executable_path="/fake/chrome",
+                               run_dir=run_dir)
+            check("investigate loop: 3 chat calls", len(chat_calls) == 3,
+                  str(len(chat_calls)))
+            if len(chat_calls) == 3:
+                first_user = [m["content"] for m in chat_calls[0]
+                              if m.get("role") == "user"]
+                check("investigate loop: network context in first user msg",
+                      bool(first_user) and
+                      "Network: GET http://x/api" in first_user[0],
+                      repr(first_user))
+                second_users = [m["content"] for m in chat_calls[1]
+                                if m.get("role") == "user"]
+                check("investigate loop: invalid-JSON retry prompt",
+                      any(c.startswith("That was not valid JSON") and
+                          c.endswith("Reply with exactly one JSON tool call.")
+                          for c in second_users),
+                      repr(second_users))
+                third_users = [m["content"] for m in chat_calls[2]
+                               if m.get("role") == "user"]
+                check("investigate loop: tool-error observation",
+                      any(c == "tool frobnicate returned:\n"
+                          "tool error: ValueError: unknown tool frobnicate"
+                          for c in third_users),
+                      repr(third_users))
+            check("investigate loop: launch kwargs pinned",
+                  launch_kw_recorded == [{"headless": True,
+                                          "executable_path": "/fake/chrome"}],
+                  repr(launch_kw_recorded))
+            check("investigate loop: diagnosis fields",
+                  diag["diagnosis"] == "d" and diag["likely_cause"] == "c"
+                  and diag["suggested_fix"] == "f", repr(diag))
+            check("investigate loop: mode agent", diag["mode"] == "agent")
+            check("investigate loop: model stub-model",
+                  diag["model"] == "stub-model", repr(diag.get("model")))
+            check("investigate loop: tokens_in 300", diag["tokens_in"] == 300,
+                  str(diag["tokens_in"]))
+            check("investigate loop: tokens_out 150",
+                  diag["tokens_out"] == 150, str(diag["tokens_out"]))
+            check("investigate loop: cost 0.0006",
+                  diag["cost_usd_est"] == 0.0006, str(diag["cost_usd_est"]))
+            check("investigate loop: actions_taken 2",
+                  diag["actions_taken"] == 2, str(diag["actions_taken"]))
+            check("investigate loop: browser closed", browser_closed == [True],
+                  repr(browser_closed))
+            inv_path = os.path.join(run_dir, "INVESTIGATION.md")
+            check("investigate loop: INVESTIGATION.md written",
+                  os.path.exists(inv_path))
+            if os.path.exists(inv_path):
+                md = open(inv_path, encoding="utf-8").read()
+                check("investigate loop: INVESTIGATION.md has diagnosis JSON",
+                      '"diagnosis": "d"' in md and '"likely_cause": "c"' in md
+                      and '"suggested_fix": "f"' in md, md[:500])
+    finally:
+        mod._chat, mod.ax_snapshot, mod._model_config = old_chat, old_ax, old_cfg
+        pw_sync.sync_playwright = old_pw
+
+
 def test_investigate_manual_brief():
     from qaloop.investigate import investigate, write_manual_brief
     old_key = os.environ.get("QALOOP_MODEL_API_KEY")
