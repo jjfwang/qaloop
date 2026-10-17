@@ -15580,6 +15580,147 @@ def test_issue_377_flow_services_explicit_url():
               "QALOOP_SERVICE_DEEP_PORT" not in os.environ)
 
 
+def test_issue_379_perform_branch_coverage():
+    """Issue #379: pin perform.py untaken branch sides.
+
+    Part A pins the 198->exit side of Performer._guard: names outside
+    the guarded set ("click", "dblclick", "press", "check") skip the
+    guard body entirely, so even destructive/publish labels and a
+    None target return None without raising. Part B pins the
+    375->377 side of perform(): a falsy target skips page.goto, so
+    the run completes with no navigation recorded.
+    """
+    import copy
+    import playwright.sync_api as pw_sync
+    import qaloop.perform as perf_mod
+    from qaloop.perform import Performer, perform
+
+    # Part A: _guard with unguarded names.
+    p = Performer.__new__(Performer)
+    p.allow_publish = False
+    for name in ("navigate", "fill", "hover", "uncheck"):
+        for target in ({"name": "Delete account"}, {"name": "Publish"},
+                       None):
+            try:
+                ret = p._guard(name, target)
+                check(f"379 guard: unguarded {name} target={target!r} "
+                      "does not raise", ret is None)
+            except PermissionError:
+                check(f"379 guard: unguarded {name} target={target!r} "
+                      "does not raise", False)
+    for target, label in (({"name": "Delete account"}, "destructive"),
+                          ({"name": "Publish"}, "publish")):
+        try:
+            p._guard("click", target)
+            check(f"379 guard: guarded click {label} raises", False)
+        except PermissionError:
+            check(f"379 guard: guarded click {label} raises", True)
+
+    # Part B: perform() with a falsy target never navigates.
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.handlers = {}
+            self.goto_calls = []
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        def title(self):
+            return "Fake Title"
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.goto_calls.append((url, timeout, wait_until))
+            self.url = url
+
+        def screenshot(self, path=None, **kw):
+            with open(path, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\nfake-perform-shot")
+
+    def make_pw(page):
+        state = {"launch": [], "ctx": [], "closed": [], "entered": []}
+
+        class FakeCtx:
+            def new_page(self):
+                return page
+
+        class FakeBrowser:
+            def new_context(self, **kw):
+                state["ctx"].append(copy.deepcopy(kw))
+                return FakeCtx()
+
+            def close(self):
+                state["closed"].append(True)
+
+        class FakeChromium:
+            def launch(self, **kw):
+                state["launch"].append(copy.deepcopy(kw))
+                return FakeBrowser()
+
+        class FakePW:
+            chromium = FakeChromium()
+
+        class FakePWCM:
+            def __enter__(self):
+                state["entered"].append(True)
+                return FakePW()
+
+            def __exit__(self, *a):
+                return False
+
+        return FakePWCM, state
+
+    def make_chat(replies):
+        calls = []
+
+        def fake_chat(cfg, messages, timeout_s=90):
+            calls.append(copy.deepcopy(messages))
+            raw = replies[len(calls) - 1]
+            return raw, {"prompt_tokens": 100, "completion_tokens": 50}
+
+        return fake_chat, calls
+
+    good_cfg = {"base_url": "http://x", "name": "stub-model",
+                "api_key": "test", "price_in": 1.0, "price_out": 2.0}
+    old_chat = perf_mod._chat
+    old_cfg = perf_mod._model_config
+    old_ax = perf_mod.ax_snapshot
+    old_pw = pw_sync.sync_playwright
+    perf_mod._model_config = lambda: dict(good_cfg)
+    perf_mod.ax_snapshot = lambda page, **kw: "AX TREE"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for falsy in (None, ""):
+                page = FakePage()
+                cm, state = make_pw(page)
+                fake_chat, calls = make_chat(
+                    [json.dumps({"action": "done",
+                                 "summary": "did the thing"})])
+                perf_mod._chat = fake_chat
+                pw_sync.sync_playwright = lambda: cm()
+                result = perform(task="do the thing", target=falsy,
+                                 max_actions=10, runs_root=tmp)
+                check(f"379 perform: falsy target={falsy!r} no goto",
+                      page.goto_calls == [], repr(page.goto_calls))
+                check(f"379 perform: falsy target={falsy!r} completed",
+                      result["status"] == "completed",
+                      str(result["status"]))
+                check(f"379 perform: falsy target={falsy!r} summary",
+                      result["summary"] == "did the thing",
+                      str(result["summary"]))
+                check(f"379 perform: falsy target={falsy!r} echoed",
+                      result["target"] == falsy, repr(result["target"]))
+                check(f"379 perform: falsy target={falsy!r} one chat call",
+                      len(calls) == 1, str(len(calls)))
+                check(f"379 perform: falsy target={falsy!r} browser closed",
+                      state["closed"] == [True], repr(state["closed"]))
+    finally:
+        perf_mod._chat = old_chat
+        perf_mod._model_config = old_cfg
+        perf_mod.ax_snapshot = old_ax
+        pw_sync.sync_playwright = old_pw
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
