@@ -2665,6 +2665,559 @@ def test_perform_cost_ceiling():
     check("cli flag defaults to unlimited", args_default.max_cost_usd == 0.0)
 
 
+def test_performer_contracts():
+    import base64
+    import time
+    import qaloop.perform as perf_mod
+    from qaloop.perform import Performer
+
+    png_bytes = b"\x89PNG\r\n\x1a\nperformer-contract-shot"
+
+    class FakeLocator:
+        def __init__(self, key, count=1):
+            self.key = key
+            self._count = count
+            self.calls = []
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return self._count
+
+        def click(self, timeout=None):
+            self.calls.append(("click", timeout))
+
+        def dblclick(self, timeout=None):
+            self.calls.append(("dblclick", timeout))
+
+        def scroll_into_view_if_needed(self, timeout=None):
+            self.calls.append(("scroll_into_view", timeout))
+
+        def fill(self, text, timeout=None):
+            self.calls.append(("fill", text, timeout))
+
+        def press(self, key, timeout=None):
+            self.calls.append(("press", key, timeout))
+
+        def select_option(self, value, timeout=None):
+            self.calls.append(("select_option", value, timeout))
+
+        def check(self, timeout=None):
+            self.calls.append(("check", timeout))
+
+        def uncheck(self, timeout=None):
+            self.calls.append(("uncheck", timeout))
+
+        def hover(self, timeout=None):
+            self.calls.append(("hover", timeout))
+
+        def wait_for(self, state=None, timeout=None):
+            self.calls.append(("wait_for", state, timeout))
+
+        def set_input_files(self, path, timeout=None):
+            self.calls.append(("set_input_files", path, timeout))
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.press_calls = []
+            self.type_calls = []
+
+        def press(self, key):
+            self.press_calls.append(key)
+
+        def type(self, text, delay=None):
+            self.type_calls.append((text, delay))
+
+    class FakeMouse:
+        def __init__(self):
+            self.wheel_calls = []
+
+        def wheel(self, dx, dy):
+            self.wheel_calls.append((dx, dy))
+
+    class FakePage:
+        def __init__(self):
+            self.url = "http://x/start"
+            self.handlers = {}
+            self.goto_calls = []
+            self.locators = {}
+            self.counts = {}
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse()
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        def title(self):
+            return "Contract Title"
+
+        def goto(self, url, timeout=None, wait_until=None):
+            self.goto_calls.append((url, timeout, wait_until))
+            self.url = url
+
+        def _loc(self, key):
+            if key not in self.locators:
+                self.locators[key] = FakeLocator(
+                    key, self.counts.get(key, 1))
+            return self.locators[key]
+
+        def set_count(self, key, n):
+            self.counts[key] = n
+            if key in self.locators:
+                self.locators[key]._count = n
+
+        def get_by_role(self, role, name=None):
+            return self._loc(("role", role, name))
+
+        def get_by_text(self, text):
+            return self._loc(("text", text))
+
+        def locator(self, css):
+            return self._loc(("css", css))
+
+        def screenshot(self, path=None, **kw):
+            with open(path, "wb") as f:
+                f.write(png_bytes)
+
+    class FakeConsoleMsg:
+        def __init__(self, type_, text):
+            self.type = type_
+            self.text = text
+
+    class FakeDialog:
+        def __init__(self, type_, message):
+            self.type = type_
+            self.message = message
+            self.dismissed = False
+
+        def dismiss(self):
+            self.dismissed = True
+
+    def expect_value_error(name, fn, *fragments):
+        try:
+            fn()
+            check(name, False, "no ValueError raised")
+        except ValueError as e:
+            check(name, all(f in str(e) for f in fragments), str(e))
+
+    real_sleep = time.sleep
+    old_ax = perf_mod.ax_snapshot
+    sleeps = []
+    time.sleep = lambda s: sleeps.append(s)
+    try:
+        with tempfile.TemporaryDirectory() as run_dir, \
+                tempfile.TemporaryDirectory() as upload_dir:
+            page = FakePage()
+            perf = Performer(page, run_dir, 25, seed=7,
+                             upload_dir=upload_dir)
+
+            # __init__: state defaults + handler registration.
+            check("performer init: defaults",
+                  perf.n == 0 and perf.console == [] and perf.dialogs == []
+                  and perf.allow_publish is False
+                  and perf.max_cost_usd == 0.0
+                  and perf.tokens_in == 0 and perf.tokens_out == 0)
+            check("performer init: handlers registered",
+                  set(page.handlers) == {"console", "pageerror", "dialog"},
+                  repr(sorted(page.handlers)))
+            check("performer init: dialog handler is _on_dialog",
+                  page.handlers["dialog"] == perf._on_dialog)
+
+            # Console handler: only errors, text truncated to 300.
+            page.handlers["console"](FakeConsoleMsg("warning", "ignored"))
+            check("console handler: non-error ignored", perf.console == [])
+            page.handlers["console"](FakeConsoleMsg("error", "x" * 350))
+            check("console handler: error kept, truncated to 300",
+                  perf.console == [{"type": "error", "text": "x" * 300}],
+                  repr(perf.console)[:200])
+            # Pageerror handler: appended as type pageerror, truncated.
+            page.handlers["pageerror"](Exception("y" * 350))
+            check("pageerror handler: appended truncated",
+                  perf.console[-1] == {"type": "pageerror",
+                                       "text": "y" * 300},
+                  repr(perf.console[-1])[:200])
+
+            # _on_dialog via the registered handler.
+            dlg = FakeDialog("confirm", "m" * 350)
+            page.handlers["dialog"](dlg)
+            check("dialog handler: records type: message truncated",
+                  perf.dialogs == ["confirm: " + "m" * 300],
+                  repr(perf.dialogs)[:200])
+            check("dialog handler: dismisses", dlg.dismissed is True)
+            perf.dialogs = []
+
+            # _pace: sleeps 0.25 + rng*0.5 (time.sleep stubbed).
+            sleeps.clear()
+            perf._pace()
+            check("pace: one sleep in [0.25, 0.75]",
+                  len(sleeps) == 1 and 0.25 <= sleeps[0] <= 0.75,
+                  repr(sleeps))
+
+            # Neutralize pacing for the act battery, counting calls so the
+            # PermissionError path (which skips _pace) is observable.
+            pace_calls = []
+            perf._pace = lambda: pace_calls.append(1)
+
+            # _ceiling_hit on real instances.
+            perf2 = Performer(FakePage(), run_dir, 10, max_cost_usd=10.0)
+            check("ceiling: no estimate basis -> False",
+                  perf2._ceiling_hit(0.0, 0.0) is False)
+            check("ceiling: negative estimate -> False",
+                  perf2._ceiling_hit(9.0, -1.0) is False)
+            check("ceiling: under -> False",
+                  perf2._ceiling_hit(5.0, 4.0) is False)
+            check("ceiling: exactly at -> False",
+                  perf2._ceiling_hit(5.0, 5.0) is False)
+            check("ceiling: over -> True",
+                  perf2._ceiling_hit(5.0, 6.0) is True)
+            check("ceiling: unlimited (max 0) -> False",
+                  perf._ceiling_hit(100.0, 100.0) is False)
+
+            # _resolve: success per target kind + all ValueError branches.
+            loc_role = perf._resolve({"role": "button", "name": "Save"})
+            check("resolve: role returns locator",
+                  loc_role is page.locators[("role", "button", "Save")])
+            check("resolve: text returns locator",
+                  perf._resolve({"text": "Hello"})
+                  is page.locators[("text", "Hello")])
+            check("resolve: css returns locator",
+                  perf._resolve({"css": "#a"})
+                  is page.locators[("css", "#a")])
+            expect_value_error(
+                "resolve: non-dict target rejected",
+                lambda: perf._resolve("oops"), "target must be an object")
+            expect_value_error(
+                "resolve: empty target rejected",
+                lambda: perf._resolve({}),
+                "target needs role(+name), text, or css")
+            page.set_count(("role", "button", "Ghost"), 0)
+            expect_value_error(
+                "resolve: zero matches rejected",
+                lambda: perf._resolve({"role": "button", "name": "Ghost"}),
+                "no element matches")
+            page.set_count(("role", "button", "Ghost"), 1)
+            page.set_count(("css", ".dup"), 3)
+            expect_value_error(
+                "resolve: multiple matches names the count",
+                lambda: perf._resolve({"css": ".dup"}),
+                "3 elements match", "disambiguate")
+            page.set_count(("css", ".dup"), 1)
+
+            # _guard via direct calls (act only guards click/dblclick).
+            for action_name in ("click", "dblclick", "press", "check"):
+                try:
+                    perf._guard(action_name, {"name": "Delete account"})
+                    check(f"guard: destructive blocked on {action_name}",
+                          False)
+                except PermissionError:
+                    check(f"guard: destructive blocked on {action_name}",
+                          True)
+            try:
+                perf._guard("click", {"name": "Publish"})
+                check("guard: publish blocked without allow_publish", False)
+            except PermissionError:
+                check("guard: publish blocked without allow_publish", True)
+            try:
+                perf._guard("click", {"text": "Share this"})
+                check("guard: publish via text label blocked", False)
+            except PermissionError:
+                check("guard: publish via text label blocked", True)
+            perf_allow = Performer(FakePage(), run_dir, 10,
+                                   allow_publish=True)
+            try:
+                perf_allow._guard("click", {"name": "Publish"})
+                check("guard: publish allowed with allow_publish", True)
+            except PermissionError:
+                check("guard: publish allowed with allow_publish", False)
+            try:
+                perf._guard("click", {"name": "Save"})
+                perf._guard("click", None)
+                check("guard: benign label and no target allowed", True)
+            except PermissionError:
+                check("guard: benign label and no target allowed", False)
+
+            # act(): navigate.
+            n0 = perf.n
+            out = perf.act({"action": "navigate", "url": "http://x/next"})
+            check("act navigate: observation", out == "navigated to http://x/next",
+                  out)
+            check("act navigate: goto call recorded",
+                  page.goto_calls[-1] == ("http://x/next", 25000,
+                                          "domcontentloaded"),
+                  repr(page.goto_calls))
+            check("act navigate: counter +1, paced",
+                  perf.n == n0 + 1 and len(pace_calls) == 1,
+                  f"n={perf.n} pace={len(pace_calls)}")
+
+            # act(): click.
+            t_save = {"role": "button", "name": "Save"}
+            out = perf.act({"action": "click", "target": t_save})
+            loc_save = page.locators[("role", "button", "Save")]
+            check("act click: observation", out == f"clicked {t_save}", out)
+            check("act click: locator calls",
+                  loc_save.calls == [("scroll_into_view", 5000),
+                                     ("click", 10000)],
+                  repr(loc_save.calls))
+
+            # act(): dblclick.
+            t_docs = {"role": "link", "name": "Docs"}
+            out = perf.act({"action": "dblclick", "target": t_docs})
+            loc_docs = page.locators[("role", "link", "Docs")]
+            check("act dblclick: observation",
+                  out == f"dblclicked {t_docs}", out)
+            check("act dblclick: locator calls",
+                  loc_docs.calls == [("scroll_into_view", 5000),
+                                     ("dblclick", 10000)],
+                  repr(loc_docs.calls))
+
+            # act(): destructive click raises PermissionError out of act,
+            # counter still increments, _pace not reached.
+            n0, pace0 = perf.n, len(pace_calls)
+            try:
+                perf.act({"action": "click",
+                          "target": {"role": "button",
+                                     "name": "Delete account"}})
+                check("act destructive click: PermissionError propagates",
+                      False)
+            except PermissionError:
+                check("act destructive click: PermissionError propagates",
+                      True)
+            check("act destructive click: counter +1, no pace",
+                  perf.n == n0 + 1 and len(pace_calls) == pace0,
+                  f"n={perf.n} pace={len(pace_calls)}")
+
+            # act(): fill short text via keyboard, long text via locator.
+            t_email = {"role": "textbox", "name": "Email"}
+            out = perf.act({"action": "fill", "target": t_email,
+                            "text": "a@b.c"})
+            loc_email = page.locators[("role", "textbox", "Email")]
+            check("act fill short: observation",
+                  out == f"filled {t_email}", out)
+            check("act fill short: select-all pressed",
+                  page.keyboard.press_calls == ["ControlOrMeta+a"],
+                  repr(page.keyboard.press_calls))
+            check("act fill short: typed with human delay",
+                  len(page.keyboard.type_calls) == 1
+                  and page.keyboard.type_calls[0][0] == "a@b.c"
+                  and 30 <= page.keyboard.type_calls[0][1] <= 69,
+                  repr(page.keyboard.type_calls))
+            check("act fill short: locator clicked, not filled",
+                  ("click", 5000) in loc_email.calls
+                  and not any(c[0] == "fill" for c in loc_email.calls),
+                  repr(loc_email.calls))
+            t_bio = {"role": "textbox", "name": "Bio"}
+            long_text = "z" * 81
+            out = perf.act({"action": "fill", "target": t_bio,
+                            "text": long_text})
+            loc_bio = page.locators[("role", "textbox", "Bio")]
+            check("act fill long: observation", out == f"filled {t_bio}",
+                  out)
+            check("act fill long: locator fill used",
+                  ("fill", long_text, 10000) in loc_bio.calls,
+                  repr(loc_bio.calls))
+            check("act fill long: keyboard type not used again",
+                  len(page.keyboard.type_calls) == 1)
+
+            # act(): press with and without target.
+            t_submit = {"role": "button", "name": "Submit"}
+            out = perf.act({"action": "press", "target": t_submit,
+                            "key": "Enter"})
+            loc_submit = page.locators[("role", "button", "Submit")]
+            check("act press with target: observation",
+                  out == "pressed Enter", out)
+            check("act press with target: locator press",
+                  ("press", "Enter", 10000) in loc_submit.calls,
+                  repr(loc_submit.calls))
+            out = perf.act({"action": "press", "key": "Escape"})
+            check("act press bare: observation", out == "pressed Escape",
+                  out)
+            check("act press bare: keyboard press",
+                  page.keyboard.press_calls[-1] == "Escape",
+                  repr(page.keyboard.press_calls))
+
+            # act(): select / check / uncheck.
+            t_city = {"role": "combobox", "name": "City"}
+            out = perf.act({"action": "select", "target": t_city,
+                            "value": "sg"})
+            loc_city = page.locators[("role", "combobox", "City")]
+            check("act select: observation", out == f"select {t_city}", out)
+            check("act select: locator call",
+                  ("select_option", "sg", 10000) in loc_city.calls,
+                  repr(loc_city.calls))
+            t_rem = {"role": "checkbox", "name": "Remember me"}
+            out = perf.act({"action": "check", "target": t_rem})
+            loc_rem = page.locators[("role", "checkbox", "Remember me")]
+            check("act check: observation", out == f"check {t_rem}", out)
+            check("act check: locator call",
+                  ("check", 10000) in loc_rem.calls, repr(loc_rem.calls))
+            t_news = {"role": "checkbox", "name": "Newsletter"}
+            out = perf.act({"action": "uncheck", "target": t_news})
+            loc_news = page.locators[("role", "checkbox", "Newsletter")]
+            check("act uncheck: observation", out == f"uncheck {t_news}",
+                  out)
+            check("act uncheck: locator call",
+                  ("uncheck", 10000) in loc_news.calls,
+                  repr(loc_news.calls))
+
+            # act(): hover.
+            t_file = {"role": "menuitem", "name": "File"}
+            out = perf.act({"action": "hover", "target": t_file})
+            loc_file = page.locators[("role", "menuitem", "File")]
+            check("act hover: observation", out == "hovered", out)
+            check("act hover: locator call",
+                  ("hover", 10000) in loc_file.calls, repr(loc_file.calls))
+
+            # act(): scroll with target, then by direction (wheel sign).
+            t_bottom = {"role": "button", "name": "Bottom"}
+            out = perf.act({"action": "scroll", "target": t_bottom})
+            loc_bottom = page.locators[("role", "button", "Bottom")]
+            check("act scroll target: observation", out == "scrolled", out)
+            check("act scroll target: scroll_into_view, no wheel",
+                  loc_bottom.calls == [("scroll_into_view", 5000)]
+                  and page.mouse.wheel_calls == [],
+                  repr((loc_bottom.calls, page.mouse.wheel_calls)))
+            out = perf.act({"action": "scroll", "direction": "down"})
+            check("act scroll down: wheel (0, 600)",
+                  out == "scrolled"
+                  and page.mouse.wheel_calls[-1] == (0, 600),
+                  repr(page.mouse.wheel_calls))
+            out = perf.act({"action": "scroll", "direction": "up"})
+            check("act scroll up: wheel (0, -600)",
+                  out == "scrolled"
+                  and page.mouse.wheel_calls[-1] == (0, -600),
+                  repr(page.mouse.wheel_calls))
+
+            # act(): wait via text target / resolved target / bare ms.
+            out = perf.act({"action": "wait", "target": {"text": "Welcome"}})
+            loc_welcome = page.locators[("text", "Welcome")]
+            check("act wait text: observation", out == "wait satisfied",
+                  out)
+            check("act wait text: first.wait_for visible/15000",
+                  ("wait_for", "visible", 15000) in loc_welcome.calls,
+                  repr(loc_welcome.calls))
+            t_ready = {"role": "button", "name": "Ready"}
+            out = perf.act({"action": "wait", "target": t_ready,
+                            "state": "hidden"})
+            loc_ready = page.locators[("role", "button", "Ready")]
+            check("act wait resolved: wait_for hidden/15000",
+                  out == "wait satisfied"
+                  and ("wait_for", "hidden", 15000) in loc_ready.calls,
+                  repr(loc_ready.calls))
+            sleeps.clear()
+            out = perf.act({"action": "wait", "ms": 250})
+            check("act wait bare ms: sleeps ms/1000",
+                  out == "wait satisfied" and sleeps == [0.25],
+                  repr(sleeps))
+            sleeps.clear()
+            out = perf.act({"action": "wait"})
+            check("act wait bare default: sleeps 1.0",
+                  out == "wait satisfied" and sleeps == [1.0],
+                  repr(sleeps))
+
+            # act(): upload inside the upload dir vs outside (FAILED obs).
+            up_path = os.path.join(upload_dir, "resume.txt")
+            t_up = {"css": "#resume"}
+            out = perf.act({"action": "upload", "target": t_up,
+                            "path": up_path})
+            loc_up = page.locators[("css", "#resume")]
+            check("act upload inside: observation",
+                  out == "uploaded resume.txt", out)
+            check("act upload inside: set_input_files call",
+                  ("set_input_files", up_path, 10000) in loc_up.calls,
+                  repr(loc_up.calls))
+            n0 = perf.n
+            out = perf.act({"action": "upload", "target": t_up,
+                            "path": "/etc/hostname"})
+            check("act upload outside: FAILED ValueError observation",
+                  out.startswith("FAILED: ValueError:")
+                  and "outside the upload dir" in out, out)
+            check("act upload outside: counter +1", perf.n == n0 + 1)
+
+            # act(): screenshot writes perform-NN.png, sets _last_shot_b64.
+            out = perf.act({"action": "screenshot"})
+            shot_name = f"perform-{perf.n:02d}.png"
+            shot_path = os.path.join(run_dir, "steps", shot_name)
+            check("act screenshot: observation",
+                  out == f"screenshot saved ({shot_name})", out)
+            check("act screenshot: file written under run_dir/steps",
+                  os.path.exists(shot_path)
+                  and open(shot_path, "rb").read() == png_bytes)
+            check("act screenshot: _last_shot_b64 set from file bytes",
+                  getattr(perf, "_last_shot_b64", None)
+                  == base64.b64encode(png_bytes).decode())
+
+            # act(): console returns the seeded JSON tail (last 10).
+            perf.console = [{"type": "error", "text": f"e{i}"}
+                            for i in range(12)]
+            out = perf.act({"action": "console"})
+            check("act console: last-10 JSON tail",
+                  out == json.dumps(perf.console[-10:],
+                                    ensure_ascii=False)
+                  and json.loads(out) == perf.console[-10:], out[:200])
+
+            # act(): unknown action -> FAILED ValueError observation.
+            n0 = perf.n
+            out = perf.act({"action": "frobnicate"})
+            check("act unknown: FAILED ValueError observation",
+                  out == "FAILED: ValueError: unknown action 'frobnicate'",
+                  out)
+            check("act unknown: counter +1", perf.n == n0 + 1)
+
+            # act(): unresolvable target -> FAILED observation, no raise.
+            page.set_count(("role", "button", "Ghost"), 0)
+            out = perf.act({"action": "click",
+                            "target": {"role": "button", "name": "Ghost"}})
+            check("act click zero matches: FAILED observation",
+                  out.startswith("FAILED: ValueError: no element matches"),
+                  out)
+            page.set_count(("role", "button", "Ghost"), 1)
+
+            # observe(): header, dialogs surfaced once (last 3), ax text.
+            ax_calls = []
+
+            def fake_ax(page_, max_nodes=400):
+                ax_calls.append(max_nodes)
+                return "AX SNAP TEXT"
+
+            perf_mod.ax_snapshot = fake_ax
+            perf.dialogs = ["alert: one", "confirm: two",
+                            "alert: three", "confirm: four"]
+            obs = perf.observe()
+            check("observe: URL/Title header",
+                  obs.startswith("URL: http://x/next\n"
+                                 "Title: Contract Title"), obs[:200])
+            check("observe: dialogs last-3 surfaced",
+                  "DIALOGS (auto-dismissed): confirm: two | "
+                  "alert: three | confirm: four" in obs, obs[:400])
+            check("observe: oldest dialog not surfaced",
+                  "alert: one" not in obs, obs[:400])
+            check("observe: dialogs cleared after surfacing",
+                  perf.dialogs == [])
+            check("observe: ax snapshot appended, max_nodes=400",
+                  obs.split("\n")[-1] == "AX SNAP TEXT"
+                  and ax_calls == [400], repr(ax_calls))
+            obs2 = perf.observe()
+            check("observe: dialogs surface only once",
+                  "DIALOGS" not in obs2, obs2[:300])
+
+            # observe(): ax failure fallback.
+            def boom_ax(page_, max_nodes=400):
+                raise RuntimeError("ax boom")
+
+            perf_mod.ax_snapshot = boom_ax
+            obs3 = perf.observe()
+            check("observe: ax failure fallback text",
+                  "(ax snapshot failed: ax boom)" in obs3, obs3[:300])
+            check("observe: fallback keeps header",
+                  obs3.startswith("URL: http://x/next\n"
+                                  "Title: Contract Title"), obs3[:200])
+    finally:
+        time.sleep = real_sleep
+        perf_mod.ax_snapshot = old_ax
+
+
 def test_services_validation():
     from qaloop.spec import _validate_services, SpecError
     good = _validate_services(
