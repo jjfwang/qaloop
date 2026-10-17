@@ -15543,6 +15543,43 @@ def test_issue_375_cli_branch_coverage():
         cli_mod.write_report = real_write_report
 
 
+def test_issue_377_flow_services_explicit_url():
+    """Issue #377: pin the explicit-url branch side in flow_services.
+
+    When a service spec supplies an explicit url, env.py line 206
+    (if url and not s.get("url")) takes its falsy side, so the
+    210-212 origin rewrite must not fire: the exported
+    QALOOP_SERVICE_<NAME>_URL is the explicit url verbatim,
+    including its path, not the wait-derived origin.
+    """
+    import socket
+    from qaloop.env import flow_services
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    spec = [{"name": "deep", "command": f"python3 -m http.server {port}",
+             "cwd": None, "env": {}, "wait": {"port": port},
+             "timeout_s": 15.0, "url": "http://example.test/deep/path"}]
+    with tempfile.TemporaryDirectory() as run_dir:
+        ctx = flow_services(spec, os.getcwd(), run_dir)
+        ctx.__enter__()
+        try:
+            check("377 explicit service URL exported verbatim",
+                  os.environ.get("QALOOP_SERVICE_DEEP_URL") ==
+                  "http://example.test/deep/path",
+                  str(os.environ.get("QALOOP_SERVICE_DEEP_URL")))
+            check("377 explicit service PORT exported",
+                  os.environ.get("QALOOP_SERVICE_DEEP_PORT") == str(port),
+                  str(os.environ.get("QALOOP_SERVICE_DEEP_PORT")))
+        finally:
+            ctx.__exit__(None, None, None)
+        check("377 explicit service URL cleaned up",
+              "QALOOP_SERVICE_DEEP_URL" not in os.environ)
+        check("377 explicit service PORT cleaned up",
+              "QALOOP_SERVICE_DEEP_PORT" not in os.environ)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
