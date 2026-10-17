@@ -2550,6 +2550,235 @@ def test_screenshot_matches_selector_capture():
               res[0].detail)
 
 
+def test_issue_381_runner_branch_coverage():
+    """Issue #381: pin runner.py's 3 remaining untaken branch sides.
+
+    (a) screenshot_matches with an ABSOLUTE baseline path: the
+    baseline_dir join (runner.py 906->908) must not fire, so the
+    comparison uses the absolute path verbatim. A different image is
+    planted at baseline_dir/<basename> so a wrong join would fail.
+    (b) An assertion key matching no branch of the _check_assertions
+    elif chain (945->595) appends no AssertionResult; a following
+    noop still appends exactly its own result.
+    (c) A step action raising a non-SeedRequestError in the run_flow
+    attempt loop (1192->1201) leaves seed_status None while the step
+    records failed with the exception named in the error.
+    """
+    from qaloop.runner import _check_assertions, run_flow
+    from qaloop.spec import Step, load_spec
+    from PIL import Image
+
+    def make_step(items):
+        return Step(index=0, phase="steps", name="t", op=None, params=None,
+                    expect={}, expect_items=items,
+                    continue_on_fail=False, timeout_ms=None, raw={})
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page, self.selector = page, selector
+
+        def screenshot(self, path):
+            Image.open(self.page.element_png).save(path)
+
+    class FakePage:
+        def __init__(self, element_png):
+            self.element_png = element_png
+
+        def wait_for_selector(self, selector, state=None, timeout=None):
+            pass
+
+        def locator(self, selector):
+            return FakeLocator(self, selector)
+
+        def screenshot(self, path):
+            Image.open(self.element_png).save(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        element_png = os.path.join(d, "element.png")
+        Image.new("RGB", (60, 30), (10, 200, 60)).save(element_png)
+        abs_dir = os.path.join(d, "abs")
+        os.makedirs(abs_dir)
+        abs_baseline = os.path.join(abs_dir, "shot.png")
+        Image.open(element_png).save(abs_baseline)
+        base_dir = os.path.join(d, "base")
+        os.makedirs(base_dir)
+        # Wrong-join decoy: baseline_dir/<basename> holds a DIFFERENT
+        # image, so joining instead of using the absolute path fails.
+        Image.new("RGB", (60, 30), (200, 10, 60)).save(
+            os.path.join(base_dir, "shot.png"))
+        run_dir = os.path.join(d, "run")
+        page = FakePage(element_png)
+        res = _check_assertions(
+            page, make_step([("screenshot_matches",
+                              {"baseline": abs_baseline,
+                               "selector": "#out"})]),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        check("381 absolute baseline passes verbatim",
+              len(res) == 1 and res[0].passed, str(res))
+        check("381 absolute baseline detail is zero diff",
+              res[0].detail == "rms_diff=0.0000 max_diff=0.0200",
+              res[0].detail)
+        # (b) unknown assertion key fall-through
+        res = _check_assertions(
+            page, make_step([("bogus_unknown_key", True),
+                             ("noop", True)]),
+            None, baseline_dir=base_dir, run_dir=run_dir)
+        check("381 unknown key appends no result",
+              len(res) == 1, str(res))
+        check("381 following noop is the only result",
+              res[0].name == "noop" and res[0].passed
+              and res[0].detail == "intentional no-op", str(res[0]))
+
+    # (c) non-seed step failure leaves seed_status None. Driven first
+    # through the fake sync_playwright seam (the issue-96 precedent in
+    # test_seed_http_headers_and_status): a real Playwright run switches
+    # greenlets and coverage cannot trace the attempt-loop arcs, so the
+    # branch proof lives here; the real-browser drive below it proves
+    # the same behavior end to end.
+    import playwright.sync_api as pw_sync
+
+    class ClickFakePage:
+        url = "http://x/"
+
+        def on(self, event, handler):
+            pass
+
+        def evaluate(self, js):
+            return None
+
+        def goto(self, url, **kw):
+            pass
+
+        def click(self, selector, timeout=None):
+            raise TimeoutError(
+                f"Locator.click: Timeout {timeout}ms exceeded: "
+                f"{selector} not found")
+
+    class FakeCtx:
+        def new_page(self):
+            return ClickFakePage()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            return FakeCtx()
+
+        def close(self):
+            pass
+
+    class FakePW:
+        class chromium:
+            @staticmethod
+            def launch(**kw):
+                return FakeBrowser()
+
+    class FakePWCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *a):
+            return False
+
+    old_pw = pw_sync.sync_playwright
+    pw_sync.sync_playwright = lambda: FakePWCM()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            flow_path = os.path.join(d, "fake-flow.yaml")
+            with open(flow_path, "w") as f:
+                f.write("name: issue-381-fake-nonseed\n"
+                        "target: http://x\n"
+                        "steps:\n"
+                        "  - name: click missing\n"
+                        "    click: '#never-there'\n"
+                        "    timeout_ms: 300\n"
+                        "artifacts: {screenshot: none, ax_snapshot: none, "
+                        "trace: false}\n")
+            spec = load_spec(flow_path)
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(spec, run_dir=run_dir)
+                check("381 fake non-seed run fails",
+                      result.status == "failed", result.status)
+                step = result.steps[0]
+                check("381 fake non-seed step failed",
+                      step.status == "failed", step.status)
+                check("381 fake non-seed error names TimeoutError",
+                      "TimeoutError" in step.error, step.error)
+                check("381 fake non-seed seed_status is None",
+                      step.seed_status is None, str(step.seed_status))
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as fh:
+                    data = json.load(fh)
+                check("381 fake run.json seed_status null",
+                      data["steps"][0]["seed_status"] is None,
+                      str(data["steps"][0].get("seed_status")))
+    finally:
+        pw_sync.sync_playwright = old_pw
+
+    # (c) non-seed step failure leaves seed_status None (real browser)
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        have_pw = True
+    except ImportError:
+        have_pw = False
+    if not have_pw or not os.path.exists(exe):
+        check("381 non-seed failure skipped (no browser)", True)
+        return
+    import socket
+    import subprocess
+    import time
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "index.html"), "w") as f:
+            f.write("<html><body><h1>381</h1></body></html>")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            flow = (f"name: issue-381-nonseed\n"
+                    f"target: http://127.0.0.1:{port}\n"
+                    "steps:\n"
+                    "  - name: click missing\n"
+                    "    click: '#never-there'\n"
+                    "    timeout_ms: 300\n"
+                    "artifacts: {screenshot: none, ax_snapshot: none, "
+                    "trace: false}\n")
+            flow_path = os.path.join(d, "flow.yaml")
+            with open(flow_path, "w") as f:
+                f.write(flow)
+            spec = load_spec(flow_path)
+            with tempfile.TemporaryDirectory() as run_dir:
+                result = run_flow(spec, run_dir=run_dir,
+                                  executable_path=exe)
+                check("381 non-seed run fails",
+                      result.status == "failed", result.status)
+                step = result.steps[0]
+                check("381 non-seed step failed",
+                      step.status == "failed", step.status)
+                check("381 non-seed error names TimeoutError",
+                      "TimeoutError" in step.error, step.error)
+                check("381 non-seed seed_status is None",
+                      step.seed_status is None, str(step.seed_status))
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as fh:
+                    data = json.load(fh)
+                check("381 run.json seed_status null",
+                      data["steps"][0]["seed_status"] is None,
+                      str(data["steps"][0].get("seed_status")))
+        finally:
+            srv.terminate()
+            srv.wait()
+
+
 def test_ax_assertion_includes_hidden():
     """Issue #216: ax role locators must resolve hidden elements.
 
