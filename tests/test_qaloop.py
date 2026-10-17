@@ -16187,6 +16187,164 @@ def test_issue_385_smoke_corpus_execute():
             for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_387_fake_model_perform_proofs():
+    """Issue #387: execute the two fake-model perform proofs end to end.
+    demo/fake_model.py (signup) and demo/fake_model_upload.py (upload) are
+    the canned-model servers behind the perform proofs, but no test ran
+    them, so a rotted SCRIPT entry or demo page would surface nowhere.
+    This test boots the proof server plus each fake in turn (both fakes
+    share port 8932, so they are sequenced, never simultaneous), points
+    perform() at the fake via the QALOOP_MODEL_* env, and pins status,
+    the verbatim done summary, and the action count (transcript length
+    including the terminal done record: 6 for signup, 3 for upload)."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop.perform import perform
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    exp_signup_summary = (
+        "Loaded the mocked greeting, filled the signup form as Maya "
+        "(maya@example.com), submitted, and confirmed 'Welcome, Maya!' "
+        "is visible.")
+    exp_upload_summary = (
+        "Uploaded upload-fixture.txt through the Resume file input and "
+        "confirmed its name is shown on the page.")
+
+    def perform_mismatch(result, exp_status, exp_summary, exp_count):
+        if result.get("status") != exp_status: return (
+            f"status: expected {exp_status}, got {result.get('status')}")
+        if result.get("summary") != exp_summary: return (
+            f"summary: expected {exp_summary!r}, "
+            f"got {result.get('summary')!r}")
+        if result.get("action_count") != exp_count: return (
+            f"action_count: expected {exp_count}, "
+            f"got {result.get('action_count')}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_greeting():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8933/api/greeting", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    synthetic = {"status": "completed", "summary": exp_signup_summary,
+                 "action_count": 6}
+    probe = perform_mismatch(synthetic, "failed", exp_signup_summary, 6)
+    check("387 fake-model proofs: corrupted status caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_mismatch(synthetic, "completed", "wrong summary", 6)
+    check("387 fake-model proofs: corrupted summary caught, names field",
+          probe is not None and "summary" in probe, probe or "")
+    probe = perform_mismatch(synthetic, "completed", exp_signup_summary, 99)
+    check("387 fake-model proofs: corrupted count caught, names field",
+          probe is not None and "action_count" in probe, probe or "")
+    check("387 fake-model proofs: exact expectations return no mismatch",
+          perform_mismatch(synthetic, "completed", exp_signup_summary,
+                           6) is None)
+    if not os.path.exists(exe): check("387 fake-model perform proofs execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_MODEL_BASE_URL", "QALOOP_MODEL_API_KEY",
+                "QALOOP_MODEL_NAME")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    proof = None
+    fake = None
+    fake_upload = None
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            os.environ["QALOOP_MODEL_BASE_URL"] = "http://127.0.0.1:8932"
+            os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-387"
+            os.environ["QALOOP_MODEL_NAME"] = "fake-model"
+            occupied_8933 = not port_free(8933)
+            occupied_8932 = not port_free(8932)
+            check("387 fake-model proofs: port 8933 not already in use",
+                  not occupied_8933, "stale server already on 8933")
+            check("387 fake-model proofs: port 8932 not already in use",
+                  not occupied_8932, "stale server already on 8932")
+            check("387 fake-model proofs: no stale proof server answering",
+                  not poll_greeting())
+            if not occupied_8933 and not occupied_8932:
+                proof = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("387 fake-model proofs: proof server ready on 8933",
+                      ready)
+                if ready:
+                    fake = subprocess.Popen(
+                        [sys.executable, "demo/fake_model.py"], cwd=root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    deadline = time.time() + 10
+                    fake_ready = False
+                    while not fake_ready and time.time() < deadline:
+                        fake_ready = not port_free(8932)
+                        time.sleep(0 if fake_ready else 0.1)
+                    check("387 fake-model proofs: fake model ready on 8932",
+                          fake_ready)
+                    result = perform(
+                        task="Sign up as Maya using the greeting signup "
+                             "form",
+                        target="http://127.0.0.1:8933/demo/mock-demo.html",
+                        max_actions=10, executable_path=exe, runs_root=d)
+                    mismatch = perform_mismatch(
+                        result, "completed", exp_signup_summary, 6)
+                    check("387 fake-model proofs: signup proof completes "
+                          "with pinned summary and 6 actions",
+                          mismatch is None, mismatch or "")
+                    fake.terminate()
+                    fake.wait()
+                    fake = None
+                    check("387 fake-model proofs: port 8932 free after "
+                          "signup fake stops", port_free(8932))
+                    fake_upload = subprocess.Popen(
+                        [sys.executable, "demo/fake_model_upload.py",
+                         os.path.join(root, "demo", "upload-fixture.txt")],
+                        cwd=root, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    deadline = time.time() + 10
+                    fake_ready = False
+                    while not fake_ready and time.time() < deadline:
+                        fake_ready = not port_free(8932)
+                        time.sleep(0 if fake_ready else 0.1)
+                    check("387 fake-model proofs: upload fake ready on 8932",
+                          fake_ready)
+                    result = perform(
+                        task="Upload the resume fixture file",
+                        target="http://127.0.0.1:8933/demo/upload-demo.html",
+                        max_actions=10, executable_path=exe, runs_root=d,
+                        upload_dir=os.path.join(root, "demo"))
+                    mismatch = perform_mismatch(
+                        result, "completed", exp_upload_summary, 3)
+                    check("387 fake-model proofs: upload proof completes "
+                          "with pinned summary and 3 actions",
+                          mismatch is None, mismatch or "")
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            fake_upload.terminate() if fake_upload is not None else None
+            fake_upload.wait() if fake_upload is not None else None
+            proof.terminate() if proof is not None else None
+            proof.wait() if proof is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
