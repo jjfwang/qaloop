@@ -16553,6 +16553,211 @@ def test_issue_389_untagged_corpus_execute():
             for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_391_game_socket_fixture():
+    """Issue #391: pin the game socket fixture protocol with an executing
+    test. fixtures/game_socket_fixture.py is the deterministic WebSocket
+    stand-in for the Stone Age game server (HELLO -> WELCOME, then one
+    verbatim SNAPSHOT in each snapshot mode), but no test ran it, so a
+    rotted WELCOME field, a drifted snapshot constant, or a socket that
+    dies on an unknown frame would surface nowhere. Expected snapshots
+    are loaded from the fixture module itself so expectations cannot
+    drift from the constants. Each of the four modes is booted on its
+    own guarded free port; the no-snapshot connection also proves
+    resilience: a non-JSON frame and an unknown-kind message are
+    ignored and a second HELLO is still answered with a WELCOME."""
+    import copy
+    import importlib.util
+    import socket
+    import subprocess
+    import time
+
+    from websockets.sync.client import connect
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fixture_path = os.path.join(root, "fixtures",
+                                "game_socket_fixture.py")
+    spec = importlib.util.spec_from_file_location(
+        "game_socket_fixture_391", fixture_path)
+    fixture_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture_mod)
+    exp_welcome = {
+        "kind": "WELCOME", "disposition": "new",
+        "resumeAnchor": {"sessionId": "qa-fixture-session",
+                         "signature": "qa-fixture"}}
+    exp_snapshots = {
+        None: None,
+        "camp-empty": fixture_mod.CAMP_EMPTY_SNAPSHOT,
+        "camp-play-aid": fixture_mod.CAMP_PLAY_AID_SNAPSHOT,
+        "camp-comfort-item": fixture_mod.CAMP_COMFORT_ITEM_SNAPSHOT}
+
+    def occupancy_of(snap): return next((e.get("campOccupancy") for e in (snap or {}).get("projection", {}).get("entities", []) if e.get("kind") == "pet"), None)
+
+    def fixture_mismatch(welcome, snapshot, exp_welcome, exp_snapshot):
+        if welcome is None: return "welcome: missing welcome"
+        if welcome.get("kind") != exp_welcome.get("kind"): return (
+            f"kind: expected {exp_welcome.get('kind')}, "
+            f"got {welcome.get('kind')}")
+        if welcome.get("disposition") != exp_welcome.get("disposition"): return (
+            f"disposition: expected {exp_welcome.get('disposition')}, "
+            f"got {welcome.get('disposition')}")
+        if welcome.get("resumeAnchor") != exp_welcome.get("resumeAnchor"): return (
+            f"resumeAnchor: expected {exp_welcome.get('resumeAnchor')!r}, "
+            f"got {welcome.get('resumeAnchor')!r}")
+        if exp_snapshot is None and snapshot is not None: return (
+            f"snapshot: expected none, got {snapshot!r}")
+        if exp_snapshot is not None and snapshot is None: return (
+            "snapshot: missing snapshot")
+        if exp_snapshot is not None and snapshot != exp_snapshot:
+            exp_occ = occupancy_of(exp_snapshot)
+            act_occ = occupancy_of(snapshot)
+            if exp_occ != act_occ: return (
+                f"campOccupancy occupancy: expected {exp_occ!r}, "
+                f"got {act_occ!r}")
+            return f"snapshot: expected {exp_snapshot!r}, got {snapshot!r}"
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    camp_empty = fixture_mod.CAMP_EMPTY_SNAPSHOT
+    camp_play_aid = fixture_mod.CAMP_PLAY_AID_SNAPSHOT
+    check("391 fixture: exact expectations return no mismatch",
+          fixture_mismatch(exp_welcome, camp_empty, exp_welcome,
+                           camp_empty) is None)
+    check("391 fixture: exact no-snapshot expectations return no mismatch",
+          fixture_mismatch(exp_welcome, None, exp_welcome, None) is None)
+    probe = fixture_mismatch(None, None, exp_welcome, None)
+    check("391 fixture: missing welcome caught, names field",
+          probe is not None and "welcome" in probe, probe or "")
+    bad_welcome = copy.deepcopy(exp_welcome)
+    bad_welcome["kind"] = "GOODBYE"
+    probe = fixture_mismatch(exp_welcome, None, bad_welcome, None)
+    check("391 fixture: corrupted kind caught, names field",
+          probe is not None and "kind" in probe, probe or "")
+    bad_welcome = copy.deepcopy(exp_welcome)
+    bad_welcome["disposition"] = "resumed"
+    probe = fixture_mismatch(exp_welcome, None, bad_welcome, None)
+    check("391 fixture: wrong disposition caught, names field",
+          probe is not None and "disposition" in probe, probe or "")
+    bad_welcome = copy.deepcopy(exp_welcome)
+    bad_welcome["resumeAnchor"] = {"sessionId": "other",
+                                    "signature": "qa-fixture"}
+    probe = fixture_mismatch(exp_welcome, None, bad_welcome, None)
+    check("391 fixture: corrupted resumeAnchor caught, names field",
+          probe is not None and "resumeAnchor" in probe, probe or "")
+    probe = fixture_mismatch(exp_welcome, camp_empty, exp_welcome, None)
+    check("391 fixture: unexpected snapshot caught, names field",
+          probe is not None and "snapshot" in probe, probe or "")
+    probe = fixture_mismatch(exp_welcome, None, exp_welcome, camp_empty)
+    check("391 fixture: missing snapshot caught, names field",
+          probe is not None and "snapshot" in probe, probe or "")
+    bad_snapshot = copy.deepcopy(camp_play_aid)
+    bad_snapshot["projection"]["entities"][1]["campOccupancy"] = {
+        "camp.play-training.slot-a": "play-aid:wrong"}
+    probe = fixture_mismatch(exp_welcome, camp_play_aid, exp_welcome,
+                             bad_snapshot)
+    check("391 fixture: wrong occupancy value caught, names field",
+          probe is not None and "occupancy" in probe.lower(),
+          probe or "")
+    bad_snapshot = copy.deepcopy(camp_empty)
+    bad_snapshot["tick"] = 99
+    probe = fixture_mismatch(exp_welcome, camp_empty, exp_welcome,
+                             bad_snapshot)
+    check("391 fixture: corrupted snapshot caught, names field",
+          probe is not None and "snapshot" in probe, probe or "")
+
+    modes = [(None, 8941), ("camp-empty", 8942),
+             ("camp-play-aid", 8943), ("camp-comfort-item", 8944)]
+    procs = []
+    try:
+        for mode_name, port in modes:
+            exp_snapshot = exp_snapshots[mode_name]
+            label = mode_name or "none"
+            occupied = not port_free(port)
+            check(f"391 fixture {label}: port {port} not already in use",
+                  not occupied, "stale fixture already on port")
+            if not occupied:
+                cmd = [sys.executable, "fixtures/game_socket_fixture.py",
+                       "--port", str(port)]
+                cmd += ["--snapshot", mode_name] if mode_name else []
+                proc = subprocess.Popen(
+                    cmd, cwd=root, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                procs.append(proc)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = not port_free(port)
+                    time.sleep(0 if ready else 0.1)
+                check(f"391 fixture {label}: fixture ready on {port}",
+                      ready)
+                if ready:
+                    with connect(f"ws://127.0.0.1:{port}/socket",
+                                 proxy=None, open_timeout=5) as ws:
+                        ws.send(json.dumps(
+                            {"kind": "HELLO",
+                             "supportedProtocolVersions": [1]}))
+                        welcome = json.loads(ws.recv(timeout=5))
+                        if exp_snapshot is not None:
+                            snapshot = json.loads(ws.recv(timeout=5))
+                            mismatch = fixture_mismatch(
+                                welcome, snapshot, exp_welcome,
+                                exp_snapshot)
+                            check(f"391 fixture {label}: WELCOME and "
+                                  "SNAPSHOT match the pinned protocol",
+                                  mismatch is None, mismatch or "")
+                            check(f"391 fixture {label}: snapshot "
+                                  "equals the fixture constant verbatim",
+                                  snapshot == exp_snapshot)
+                            extra_holder = []
+                            try:
+                                extra_holder.append(ws.recv(timeout=0.7))
+                            except TimeoutError:
+                                extra_holder.append(None)
+                            check(f"391 fixture {label}: no second "
+                                  "snapshot arrives",
+                                  extra_holder[0] is None,
+                                  repr(extra_holder[0]))
+                        else:
+                            snap_holder = []
+                            try:
+                                snap_holder.append(
+                                    json.loads(ws.recv(timeout=0.7)))
+                            except TimeoutError:
+                                snap_holder.append(None)
+                            mismatch = fixture_mismatch(
+                                welcome, snap_holder[0], exp_welcome,
+                                None)
+                            check(f"391 fixture {label}: WELCOME "
+                                  "matches and no snapshot arrives",
+                                  mismatch is None, mismatch or "")
+                            ws.send("this is not json {{{")
+                            ws.send(json.dumps(
+                                {"kind": "UNKNOWN_KIND", "x": 1}))
+                            ws.send(json.dumps(
+                                {"kind": "HELLO",
+                                 "supportedProtocolVersions": [1]}))
+                            welcome2 = json.loads(ws.recv(timeout=5))
+                            mismatch2 = fixture_mismatch(
+                                welcome2, None, exp_welcome, None)
+                            check("391 fixture none: socket survives "
+                                  "non-JSON and unknown-kind frames, "
+                                  "second HELLO answered",
+                                  mismatch2 is None, mismatch2 or "")
+                proc.terminate()
+                proc.wait()
+    finally:
+        for proc in procs: proc.terminate() if proc.poll() is None else None
+        for proc in procs: proc.wait() if proc.poll() is None else None
+    for mode_name, port in modes:
+        label = mode_name or "none"
+        check(f"391 fixture {label}: port {port} free after fixture "
+              "stops", port_free(port))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
