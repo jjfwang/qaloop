@@ -15950,6 +15950,69 @@ def test_issue_379_perform_branch_coverage():
         pw_sync.sync_playwright = old_pw
 
 
+def test_issue_383_spec_branch_coverage():
+    """Issue #383: pin spec.py untaken branch sides.
+
+    _validate_op_params has no final else: an op outside every known
+    branch falls through and returns None silently. _validate_browser
+    now uses a final else for device_scale_factor (the unknown-key
+    guard above it already rejects anything outside the known set):
+    valid int/float values are returned verbatim and invalid values
+    raise SpecError naming browser.device_scale_factor.
+    """
+    from qaloop.spec import SpecError, _validate_browser, _validate_op_params
+
+    # Out-of-set op: arbitrary params are ignored, returns None.
+    for params in (None, "anything", 123, {"target": "x"}, ["a"]):
+        try:
+            ret = _validate_op_params("bogus_op", params, "steps[0]")
+            check(f"383 op_params: bogus_op params={params!r} returns None",
+                  ret is None, repr(ret))
+        except SpecError as e:
+            check(f"383 op_params: bogus_op params={params!r} returns None",
+                  False, str(e))
+
+    # In-chain controls: valid goto passes, invalid goto raises.
+    try:
+        ret = _validate_op_params("goto", "http://example.test", "steps[0]")
+        check("383 op_params: valid goto returns None", ret is None,
+              repr(ret))
+    except SpecError as e:
+        check("383 op_params: valid goto returns None", False, str(e))
+    for bad in ("", None, 123):
+        try:
+            _validate_op_params("goto", bad, "steps[0]")
+            check(f"383 op_params: invalid goto {bad!r} raises", False)
+        except SpecError:
+            check(f"383 op_params: invalid goto {bad!r} raises", True)
+
+    # device_scale_factor: valid int and float returned verbatim.
+    for good in (2, 1.5):
+        out = _validate_browser({"device_scale_factor": good}, "spec test")
+        check(f"383 browser: device_scale_factor {good!r} verbatim",
+              out == {"device_scale_factor": good}
+              and type(out["device_scale_factor"]) is type(good),
+              repr(out))
+
+    # device_scale_factor: invalid values raise naming the key.
+    for bad in (0, -1, -0.5, True, "2"):
+        try:
+            _validate_browser({"device_scale_factor": bad}, "spec test")
+            check(f"383 browser: device_scale_factor {bad!r} raises",
+                  False)
+        except SpecError as e:
+            check(f"383 browser: device_scale_factor {bad!r} raises",
+                  "browser.device_scale_factor" in str(e), str(e))
+
+    # Mixed browser block returns every declared key.
+    mixed = {"color_scheme": "dark", "is_mobile": True, "has_touch": False,
+             "locale": "en-US", "timezone_id": "America/New_York",
+             "user_agent": "test-ua", "device_scale_factor": 1.5}
+    out = _validate_browser(dict(mixed), "spec test")
+    check("383 browser: mixed block returns every declared key",
+          out == mixed, repr(out))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

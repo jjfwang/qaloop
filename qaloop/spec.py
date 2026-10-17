@@ -200,7 +200,7 @@ def _validate_browser(raw: Any, where: str) -> dict:
             if not isinstance(value, str):
                 raise SpecError(
                     f"{where}: browser.{key} must be a string, got {value!r}")
-        elif key == "device_scale_factor":
+        else:
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
                     or value <= 0:
                 raise SpecError(
