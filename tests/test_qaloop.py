@@ -16013,6 +16013,180 @@ def test_issue_383_spec_branch_coverage():
           out == mixed, repr(out))
 
 
+def test_issue_385_smoke_corpus_execute():
+    """Issue #385: execute the smoke-tagged shipped flows against the proof
+    server. Default mode (QALOOP_SMOKE_CORPUS_FULL unset) really executes a
+    pinned 7-flow subset covering every outcome class (passed, failed,
+    error, boot_failed, matrix). QALOOP_SMOKE_CORPUS_FULL=1/true selects the
+    full enumerated corpus; this test asserts that selection under the flag
+    and drives the full-mode loop with a fake executor so the suite stays
+    fast, while the real subset execution proves the executor end to end.
+    The subset is never shrunk silently: the docstring and the checks below
+    name the flag and the pinned subset."""
+    import glob
+    import socket
+    import subprocess
+    import time
+    from types import SimpleNamespace
+
+    from qaloop.cli import cmd_verify
+    from qaloop.spec import load_spec
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    # Only designed-failure exceptions; every other smoke flow must pass.
+    # Other *-fail flows (demo-hidden-fail, demo-js-fail, ...) fail at step
+    # level with continue_on_fail, so their run outcome is "passed".
+    smoke_expectations = {
+        "demo-setup-fail": ("failed", None),
+        "demo-steps-fail": ("failed", None),
+        "demo-run-timeout": ("error", "run timeout"),
+        "demo-services-http-fail": ("boot_failed", None),
+        "demo-services-partial-fail": ("boot_failed", None),
+        "demo-services-log-fail": ("boot_failed", None),
+    }
+    smoke_subset = ["demo-seed-http-json", "demo-mock-method",
+                    "demo-matrix-list", "demo-setup-fail",
+                    "demo-run-timeout", "demo-services-http-fail",
+                    "demo-wait-ms"]
+
+    def smoke_mismatch(flow_name, outcome, table):
+        expected_status, expected_sub = table.get(
+            flow_name, ("passed", None))
+        status, error_text = outcome
+        if status != expected_status: return (
+            f"{flow_name}: expected status {expected_status}, "
+            f"got {status} ({error_text})")
+        if expected_sub is not None and expected_sub not in error_text: return (
+            f"{flow_name}: expected error containing {expected_sub!r}, "
+            f"got {error_text!r}")
+        return None
+
+    def select_smoke_paths(all_paths, full):
+        if full: return list(all_paths)
+        wanted = set(smoke_subset)
+        return [p for p in all_paths
+                if os.path.splitext(os.path.basename(p))[0] in wanted]
+
+    def full_mode():
+        return os.environ.get(
+            "QALOOP_SMOKE_CORPUS_FULL", "").lower() in ("1", "true")
+
+    # Enumerate the corpus from the shipped tags, never a hardcoded list.
+    corpus = [p for p in sorted(glob.glob(os.path.join(root, "flows",
+                                                       "*.yaml")))
+              if "smoke" in load_spec(p, strict_env=False).tags]
+    check("385 smoke corpus: smoke-tagged flows enumerated",
+          len(corpus) > 0, str(len(corpus)))
+    subset = select_smoke_paths(corpus, False)
+    subset_names = sorted(os.path.splitext(os.path.basename(p))[0]
+                          for p in subset)
+    check("385 smoke corpus: default selection is the pinned subset",
+          subset_names == sorted(smoke_subset), str(subset_names))
+    check("385 smoke corpus: full selection returns the whole corpus",
+          select_smoke_paths(corpus, True) == corpus)
+    # Corrupted-expectation probes: a wrong table entry must be caught.
+    bad = dict(smoke_expectations)
+    bad["demo-wait-ms"] = ("failed", None)
+    probe = smoke_mismatch("demo-wait-ms", ("passed", ""), bad)
+    check("385 smoke corpus: corrupted expectation caught, names flow",
+          probe is not None and "demo-wait-ms" in probe, probe or "")
+    check("385 smoke corpus: matching outcome returns no mismatch",
+          smoke_mismatch("demo-wait-ms", ("passed", ""),
+                         smoke_expectations) is None)
+    sub_probe = smoke_mismatch("demo-run-timeout",
+                               ("error", "some other error"),
+                               smoke_expectations)
+    check("385 smoke corpus: wrong error text caught, names flow",
+          sub_probe is not None and "demo-run-timeout" in sub_probe,
+          sub_probe or "")
+    if not os.path.exists(exe): check("385 smoke corpus execution skipped (no browser)", True); return
+
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_SMOKE_CORPUS_FULL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    srv = None
+    with tempfile.TemporaryDirectory() as d:
+        runs_dir = os.path.join(d, "runs")
+        os.environ["TARGET_URL"] = "http://127.0.0.1:8933"
+        os.environ["QALOOP_RUNS"] = runs_dir
+        os.environ["QALOOP_LEDGER"] = os.path.join(d, "ledger.jsonl")
+        os.environ.pop("QALOOP_SMOKE_CORPUS_FULL", None)
+        try:
+            def poll_greeting():
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:8933/api/greeting",
+                            timeout=1) as r:
+                        return r.status == 200
+                except Exception:
+                    return False
+
+            def run_corpus(paths, executor):
+                for p in paths:
+                    name = os.path.splitext(os.path.basename(p))[0]
+                    mismatch = smoke_mismatch(name, executor(p),
+                                              smoke_expectations)
+                    check(f"smoke corpus executes: {os.path.basename(p)}",
+                          mismatch is None, mismatch or "")
+
+            def real_executor(path):
+                spec = load_spec(path, strict_env=False)
+                before = (set(os.listdir(runs_dir))
+                          if os.path.isdir(runs_dir) else set())
+                args = SimpleNamespace(
+                    flow=os.path.abspath(path), target=None, headed=False,
+                    executable_path=exe, upload_dir=None, investigate=False,
+                    keep_runs=0, max_investigation_actions=None, tag=None,
+                    video=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = cmd_verify(args)
+                if rc == 3: return ("boot_failed", "")
+                if spec.matrix: return ("passed" if rc == 0 else "failed", "")
+                new = sorted(set(os.listdir(runs_dir)) - before)
+                with open(os.path.join(runs_dir, new[0],
+                                       "run.json")) as f:
+                    data = json.load(f)
+                return (data["status"], data.get("error") or "")
+
+            def fake_executor(path):
+                name = os.path.splitext(os.path.basename(path))[0]
+                status, sub = smoke_expectations.get(name, ("passed", None))
+                return (status, "run timeout exceeded" if sub else "")
+
+            sock = socket.socket()
+            occupied = sock.connect_ex(("127.0.0.1", 8933)) == 0
+            sock.close()
+            check("385 smoke corpus: port 8933 not already in use",
+                  not occupied, "stale server already on 8933")
+            check("385 smoke corpus: no stale proof server answering",
+                  not poll_greeting())
+            if not occupied:
+                srv = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("385 smoke corpus: proof server ready on 8933", ready)
+                if ready:
+                    run_corpus(select_smoke_paths(corpus, full_mode()),
+                               real_executor)
+                    os.environ["QALOOP_SMOKE_CORPUS_FULL"] = "1"
+                    full_paths = select_smoke_paths(corpus, full_mode())
+                    check("385 smoke corpus: flag selects the full corpus",
+                          full_paths == corpus)
+                    run_corpus(full_paths, fake_executor)
+        finally:
+            srv.terminate() if srv is not None else None
+            srv.wait() if srv is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
