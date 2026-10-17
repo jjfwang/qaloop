@@ -15399,6 +15399,150 @@ def test_issue_369_flow_corpus_validate():
         os.unlink(bad_path)
 
 
+def test_issue_375_cli_branch_coverage():
+    """Issue #375: pin the 2 untaken branch sides in cli.py.
+
+    (a) cmd_verify on a single file with no tag (None and empty list):
+    the falsy side of `if args.tag:` (127->139) runs the flow and
+    exits 0. (b) A failing flow with investigate_on_failure and a
+    stubbed investigator returning None: the falsy side of
+    `if diagnosis:` (218->225) appends exactly one scripted ledger
+    entry and no investigation entry, and still writes the report.
+    """
+    from types import SimpleNamespace
+    from qaloop.runner import RunResult, StepResult
+    from qaloop.cli import _cmd_verify_run, cmd_verify
+    import qaloop.cli as cli_mod
+    import qaloop.ledger as ledger_mod
+    import qaloop.investigate as inv_mod
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    base = ("name: t\ntarget: http://h\nsteps:\n"
+            "  - name: s\n    wait_ms: 1\n")
+
+    def fake_result(status, ms=100):
+        steps = [StepResult(index=0, phase="steps", name="s", op="wait_ms",
+                            status="passed" if status == "passed"
+                            else "failed",
+                            duration_ms=ms)]
+        return RunResult(flow_name="x", target="http://h", status=status,
+                         started=1.0, ended=1.0 + ms / 1000.0, steps=steps,
+                         failed_step=None if status == "passed" else 0,
+                         console_errors=[], page_errors=[],
+                         failed_requests=[], bad_responses=[], run_dir="")
+
+    real_run_flow = cli_mod.run_flow
+    real_append = ledger_mod.append
+    real_default_runs = cli_mod.default_runs_root
+    real_inv = inv_mod.investigate
+    real_write_report = cli_mod.write_report
+    try:
+        # --- (a) single file with no tag: None and [] both run ---
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "f.yaml")
+            write(fp, base)
+            ledger_rows = []
+            ledger_mod.append = lambda row: ledger_rows.append(row)
+            cli_mod.default_runs_root = lambda: os.path.join(d, "runs")
+            run_calls = []
+
+            def fake_passed(spec, **kw):
+                run_calls.append((spec, kw))
+                return fake_result("passed")
+
+            cli_mod.run_flow = fake_passed
+            try:
+                def mk(tag):
+                    return SimpleNamespace(
+                        flow=fp, target=None, headed=True,
+                        executable_path=None, upload_dir=None,
+                        investigate=False, keep_runs=0,
+                        max_investigation_actions=None, tag=tag)
+
+                for tag, label in [(None, "None"), ([], "empty list")]:
+                    ledger_rows.clear()
+                    run_calls.clear()
+                    rc = cmd_verify(mk(tag))
+                    check(f"375 no-tag ({label}) verify exits 0",
+                          rc == 0, str(rc))
+                    check(f"375 no-tag ({label}) run_flow called once",
+                          len(run_calls) == 1, str(len(run_calls)))
+                    check(f"375 no-tag ({label}) one scripted ledger entry",
+                          len(ledger_rows) == 1
+                          and ledger_rows[0].get("kind") == "scripted",
+                          str(ledger_rows))
+            finally:
+                ledger_mod.append = real_append
+                cli_mod.default_runs_root = real_default_runs
+                cli_mod.run_flow = real_run_flow
+
+        # --- (b) falsy diagnosis: investigator returns None ---
+        with tempfile.TemporaryDirectory() as d:
+            inv_calls = []
+
+            def fake_inv(**kw):
+                inv_calls.append(kw)
+                return None
+
+            inv_mod.investigate = fake_inv
+            cli_mod.run_flow = lambda spec, **kw: fake_result("failed")
+            captured = {}
+
+            def capturing_write(result, spec, run_dir, diagnosis=None):
+                captured["diagnosis"] = diagnosis
+                captured["run_dir"] = run_dir
+                return real_write_report(result, spec, run_dir,
+                                         diagnosis=diagnosis)
+
+            cli_mod.write_report = capturing_write
+            try:
+                okf = os.path.join(d, "ok.yaml")
+                write(okf, base + "investigate_on_failure: true\n")
+                args_i = SimpleNamespace(
+                    flow=okf, target=None, headed=True,
+                    executable_path=None, upload_dir=None,
+                    investigate=True, keep_runs=0,
+                    max_investigation_actions=None)
+                led = FakeLedger()
+                ri_dir = os.path.join(d, "ri")
+                os.makedirs(ri_dir, exist_ok=True)
+                rc = _cmd_verify_run(args_i, ri_dir, led, d, 0)
+                check("375 falsy diagnosis verify exits 1",
+                      rc == 1, str(rc))
+                check("375 falsy diagnosis investigator called once",
+                      len(inv_calls) == 1, str(len(inv_calls)))
+                check("375 falsy diagnosis ledger has scripted only",
+                      [r["kind"] for r in led.rows] == ["scripted"],
+                      str([r["kind"] for r in led.rows]))
+                check("375 falsy diagnosis write_report diagnosis is None",
+                      "diagnosis" in captured
+                      and captured["diagnosis"] is None,
+                      str(captured))
+                check("375 falsy diagnosis report written",
+                      os.path.isfile(os.path.join(ri_dir, "REPORT.md")),
+                      ri_dir)
+            finally:
+                inv_mod.investigate = real_inv
+                cli_mod.run_flow = real_run_flow
+                cli_mod.write_report = real_write_report
+    finally:
+        cli_mod.run_flow = real_run_flow
+        ledger_mod.append = real_append
+        cli_mod.default_runs_root = real_default_runs
+        inv_mod.investigate = real_inv
+        cli_mod.write_report = real_write_report
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
