@@ -15069,6 +15069,46 @@ def test_perform_model_config_contract():
                 os.environ[k] = saved[k]
 
 
+def test_issue_369_flow_corpus_validate():
+    """Issue #369: every shipped top-level flow in flows/ loads clean.
+
+    Enumerates the real flows/ directory (sorted glob, no hardcoded
+    list or count), loads each file exactly as cli cmd_validate does
+    (load_spec(path, strict_env=False), catching SpecError), and emits
+    one check per file naming the file on failure. flows/fragments/
+    partials are out of scope: the top-level *.yaml glob excludes them.
+    """
+    import glob
+    from qaloop.spec import load_spec, SpecError
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def try_load(path):
+        try:
+            load_spec(path, strict_env=False)
+        except SpecError as e:
+            return e
+        return None
+
+    paths = sorted(glob.glob(os.path.join(repo, "flows", "*.yaml")))
+    check("flow corpus: enumeration is non-empty", len(paths) > 0, str(len(paths)))
+    for path in paths:
+        err = try_load(path)
+        check(f"flow corpus loads: {os.path.basename(path)}", err is None,
+              f"{path}: {err}" if err is not None else "")
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("name: corpus-negative\ntarget: http://x\nbogus_key: 1\n"
+                "steps:\n  - name: s\n    expect: {noop: true}\n")
+        bad_path = f.name
+    try:
+        bad_err = try_load(bad_path)
+        check("flow corpus: corrupt flow is rejected naming its error",
+              bad_err is not None and "bogus_key" in str(bad_err),
+              f"{bad_path}: {bad_err}")
+    finally:
+        os.unlink(bad_path)
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
