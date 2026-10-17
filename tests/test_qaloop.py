@@ -16758,6 +16758,125 @@ def test_issue_391_game_socket_fixture():
               "stops", port_free(port))
 
 
+def test_issue_393_worker_verify_repo_e2e():
+    """Issue #393: pin the worker verify-repo composition end to end.
+    The verify-repo contract (issue #331) is only exercised with
+    worker.boot_repo_env and worker._run_one_flow stubbed, so the real
+    composition - queue claim, preset boot of a static server, a real
+    browser flow run, report write, job completion, and process-level
+    teardown of the booted server - could rot unobserved. This test
+    stubs nothing in the worker: it enqueues a verify-repo job for a
+    preset whose static dir is the repo root (the demo-login fragment
+    navigates to /demo/demo-login.html), claims it, drives the real
+    worker.handle_job against flows/demo-login-a.yaml with the real
+    headless browser, and pins the job row done, run.json passed, and
+    no http.server process left behind for the booted port."""
+    import socket
+    import subprocess
+
+    from qaloop import queue, worker
+    from qaloop.env import find_free_port
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_repo_mismatch(job_status, run_status, exp_job_status,
+                             exp_run_status):
+        if job_status != exp_job_status: return (
+            f"job status: expected {exp_job_status}, got {job_status}")
+        if run_status != exp_run_status: return (
+            f"run.json status: expected {exp_run_status}, "
+            f"got {run_status}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    check("393 verify-repo e2e: exact expectations return no mismatch",
+          verify_repo_mismatch("done", "passed", "done", "passed")
+          is None)
+    probe = verify_repo_mismatch("failed", "passed", "done", "passed")
+    check("393 verify-repo e2e: corrupted job status caught, names "
+          "field", probe is not None and "job status" in probe,
+          probe or "")
+    probe = verify_repo_mismatch("done", "failed", "done", "passed")
+    check("393 verify-repo e2e: corrupted run.json status caught, "
+          "names field",
+          probe is not None and "run.json status" in probe, probe or "")
+    if not os.path.exists(exe): check("393 verify-repo e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("393 verify-repo e2e: booted port not already answering",
+          port_free(port), f"port {port} already in use")
+    check("393 verify-repo e2e: no http.server for the port yet",
+          no_static_server(port), f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_LEDGER")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with temp_db():
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                preset = {"workdir": root,
+                          "env": [{"static": {"dir": root,
+                                              "port": port}}],
+                          "flows": ["flows/demo-login-a.yaml"]}
+                jid = queue.enqueue("verify-repo", {"repo": "e2e393"})
+                job = queue.claim()
+                check("393 verify-repo e2e: enqueued job claimed",
+                      job is not None and job["id"] == jid,
+                      str(job))
+                if job is not None and job["id"] == jid:
+                    worker.handle_job(
+                        job, flows_dir=os.path.join(root, "flows"),
+                        runs_root=runs_root, headless=True,
+                        executable_path=exe,
+                        repos_config={"repos": {"e2e393": preset}})
+                row = _job_row(jid)
+                run_dir = row["run_dir"] or ""
+                run_json = (os.path.join(run_dir, "run.json")
+                            if run_dir else "")
+                run_data = {}
+                if run_json and os.path.exists(run_json):
+                    with open(run_json, encoding="utf-8") as f:
+                        run_data = json.load(f)
+                mismatch = verify_repo_mismatch(
+                    row["status"], run_data.get("status"),
+                    "done", "passed")
+                check("393 verify-repo e2e: real composition completes "
+                      "job done with run.json passed",
+                      mismatch is None, mismatch or "")
+                check("393 verify-repo e2e: run_dir is a real "
+                      "directory under the runs root",
+                      bool(run_dir) and os.path.isdir(run_dir)
+                      and os.path.abspath(run_dir).startswith(
+                          os.path.abspath(runs_root) + os.sep),
+                      run_dir)
+                check("393 verify-repo e2e: run.json exists in the "
+                      "run dir",
+                      bool(run_json) and os.path.exists(run_json),
+                      run_json)
+                check("393 verify-repo e2e: booted static server "
+                      "stopped after the job",
+                      no_static_server(port),
+                      f"http.server still running on {port}")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("393 verify-repo e2e: no http.server remains after cleanup",
+          no_static_server(port), f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
