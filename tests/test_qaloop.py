@@ -17014,6 +17014,124 @@ def test_issue_395_worker_verify_flow_e2e():
           no_static_server(port), f"http.server still on {port}")
 
 
+def test_issue_399_worker_loop_e2e():
+    """Issue #399: pin the worker loop (run_worker --once) composition
+    end to end. Issue #395 pins handle_job directly, but the loop
+    itself - claim inside run_worker, the --once exit once the queue
+    drains, and job completion through the real loop - could rot
+    unobserved. This test stubs NOTHING in the worker: it serves the
+    repo root itself on a free port, enqueues a verify-flow job whose
+    flow is the bare filename demo-login-a.yaml, drives the real
+    worker.run_worker(once=True), and pins the job row done, run.json
+    passed, and no http.server process left behind."""
+    import socket
+    import subprocess
+
+    from qaloop import queue, worker
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_loop_mismatch(job_status, run_status, exp_job_status,
+                             exp_run_status):
+        if job_status != exp_job_status: return (
+            f"job status: expected {exp_job_status}, got {job_status}")
+        if run_status != exp_run_status: return (
+            f"run.json status: expected {exp_run_status}, "
+            f"got {run_status}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    check("399 worker-loop e2e: exact expectations return no mismatch",
+          worker_loop_mismatch("done", "passed", "done", "passed")
+          is None)
+    probe = worker_loop_mismatch("failed", "passed", "done", "passed")
+    check("399 worker-loop e2e: corrupted job status caught, names "
+          "field", probe is not None and "job status" in probe,
+          probe or "")
+    probe = worker_loop_mismatch("done", "failed", "done", "passed")
+    check("399 worker-loop e2e: corrupted run.json status caught, "
+          "names field",
+          probe is not None and "run.json status" in probe, probe or "")
+    if not os.path.exists(exe): check("399 worker-loop e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("399 worker-loop e2e: static port not already answering",
+          port_free(port), f"port {port} already in use")
+    check("399 worker-loop e2e: no http.server for the port yet",
+          no_static_server(port), f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    os.environ["QALOOP_LEDGER"] = os.path.join(
+                        td, "ledger.jsonl")
+                    jid = queue.enqueue(
+                        "verify-flow",
+                        {"flow": "demo-login-a.yaml",
+                         "target": f"http://127.0.0.1:{port}"})
+                    worker.run_worker(
+                        flows_dir=os.path.join(root, "flows"),
+                        runs_root=runs_root, once=True, poll_s=0.01,
+                        headless=True, executable_path=exe,
+                        repos_config_path=os.path.join(
+                            td, "no-such-repos.yaml"))
+                    row = _job_row(jid)
+                    run_dir = row["run_dir"] or ""
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    run_data = {}
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            run_data = json.load(f)
+                    mismatch = worker_loop_mismatch(
+                        row["status"], run_data.get("status"),
+                        "done", "passed")
+                    check("399 worker-loop e2e: real loop completes "
+                          "job done with run.json passed",
+                          mismatch is None, mismatch or "")
+                    check("399 worker-loop e2e: run_dir is a real "
+                          "directory under the runs root",
+                          bool(run_dir) and os.path.isdir(run_dir)
+                          and os.path.abspath(run_dir).startswith(
+                              os.path.abspath(runs_root) + os.sep),
+                          run_dir)
+                    check("399 worker-loop e2e: run.json exists in the "
+                          "run dir",
+                          bool(run_json) and os.path.exists(run_json),
+                          run_json)
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("399 worker-loop e2e: no http.server remains after cleanup",
+          no_static_server(port), f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
