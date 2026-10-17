@@ -16345,6 +16345,214 @@ def test_issue_387_fake_model_perform_proofs():
             for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_389_untagged_corpus_execute():
+    """Issue #389: execute the untagged demo flow corpus against the proof
+    server. The 38 shipped demo-*.yaml flows with no tags are pinned only
+    at load time today, so a rotted step, mock, or demo page would surface
+    nowhere. Default mode (QALOOP_UNTAGGED_CORPUS_FULL unset) really
+    executes a pinned 6-flow subset covering every setup class (plain,
+    upload-dir, upload-guard, matrix, baselines-first-screenshot,
+    services). QALOOP_UNTAGGED_CORPUS_FULL=1/true selects the full
+    enumerated corpus; this test asserts that selection under the flag
+    and drives the full-mode loop with a fake executor so the suite stays
+    fast, while the real subset execution proves the executor end to end.
+    Every designed outcome here is "passed": the expectations table stays
+    empty and any failure under the designed setup is rot to file
+    separately, never encoded as an expectation."""
+    import glob
+    import socket
+    import subprocess
+    import time
+    from types import SimpleNamespace
+
+    from qaloop.cli import cmd_baselines, cmd_verify
+    from qaloop.spec import load_spec
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    # No designed-failure exceptions: every untagged flow must pass.
+    untagged_expectations = {}
+    untagged_subset = ["demo-login-a", "demo-upload", "demo-upload-guard",
+                       "demo-matrix", "demo-matrix-screenshot",
+                       "demo-services"]
+    baseline_png = os.path.join(root, "flows", "baselines",
+                                "matrix-card-a.png")
+
+    def untagged_mismatch(flow_name, outcome, table):
+        expected_status, expected_sub = table.get(
+            flow_name, ("passed", None))
+        status, error_text = outcome
+        if status != expected_status: return (
+            f"{flow_name}: expected status {expected_status}, "
+            f"got {status} ({error_text})")
+        if expected_sub is not None and expected_sub not in error_text: return (
+            f"{flow_name}: expected error containing {expected_sub!r}, "
+            f"got {error_text!r}")
+        return None
+
+    def select_untagged_paths(all_paths, full):
+        if full: return list(all_paths)
+        wanted = set(untagged_subset)
+        return [p for p in all_paths
+                if os.path.splitext(os.path.basename(p))[0] in wanted]
+
+    def full_mode():
+        return os.environ.get(
+            "QALOOP_UNTAGGED_CORPUS_FULL", "").lower() in ("1", "true")
+
+    # Enumerate the corpus from the shipped tags, never a hardcoded list.
+    corpus = [p for p in sorted(glob.glob(os.path.join(root, "flows",
+                                                       "demo-*.yaml")))
+              if not load_spec(p, strict_env=False).tags]
+    check("389 untagged corpus: untagged demo flows enumerated",
+          len(corpus) > 0, str(len(corpus)))
+    subset = select_untagged_paths(corpus, False)
+    subset_names = sorted(os.path.splitext(os.path.basename(p))[0]
+                          for p in subset)
+    check("389 untagged corpus: default selection is the pinned subset",
+          subset_names == sorted(untagged_subset), str(subset_names))
+    check("389 untagged corpus: full selection returns the whole corpus",
+          select_untagged_paths(corpus, True) == corpus)
+    # Corrupted-expectation probes: a wrong table entry must be caught.
+    bad = dict(untagged_expectations)
+    bad["demo-upload"] = ("failed", None)
+    probe = untagged_mismatch("demo-upload", ("passed", ""), bad)
+    check("389 untagged corpus: corrupted expectation caught, names flow",
+          probe is not None and "demo-upload" in probe, probe or "")
+    check("389 untagged corpus: matching outcome returns no mismatch",
+          untagged_mismatch("demo-upload", ("passed", ""),
+                            untagged_expectations) is None)
+    sub_table = {"demo-upload": ("failed", "expected boom")}
+    sub_probe = untagged_mismatch("demo-upload",
+                                  ("failed", "some other error"),
+                                  sub_table)
+    check("389 untagged corpus: wrong error text caught, names flow",
+          sub_probe is not None and "demo-upload" in sub_probe,
+          sub_probe or "")
+    if not os.path.exists(exe): check("389 untagged corpus execution skipped (no browser)", True); return
+
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_UNTAGGED_CORPUS_FULL", "QALOOP_UPLOAD_DIR",
+                "QALOOP_UPLOAD_FILE")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    srv = None
+    with tempfile.TemporaryDirectory() as d:
+        runs_dir = os.path.join(d, "runs")
+        os.environ["TARGET_URL"] = "http://127.0.0.1:8933"
+        os.environ["QALOOP_RUNS"] = runs_dir
+        os.environ["QALOOP_LEDGER"] = os.path.join(d, "ledger.jsonl")
+        os.environ.pop("QALOOP_UNTAGGED_CORPUS_FULL", None)
+        try:
+            def poll_greeting():
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:8933/api/greeting",
+                            timeout=1) as r:
+                        return r.status == 200
+                except Exception:
+                    return False
+
+            def run_corpus(paths, executor):
+                for p in paths:
+                    name = os.path.splitext(os.path.basename(p))[0]
+                    mismatch = untagged_mismatch(name, executor(p),
+                                                 untagged_expectations)
+                    check(f"untagged corpus executes: {os.path.basename(p)}",
+                          mismatch is None, mismatch or "")
+
+            def real_executor(path):
+                name = os.path.splitext(os.path.basename(path))[0]
+                # Per-flow env is set/popped on EVERY call, regardless of
+                # sorted order (demo-upload-guard sorts before demo-upload
+                # and must not inherit its QALOOP_UPLOAD_DIR).
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                os.environ.pop("QALOOP_UPLOAD_FILE", None)
+                upload_dir = None
+                if name == "demo-upload":
+                    # The env var is load-bearing: the flow expands
+                    # ${QALOOP_UPLOAD_DIR}/upload-fixture.txt at load.
+                    upload_dir = os.path.join(root, "demo")
+                    os.environ["QALOOP_UPLOAD_DIR"] = upload_dir
+                elif name == "demo-upload-guard":
+                    # Fail-closed guard: a file path but no declared dir.
+                    os.environ["QALOOP_UPLOAD_FILE"] = os.path.join(
+                        root, "demo", "upload-fixture.txt")
+                spec = load_spec(path, strict_env=False)
+                before = (set(os.listdir(runs_dir))
+                          if os.path.isdir(runs_dir) else set())
+                args = SimpleNamespace(
+                    flow=os.path.abspath(path), target=None, headed=False,
+                    executable_path=exe, upload_dir=upload_dir,
+                    investigate=False, keep_runs=0,
+                    max_investigation_actions=None, tag=None, video=False)
+                try:
+                    if name == "demo-matrix-screenshot":
+                        # No baseline is committed for this flow: create
+                        # it in baseline-update mode, then verify.
+                        bargs = SimpleNamespace(
+                            flow=os.path.abspath(path), target=None,
+                            headed=False, executable_path=exe,
+                            upload_dir=None)
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            brc = cmd_baselines(bargs)
+                        check("389 untagged corpus: matrix baselines "
+                              "run rc 0", brc == 0, str(brc))
+                        check("389 untagged corpus: matrix baseline "
+                              "created", os.path.exists(baseline_png))
+                        if brc != 0 or not os.path.exists(baseline_png): return ("failed", f"baselines rc={brc}")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = cmd_verify(args)
+                    if rc == 3: return ("boot_failed", "")
+                    if spec.matrix: return ("passed" if rc == 0 else "failed", "")
+                    new = sorted(set(os.listdir(runs_dir)) - before)
+                    with open(os.path.join(runs_dir, new[0],
+                                           "run.json")) as f:
+                        data = json.load(f)
+                    return (data["status"], data.get("error") or "")
+                finally:
+                    if name == "demo-matrix-screenshot" \
+                            and os.path.exists(baseline_png):
+                        os.remove(baseline_png)
+
+            def fake_executor(path):
+                return ("passed", "")
+
+            sock = socket.socket()
+            occupied = sock.connect_ex(("127.0.0.1", 8933)) == 0
+            sock.close()
+            check("389 untagged corpus: port 8933 not already in use",
+                  not occupied, "stale server already on 8933")
+            check("389 untagged corpus: no stale proof server answering",
+                  not poll_greeting())
+            if not occupied:
+                srv = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("389 untagged corpus: proof server ready on 8933",
+                      ready)
+                if ready:
+                    run_corpus(select_untagged_paths(corpus, full_mode()),
+                               real_executor)
+                    check("389 untagged corpus: no leftover matrix "
+                          "baseline", not os.path.exists(baseline_png))
+                    os.environ["QALOOP_UNTAGGED_CORPUS_FULL"] = "1"
+                    full_paths = select_untagged_paths(corpus, full_mode())
+                    check("389 untagged corpus: flag selects the full "
+                          "corpus", full_paths == corpus)
+                    run_corpus(full_paths, fake_executor)
+        finally:
+            srv.terminate() if srv is not None else None
+            srv.wait() if srv is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
