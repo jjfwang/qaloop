@@ -19114,6 +19114,208 @@ def test_issue_419_baselines_verify_e2e():
           "cleanup", no_static_server(port),
           f"http.server still on {port}")
 
+def test_issue_421_verify_investigate_e2e():
+    """Issue #421: pin the verify --investigate inline composition
+    end to end. The existing investigate coverage stubs the whole
+    composition (test_single_verify_failure_investigates_and_reports
+    stubs run_flow + investigate + the ledger), so the advertised
+    shell path itself - build_parser -> cmd_verify on a failing
+    flow with investigate_on_failure: true and --investigate,
+    summoning the real investigator inline (SPEC step 7), writing
+    the manual brief, the report diagnosis section, and the
+    investigation-then-scripted ledger rows - could rot unobserved.
+    This test stubs NOTHING: it copies the demo-steps-fail flow
+    into a temp dir with investigate_on_failure flipped to true,
+    removes QALOOP_MODEL_API_KEY so the investigator takes its
+    manual branch, and drives the real CLI verify command against
+    a real browser run."""
+    import functools
+    import shutil
+    import socket
+    import subprocess
+    import threading
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_investigate_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"exit_code": 1, "status": "failed", "failed_step": 2,
+           "diag_mode": "manual", "diag_model": None,
+           "diag_tokens_in": 0, "diag_tokens_out": 0,
+           "diag_cost": 0.0, "first_kind": "investigation",
+           "second_kind": "scripted", "second_status": "failed"}
+    check("421 verify-investigate e2e: exact expectations return "
+          "no mismatch",
+          verify_investigate_mismatch(dict(exp), exp) is None)
+    probe = verify_investigate_mismatch(dict(exp, diag_mode="agent"),
+                                        exp)
+    check("421 verify-investigate e2e: corrupted diag_mode "
+          "caught, names field",
+          probe is not None and probe.startswith("diag_mode:"),
+          probe or "")
+    probe = verify_investigate_mismatch(
+        dict(exp, first_kind="scripted"), exp)
+    check("421 verify-investigate e2e: corrupted first_kind "
+          "caught, names field",
+          probe is not None and probe.startswith("first_kind:"),
+          probe or "")
+    if not os.path.exists(exe): check("421 verify-investigate e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("421 verify-investigate e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("421 verify-investigate e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER", "TARGET_URL",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+        handler = functools.partial(QuietHandler, directory=root)
+        srv = ThreadingHTTPServer(("127.0.0.1", port), handler)
+        thread = threading.Thread(target=srv.serve_forever,
+                                  daemon=True)
+        thread.start()
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/teardown-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_file = os.path.join(td, "ledger.jsonl")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_file
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                with open(os.path.join(
+                        root, "flows", "demo-steps-fail.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                check("421 verify-investigate e2e: source flow "
+                      "pins investigate_on_failure: false",
+                      "investigate_on_failure: false" in flow_text)
+                flow_copy = os.path.join(td, "demo-steps-fail.yaml")
+                with open(flow_copy, "w", encoding="utf-8") as f:
+                    f.write(flow_text.replace(
+                        "investigate_on_failure: false",
+                        "investigate_on_failure: true"))
+                args = cli.build_parser().parse_args(
+                    ["verify", flow_copy, "--investigate"])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                out = buf.getvalue()
+                check("421 verify-investigate e2e: real cmd_verify "
+                      "exits 1", rc == 1, str(rc))
+                check("421 verify-investigate e2e: stdout summons "
+                      "the investigator",
+                      "step failed — summoning investigator..."
+                      in out, out[-400:])
+                check("421 verify-investigate e2e: stdout reports "
+                      "the manual brief",
+                      "no model configured — manual brief written to"
+                      in out, out[-400:])
+                run_dirs = sorted(os.listdir(runs_root))
+                check("421 verify-investigate e2e: exactly one "
+                      "new run dir", len(run_dirs) == 1,
+                      str(run_dirs))
+                run_dir = os.path.join(runs_root, run_dirs[0])
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as f:
+                    run_data = json.load(f)
+                diag = run_data.get("diagnosis") or {}
+                brief_path = os.path.join(
+                    run_dir, "INVESTIGATION_BRIEF.md")
+                check("421 verify-investigate e2e: diagnosis brief "
+                      "is the run dir INVESTIGATION_BRIEF.md",
+                      diag.get("brief") == brief_path,
+                      str(diag.get("brief")))
+                check("421 verify-investigate e2e: "
+                      "INVESTIGATION_BRIEF.md exists",
+                      os.path.exists(brief_path), brief_path)
+                with open(brief_path, encoding="utf-8") as f:
+                    brief_text = f.read()
+                check("421 verify-investigate e2e: brief names "
+                      "the flow", "demo-steps-fail" in brief_text,
+                      brief_text[:200])
+                check("421 verify-investigate e2e: brief names "
+                      "the failing step",
+                      "Failing step" in brief_text, brief_text[:400])
+                with open(os.path.join(run_dir, "REPORT.md"),
+                          encoding="utf-8") as f:
+                    report_text = f.read()
+                check("421 verify-investigate e2e: REPORT.md "
+                      "carries the investigator diagnosis section",
+                      "## Investigator diagnosis" in report_text,
+                      report_text[:400])
+                with open(ledger_file, encoding="utf-8") as f:
+                    rows = [json.loads(line) for line in f
+                            if line.strip()]
+                check("421 verify-investigate e2e: ledger has "
+                      "exactly 2 rows", len(rows) == 2, str(rows))
+                row0 = rows[0] if len(rows) > 0 else {}
+                row1 = rows[1] if len(rows) > 1 else {}
+                check("421 verify-investigate e2e: investigation "
+                      "row pins model/tokens/cost",
+                      row0.get("model") is None
+                      and row0.get("tokens_in") == 0
+                      and row0.get("tokens_out") == 0
+                      and row0.get("cost_usd_est") == 0.0,
+                      str(row0))
+                outcome = {
+                    "exit_code": rc,
+                    "status": run_data.get("status"),
+                    "failed_step": run_data.get("failed_step"),
+                    "diag_mode": diag.get("mode"),
+                    "diag_model": diag.get("model"),
+                    "diag_tokens_in": diag.get("tokens_in"),
+                    "diag_tokens_out": diag.get("tokens_out"),
+                    "diag_cost": diag.get("cost_usd_est"),
+                    "first_kind": row0.get("kind"),
+                    "second_kind": row1.get("kind"),
+                    "second_status": row1.get("status")}
+                mismatch = verify_investigate_mismatch(outcome, exp)
+                check("421 verify-investigate e2e: real run pins "
+                      "the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("421 verify-investigate e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
