@@ -18913,6 +18913,207 @@ def test_issue_417_verify_ledger_e2e():
           "cleanup", no_static_server(port),
           f"http.server still on {port}")
 
+
+
+def test_issue_419_baselines_verify_e2e():
+    """Issue #419: pin the baselines-to-verify composition end to
+    end. The baselines tests stub run_flow or handwrite baseline
+    PNGs, and the verify screenshot tests handwrite their baseline
+    or stub the comparison, so the advertised shell path itself -
+    build_parser -> cmd_baselines writing a real baseline PNG from
+    a real browser run, then build_parser -> cmd_verify comparing
+    against that exact file - could rot unobserved. This test
+    stubs NOTHING: it copies the demo-mock-ux flow into a temp
+    dir, drives the real CLI baselines command so the baseline is
+    written by the baselines run itself, verifies against the
+    fresh baseline (passes), inverts the PNG in place, and
+    verifies again (fails at the screenshot_matches step)."""
+    import shutil
+    import socket
+    import subprocess
+
+    from PIL import Image, ImageOps
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def baselines_verify_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    def latest_run_data(runs_root, before):
+        new_dirs = sorted(d for d in os.listdir(runs_root)
+                          if d not in before)
+        with open(os.path.join(runs_root, new_dirs[-1], "run.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)
+
+    exp = {"baselines_exit": 0, "fresh_exit": 0,
+           "fresh_status": "passed", "inv_exit": 1,
+           "inv_status": "failed"}
+    check("419 baselines-verify e2e: exact expectations return "
+          "no mismatch",
+          baselines_verify_mismatch(dict(exp), exp) is None)
+    probe = baselines_verify_mismatch(
+        dict(exp, baselines_exit=1), exp)
+    check("419 baselines-verify e2e: corrupted baselines_exit "
+          "caught, names field",
+          probe is not None and probe.startswith("baselines_exit:"),
+          probe or "")
+    probe = baselines_verify_mismatch(
+        dict(exp, fresh_status="failed"), exp)
+    check("419 baselines-verify e2e: corrupted fresh_status "
+          "caught, names field",
+          probe is not None and probe.startswith("fresh_status:"),
+          probe or "")
+    probe = baselines_verify_mismatch(
+        dict(exp, inv_status="passed"), exp)
+    check("419 baselines-verify e2e: corrupted inv_status "
+          "caught, names field",
+          probe is not None and probe.startswith("inv_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("419 baselines-verify e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("419 baselines-verify e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("419 baselines-verify e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_file = os.path.join(td, "ledger.jsonl")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_file
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_copy = os.path.join(td, "demo-mock-ux.yaml")
+                shutil.copyfile(
+                    os.path.join(root, "flows", "demo-mock-ux.yaml"),
+                    flow_copy)
+                baseline_png = os.path.join(
+                    td, "baselines", "mock-demo.png")
+                check("419 baselines-verify e2e: baseline PNG "
+                      "absent before the baselines run",
+                      not os.path.exists(baseline_png),
+                      baseline_png)
+                parsed = cli.build_parser().parse_args(
+                    ["baselines", flow_copy,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_base = parsed.fn(parsed)
+                out_base = buf.getvalue()
+                check("419 baselines-verify e2e: real cmd_baselines "
+                      "exits 0", rc_base == 0, str(rc_base))
+                check("419 baselines-verify e2e: baselines output "
+                      "reports the saved screenshot baseline",
+                      "screenshot_matches: baseline saved to"
+                      in out_base, out_base[-400:])
+                check("419 baselines-verify e2e: saved-to path is "
+                      "the temp flow dir baseline",
+                      baseline_png in out_base, out_base[-400:])
+                check("419 baselines-verify e2e: baseline PNG "
+                      "written by the baselines run itself",
+                      os.path.exists(baseline_png)
+                      and os.path.getsize(baseline_png) > 0,
+                      baseline_png)
+                before = set(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else set()
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_copy, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_fresh = parsed.fn(parsed)
+                fresh = latest_run_data(runs_root, before)
+                check("419 baselines-verify e2e: verify against "
+                      "the fresh baseline exits 0",
+                      rc_fresh == 0, str(rc_fresh))
+                check("419 baselines-verify e2e: fresh verify "
+                      "run.json status passed",
+                      fresh.get("status") == "passed",
+                      str(fresh.get("status")))
+                img = Image.open(baseline_png)
+                ImageOps.invert(img.convert("RGB")).save(baseline_png)
+                before = set(os.listdir(runs_root))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_copy, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_inv = parsed.fn(parsed)
+                inv = latest_run_data(runs_root, before)
+                check("419 baselines-verify e2e: verify against "
+                      "the inverted baseline exits 1",
+                      rc_inv == 1, str(rc_inv))
+                check("419 baselines-verify e2e: inverted verify "
+                      "run.json status failed",
+                      inv.get("status") == "failed",
+                      str(inv.get("status")))
+                shot_asserts = [
+                    a for s in inv.get("steps", [])
+                    if s.get("name") == "mocked state matches the "
+                                       "visual baseline"
+                    for a in s.get("assertions", [])
+                    if a.get("name") == "screenshot_matches"]
+                detail = shot_asserts[0].get("detail", "") \
+                    if shot_asserts else ""
+                check("419 baselines-verify e2e: failure lands on "
+                      "the screenshot_matches assertion of the "
+                      "visual baseline step",
+                      len(shot_asserts) == 1
+                      and shot_asserts[0].get("passed") is False,
+                      str(shot_asserts))
+                check("419 baselines-verify e2e: failure detail "
+                      "pins the rms/max diff format",
+                      "rms_diff=" in detail
+                      and "max_diff=0.0300" in detail, detail)
+                outcome = {"baselines_exit": rc_base,
+                           "fresh_exit": rc_fresh,
+                           "fresh_status": fresh.get("status"),
+                           "inv_exit": rc_inv,
+                           "inv_status": inv.get("status")}
+                mismatch = baselines_verify_mismatch(outcome, exp)
+                check("419 baselines-verify e2e: round trip pins "
+                      "the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("419 baselines-verify e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
