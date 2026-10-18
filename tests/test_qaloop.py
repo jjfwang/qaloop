@@ -18367,6 +18367,153 @@ def test_issue_411_evaluate_cli_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_413_webhook_serve_cli_e2e():
+    """Issue #413: pin the webhook server shell path end to end.
+    cmd_webhook (qaloop/cli.py) imports serve from qaloop.webhook
+    and the webhook subparser wires --port/--host to it, but no
+    executing test drove that shell path: the receiver could be
+    dead on arrival while unit pins on Handler/serve stayed green.
+    This test stubs NOTHING: it launches the real CLI as a
+    subprocess (python -m qaloop.cli webhook --port/--host), polls
+    the real /health endpoint, posts a correctly HMAC-signed
+    pull_request opened delivery to /webhook/github, and pins the
+    exact response body plus the exact pending verify-repo queue
+    row the handler enqueues in the shared temp database."""
+    import hashlib
+    import hmac
+    import socket
+    import subprocess
+    import time
+    import urllib.request
+
+    from qaloop import queue as q
+    from qaloop.env import find_free_port
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    secret = "413-webhook-secret"
+
+    def webhook_serve_mismatch(job_status, payload_repo,
+                               exp_job_status, exp_payload_repo):
+        if job_status != exp_job_status: return (
+            f"job status: expected {exp_job_status}, got {job_status}")
+        if payload_repo != exp_payload_repo: return (
+            f"payload repo: expected {exp_payload_repo}, "
+            f"got {payload_repo}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    check("413 webhook-serve e2e: exact expectations return "
+          "no mismatch",
+          webhook_serve_mismatch("pending", "qaloop",
+                                 "pending", "qaloop") is None)
+    probe = webhook_serve_mismatch("done", "qaloop",
+                                   "pending", "qaloop")
+    check("413 webhook-serve e2e: corrupted job status caught, "
+          "names field",
+          probe is not None and "job status" in probe, probe or "")
+    probe = webhook_serve_mismatch("pending", "bogus",
+                                   "pending", "qaloop")
+    check("413 webhook-serve e2e: corrupted payload repo caught, "
+          "names field",
+          probe is not None and "repo" in probe, probe or "")
+
+    port = find_free_port()
+    check("413 webhook-serve e2e: port not already answering",
+          port_free(port), f"port {port} already in use")
+    env_keys = ("QALOOP_DB", "QALOOP_LEDGER", "QALOOP_WEBHOOK_SECRET")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_WEBHOOK_SECRET"] = secret
+            child_env = dict(os.environ)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "qaloop.cli", "webhook",
+                 "--port", str(port), "--host", "127.0.0.1"],
+                cwd=root, env=child_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                health_status = None
+                health_body = None
+                for _ in range(75):
+                    try:
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{port}/health",
+                                timeout=5) as resp:
+                            health_status = resp.status
+                            health_body = json.loads(
+                                resp.read().decode())
+                        break
+                    except Exception:
+                        time.sleep(0.2)
+                check("413 webhook-serve e2e: health status is 200",
+                      health_status == 200, str(health_status))
+                check("413 webhook-serve e2e: health body exact",
+                      health_body == {"ok": True, "pending": 0},
+                      str(health_body))
+                body = json.dumps({
+                    "action": "opened",
+                    "repository": {"full_name": "jjfwang/qaloop"},
+                    "pull_request": {"number": 413,
+                                     "head": {"sha": "413probe"}}}).encode()
+                sig = "sha256=" + hmac.new(
+                    secret.encode(), body, hashlib.sha256).hexdigest()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/webhook/github",
+                    data=body, method="POST",
+                    headers={"X-GitHub-Event": "pull_request",
+                             "X-Hub-Signature-256": sig,
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    post_status = resp.status
+                    post_body = json.loads(resp.read().decode())
+                check("413 webhook-serve e2e: signed delivery "
+                      "status is 200", post_status == 200,
+                      str(post_status))
+                check("413 webhook-serve e2e: signed delivery "
+                      "body exact",
+                      post_body == {"ok": True, "job_id": 1},
+                      str(post_body))
+                jobs = q.list_jobs(limit=100)
+                check("413 webhook-serve e2e: exactly one job "
+                      "enqueued", len(jobs) == 1, str(len(jobs)))
+                job = jobs[0] if jobs else {}
+                check("413 webhook-serve e2e: job id is 1",
+                      job.get("id") == 1, str(job))
+                check("413 webhook-serve e2e: job kind is "
+                      "verify-repo", job.get("kind") == "verify-repo",
+                      str(job))
+                mismatch = webhook_serve_mismatch(
+                    job.get("status"),
+                    (job.get("payload") or {}).get("repo"),
+                    "pending", "qaloop")
+                check("413 webhook-serve e2e: job pending for "
+                      "repo qaloop", mismatch is None, mismatch or "")
+                check("413 webhook-serve e2e: job payload exact",
+                      job.get("payload") == {
+                          "repo": "qaloop",
+                          "repo_full": "jjfwang/qaloop", "pr": 413,
+                          "sha": "413probe",
+                          "source": "github-webhook"},
+                      str(job.get("payload")))
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
+            check("413 webhook-serve e2e: process exited",
+                  proc.poll() is not None, str(proc.poll()))
+            check("413 webhook-serve e2e: port no longer answers",
+                  port_free(port), f"port {port} still answering")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
