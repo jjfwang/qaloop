@@ -19787,6 +19787,237 @@ def test_issue_425_batch_verify_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_427_matrix_verify_e2e():
+    """Issue #427: pin the matrix verify composition end to
+    end. The existing matrix coverage stubs the per-combo
+    path or handwrites matrix records, so the real single-
+    file verify composition - build_parser -> cmd_verify on
+    a matrix flow, the real _cmd_verify_matrix running each
+    combination for real, the parent REPORT.md written by
+    the real write_matrix_summary, the per-combination
+    run.json/REPORT.md records, and the real scripted-matrix
+    ledger row - could rot unobserved. This test stubs
+    NOTHING: it copies flows/demo-matrix.yaml into a temp
+    dir, adapts the copy to an explicit two-combination
+    matrix plus the signup mock the demo page needs, serves
+    the repo root on a free port, and drives the real CLI
+    verify of the copied flow."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def matrix_verify_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"rc": 0, "combo_line_1": True, "combo_line_2": True,
+           "matrix_line": True, "report_line_parent": True,
+           "parent_count": 1,
+           "report_first_line": "# qaloop matrix report — "
+           "demo-matrix [2/2 PASS]",
+           "table_row_0": "| 0 | `user=ada, plan=pro` | PASS | "
+           "7/7 | [00-user-ada-plan-pro]"
+           "(matrix/00-user-ada-plan-pro/REPORT.md) |",
+           "table_row_1": "| 1 | `user=bob, plan=free` | PASS | "
+           "7/7 | [01-user-bob-plan-free]"
+           "(matrix/01-user-bob-plan-free/REPORT.md) |",
+           "subdir0_status": "passed",
+           "subdir1_status": "passed",
+           "subdir0_report_exists": True,
+           "subdir1_report_exists": True, "ledger_rows": 1,
+           "ledger_kind": "scripted-matrix",
+           "ledger_flow": "demo-matrix",
+           "ledger_status": "passed", "ledger_combinations": 2,
+           "passed_count": 2, "ledger_cost": 0.0}
+    check("427 matrix-verify e2e: exact expectations return "
+          "no mismatch",
+          matrix_verify_mismatch(dict(exp), exp) is None)
+    probe = matrix_verify_mismatch(dict(exp, passed_count=1), exp)
+    check("427 matrix-verify e2e: corrupted passed_count "
+          "caught, names field",
+          probe is not None and probe.startswith("passed_count:"),
+          probe or "")
+    probe = matrix_verify_mismatch(
+        dict(exp, ledger_kind="scripted"), exp)
+    check("427 matrix-verify e2e: corrupted ledger_kind "
+          "caught, names field",
+          probe is not None and probe.startswith("ledger_kind:"),
+          probe or "")
+    if not os.path.exists(exe): check("427 matrix-verify e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("427 matrix-verify e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("427 matrix-verify e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                with open(os.path.join(
+                        root, "flows", "demo-matrix.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                matrix_block = ("matrix:\n  user: [ada, bob]\n"
+                                "  plan: [pro, free]")
+                check("427 matrix-verify e2e: source matrix "
+                      "block pin present",
+                      matrix_block in flow_text)
+                greeting_pin = ('mock: {url: "**/api/greeting", '
+                                'json: {greeting: "Hello from '
+                                'mock"}}')
+                check("427 matrix-verify e2e: source greeting "
+                      "mock pin present",
+                      greeting_pin in flow_text)
+                goto_pin = "  - name: open the demo page"
+                check("427 matrix-verify e2e: source goto step "
+                      "pin present", goto_pin in flow_text)
+                flow_text = flow_text.replace(
+                    matrix_block,
+                    "matrix:\n  - {user: ada, plan: pro}\n"
+                    "  - {user: bob, plan: free}")
+                signup_step = (
+                    "  - name: mock the signup API\n"
+                    '    mock: {url: "**/api/signup", method: '
+                    'POST, json: {ok: true}}\n')
+                flow_text = flow_text.replace(
+                    goto_pin, signup_step + goto_pin)
+                flow_copy = os.path.join(td, "demo-matrix.yaml")
+                with open(flow_copy, "w",
+                          encoding="utf-8") as f:
+                    f.write(flow_text)
+                args = cli.build_parser().parse_args(
+                    ["verify", flow_copy])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                lines = buf.getvalue().splitlines()
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_lines = []
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                if report_path and os.path.exists(report_path):
+                    with open(report_path,
+                              encoding="utf-8") as f:
+                        report_lines = f.read().splitlines()
+                subdir0 = (os.path.join(
+                    parent, "matrix", "00-user-ada-plan-pro")
+                    if parent else "")
+                subdir1 = (os.path.join(
+                    parent, "matrix", "01-user-bob-plan-free")
+                    if parent else "")
+                sub0_data = {}
+                sub0_json = (os.path.join(subdir0, "run.json")
+                             if subdir0 else "")
+                if sub0_json and os.path.exists(sub0_json):
+                    with open(sub0_json, encoding="utf-8") as f:
+                        sub0_data = json.load(f)
+                sub1_data = {}
+                sub1_json = (os.path.join(subdir1, "run.json")
+                             if subdir1 else "")
+                if sub1_json and os.path.exists(sub1_json):
+                    with open(sub1_json, encoding="utf-8") as f:
+                        sub1_data = json.load(f)
+                rows = ledger.read_all()
+                row0 = rows[0] if len(rows) > 0 else {}
+                outcome = {
+                    "rc": rc,
+                    "combo_line_1": (
+                        "combination 1/2: {'user': 'ada', "
+                        "'plan': 'pro'}" in lines),
+                    "combo_line_2": (
+                        "combination 2/2: {'user': 'bob', "
+                        "'plan': 'free'}" in lines),
+                    "matrix_line": (
+                        "matrix: 2/2 combinations passed"
+                        in lines),
+                    "report_line_parent": (
+                        bool(parent) and f"report: {report_path}"
+                        in lines),
+                    "parent_count": len(parents),
+                    "report_first_line": (
+                        report_lines[0] if report_lines else None),
+                    "table_row_0": next(
+                        (l for l in report_lines
+                         if l.startswith("| 0 |")), None),
+                    "table_row_1": next(
+                        (l for l in report_lines
+                         if l.startswith("| 1 |")), None),
+                    "subdir0_status": sub0_data.get("status"),
+                    "subdir1_status": sub1_data.get("status"),
+                    "subdir0_report_exists": bool(subdir0) and (
+                        os.path.exists(os.path.join(
+                            subdir0, "REPORT.md"))),
+                    "subdir1_report_exists": bool(subdir1) and (
+                        os.path.exists(os.path.join(
+                            subdir1, "REPORT.md"))),
+                    "ledger_rows": len(rows),
+                    "ledger_kind": row0.get("kind"),
+                    "ledger_flow": row0.get("flow"),
+                    "ledger_status": row0.get("status"),
+                    "ledger_combinations": row0.get(
+                        "combinations"),
+                    "passed_count": row0.get("passed"),
+                    "ledger_cost": row0.get("cost_usd_est")}
+                mismatch = matrix_verify_mismatch(outcome, exp)
+                check("427 matrix-verify e2e: real composition "
+                      "pins the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("427 matrix-verify e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
