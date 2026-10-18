@@ -18514,6 +18514,242 @@ def test_issue_413_webhook_serve_cli_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_415_verify_compare_e2e():
+    """Issue #415: pin the verify-to-compare composition end to
+    end. The compare tests feed cmd_compare only hand-written
+    run.json fixtures, so the README-advertised shell path itself
+    - build_parser -> cmd_verify producing real run dirs, then
+    the real CLI compare command diffing those runs - could rot
+    unobserved. This test stubs NOTHING (in particular not
+    qaloop.compare.compare_runs, qaloop.compare.resolve_run, or
+    qaloop.compare.render_text, and not the verify runner): it
+    serves the repo root itself on a free port, drives the real
+    CLI verify of a passing and a designed-failure flow, then the
+    real CLI compare by run-dir basename, and pins the rendered
+    header, status, steps, and final lines against the real
+    records."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_compare_mismatch(outcome, exp):
+        if outcome.get("status_line_same") != exp.get("status_line_same"): return (
+            f"identical-case status line: expected "
+            f"{exp.get('status_line_same')}, "
+            f"got {outcome.get('status_line_same')}")
+        if outcome.get("final_line_same") != exp.get("final_line_same"): return (
+            f"identical-case final line: expected "
+            f"{exp.get('final_line_same')}, "
+            f"got {outcome.get('final_line_same')}")
+        if outcome.get("status_line_diff") != exp.get("status_line_diff"): return (
+            f"differ-case status line: expected "
+            f"{exp.get('status_line_diff')}, "
+            f"got {outcome.get('status_line_diff')}")
+        if outcome.get("final_line_diff") != exp.get("final_line_diff"): return (
+            f"differ-case final line: expected "
+            f"{exp.get('final_line_diff')}, "
+            f"got {outcome.get('final_line_diff')}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_outcome = {
+        "status_line_same": "status: passed -> passed (same)",
+        "final_line_same": "identical",
+        "status_line_diff": "status: passed -> failed (CHANGED)",
+        "final_line_diff": "differ"}
+    check("415 verify-compare e2e: exact expectations return "
+          "no mismatch",
+          verify_compare_mismatch(dict(exp_outcome),
+                                  exp_outcome) is None)
+    probe = verify_compare_mismatch(
+        dict(exp_outcome, status_line_same="status: bogus"),
+        exp_outcome)
+    check("415 verify-compare e2e: corrupted identical-case "
+          "status line caught, names field",
+          probe is not None and "status line" in probe, probe or "")
+    probe = verify_compare_mismatch(
+        dict(exp_outcome, final_line_same="differ"), exp_outcome)
+    check("415 verify-compare e2e: corrupted identical-case "
+          "final line caught, names field",
+          probe is not None and "final line" in probe, probe or "")
+    probe = verify_compare_mismatch(
+        dict(exp_outcome, status_line_diff="status: bogus"),
+        exp_outcome)
+    check("415 verify-compare e2e: corrupted differ-case status "
+          "line caught, names field",
+          probe is not None and "status line" in probe, probe or "")
+    probe = verify_compare_mismatch(
+        dict(exp_outcome, final_line_diff="identical"), exp_outcome)
+    check("415 verify-compare e2e: corrupted differ-case final "
+          "line caught, names field",
+          probe is not None and "final line" in probe, probe or "")
+    if not os.path.exists(exe): check("415 verify-compare e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("415 verify-compare e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("415 verify-compare e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_a = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                flow_b = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_a, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_a = parsed.fn(parsed)
+                check("415 verify-compare e2e: real verify of "
+                      "demo-login-a exits 0", rc_a == 0, str(rc_a))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_b, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_b = parsed.fn(parsed)
+                check("415 verify-compare e2e: real verify of "
+                      "demo-steps-fail exits 1", rc_b == 1, str(rc_b))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("415 verify-compare e2e: exactly two run "
+                      "dirs written", len(run_dirs) == 2,
+                      str(run_dirs))
+                run_data_by_flow = {}
+                run_dir_by_flow = {}
+                for d in run_dirs:
+                    with open(os.path.join(runs_root, d, "run.json"),
+                              encoding="utf-8") as f:
+                        data = json.load(f)
+                    run_data_by_flow[data.get("flow_name")] = data
+                    run_dir_by_flow[data.get("flow_name")] = d
+                check("415 verify-compare e2e: run records carry "
+                      "both real flow names",
+                      set(run_data_by_flow) == {
+                          "demo-login-a", "demo-steps-fail"},
+                      str(sorted(run_data_by_flow)))
+                data_a = run_data_by_flow.get("demo-login-a") or {}
+                data_b = run_data_by_flow.get("demo-steps-fail") or {}
+                check("415 verify-compare e2e: real run records "
+                      "pin passed and failed statuses",
+                      data_a.get("status") == "passed"
+                      and data_b.get("status") == "failed",
+                      f"{data_a.get('status')} / "
+                      f"{data_b.get('status')}")
+                check("415 verify-compare e2e: steps-fail "
+                      "run.json failed_step is 2",
+                      data_b.get("failed_step") == 2,
+                      str(data_b.get("failed_step")))
+                base_a = run_dir_by_flow.get("demo-login-a")
+                base_b = run_dir_by_flow.get("demo-steps-fail")
+
+                def run_compare(ref_a, ref_b):
+                    parsed_c = cli.build_parser().parse_args(
+                        ["compare", ref_a, ref_b])
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_c = parsed_c.fn(parsed_c)
+                    return rc_c, buf.getvalue()
+
+                rc_same, out_same = run_compare(base_a, base_a)
+                lines_same = out_same.splitlines()
+                check("415 verify-compare e2e: compare of passed "
+                      "run with itself exits 0", rc_same == 0,
+                      str(rc_same))
+                check("415 verify-compare e2e: identical header "
+                      "names the run on both sides",
+                      bool(lines_same) and lines_same[0] == (
+                          f"compare: {base_a} -> {base_a}"),
+                      lines_same[0] if lines_same else out_same)
+                check("415 verify-compare e2e: identical steps "
+                      "line reads all unchanged",
+                      "steps: all unchanged" in lines_same, out_same)
+                rc_diff, out_diff = run_compare(base_a, base_b)
+                lines_diff = out_diff.splitlines()
+                check("415 verify-compare e2e: compare of passed "
+                      "vs failed exits 1", rc_diff == 1, str(rc_diff))
+                outcome = {
+                    "status_line_same": next(
+                        (l for l in lines_same
+                         if l.startswith("status: ")), None),
+                    "final_line_same": (
+                        lines_same[-1] if lines_same else None),
+                    "status_line_diff": next(
+                        (l for l in lines_diff
+                         if l.startswith("status: ")), None),
+                    "final_line_diff": (
+                        lines_diff[-1] if lines_diff else None)}
+                mismatch = verify_compare_mismatch(
+                    outcome, exp_outcome)
+                check("415 verify-compare e2e: real compare pins "
+                      "status and final lines for both cases",
+                      mismatch is None, mismatch or "")
+                names_a = {s.get("name")
+                           for s in data_a.get("steps", [])}
+                names_b = {s.get("name")
+                           for s in data_b.get("steps", [])}
+                added_names = sorted(names_b - names_a)
+                removed_names = sorted(names_a - names_b)
+                check("415 verify-compare e2e: real records hold "
+                      "steps unique to each run",
+                      bool(added_names) and bool(removed_names),
+                      f"added={added_names} removed={removed_names}")
+                check("415 verify-compare e2e: differ render has "
+                      "an added-step line naming a real B-only step",
+                      any(l.startswith(
+                          f"  + step {n!r}: added in B")
+                          for n in added_names for l in lines_diff),
+                      out_diff)
+                check("415 verify-compare e2e: differ render has "
+                      "a removed-step line naming a real "
+                      "A-only step",
+                      any(l.startswith(
+                          f"  - step {n!r}: removed in B")
+                          for n in removed_names for l in lines_diff),
+                      out_diff)
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("415 verify-compare e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
