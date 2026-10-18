@@ -19316,6 +19316,236 @@ def test_issue_421_verify_investigate_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_423_worker_investigate_e2e():
+    """Issue #423: pin the worker investigate-on-failure
+    composition end to end. The existing worker coverage stubs
+    _run_one_flow or the investigate composition, so the real
+    worker path itself - queue claim of a verify-flow job with
+    no investigate key (handle_job defaults do_investigate to
+    True), the real _run_one_flow gate on a failing flow with
+    investigate_on_failure: true, the real investigate()
+    writing the manual brief, the report diagnosis section,
+    the investigation-then-scripted ledger rows, and the job
+    row recorded failed with run_dir staying None - could rot
+    unobserved. This test stubs NOTHING: it copies the
+    demo-steps-fail flow into a temp flows dir with
+    investigate_on_failure flipped to true, removes
+    QALOOP_MODEL_API_KEY so the investigator takes its manual
+    branch, enqueues and claims a real verify-flow job, and
+    drives the real worker.handle_job against a real browser
+    run."""
+    import socket
+    import subprocess
+
+    from qaloop import ledger, queue, worker
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_investigate_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"job_status": "failed",
+           "job_note": "verify-flow -> failed",
+           "job_run_dir": None, "status": "failed",
+           "failed_step": 2, "diag_mode": "manual",
+           "diag_model": None, "diag_tokens_in": 0,
+           "diag_tokens_out": 0, "diag_cost": 0.0,
+           "ledger_rows": 2, "first_kind": "investigation",
+           "first_model": None, "first_cost": 0.0,
+           "second_kind": "scripted", "second_status": "failed",
+           "second_cost": 0.0}
+    check("423 worker-investigate e2e: exact expectations "
+          "return no mismatch",
+          worker_investigate_mismatch(dict(exp), exp) is None)
+    probe = worker_investigate_mismatch(
+        dict(exp, diag_mode="agent"), exp)
+    check("423 worker-investigate e2e: corrupted diag_mode "
+          "caught, names field",
+          probe is not None and probe.startswith("diag_mode:"),
+          probe or "")
+    probe = worker_investigate_mismatch(
+        dict(exp, first_kind="scripted"), exp)
+    check("423 worker-investigate e2e: corrupted first_kind "
+          "caught, names field",
+          probe is not None and probe.startswith("first_kind:"),
+          probe or "")
+    if not os.path.exists(exe): check("423 worker-investigate e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("423 worker-investigate e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("423 worker-investigate e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/teardown-demo.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    flows_dir = os.path.join(td, "flows")
+                    os.makedirs(flows_dir)
+                    os.environ["QALOOP_LEDGER"] = os.path.join(
+                        td, "ledger.jsonl")
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ["TARGET_URL"] = (
+                        f"http://127.0.0.1:{port}")
+                    with open(os.path.join(
+                            root, "flows",
+                            "demo-steps-fail.yaml"),
+                            encoding="utf-8") as f:
+                        flow_text = f.read()
+                    check("423 worker-investigate e2e: source "
+                          "flow pins investigate_on_failure: "
+                          "false",
+                          "investigate_on_failure: false"
+                          in flow_text)
+                    with open(os.path.join(
+                            flows_dir, "demo-steps-fail.yaml"),
+                            "w", encoding="utf-8") as f:
+                        f.write(flow_text.replace(
+                            "investigate_on_failure: false",
+                            "investigate_on_failure: true"))
+                    jid = queue.enqueue(
+                        "verify-flow",
+                        {"flow": "demo-steps-fail.yaml",
+                         "target": f"http://127.0.0.1:{port}"})
+                    job = queue.claim()
+                    check("423 worker-investigate e2e: "
+                          "enqueued job claimed",
+                          job is not None and job["id"] == jid,
+                          str(job))
+                    if job is not None and job["id"] == jid:
+                        worker.handle_job(
+                            job, flows_dir=flows_dir,
+                            runs_root=runs_root, headless=True,
+                            executable_path=exe,
+                            repos_config={"repos": {}})
+                    row = _job_row(jid)
+                    run_dirs = (sorted(os.listdir(runs_root))
+                                if os.path.isdir(runs_root)
+                                else [])
+                    check("423 worker-investigate e2e: "
+                          "exactly one run dir under the runs "
+                          "root", len(run_dirs) == 1,
+                          str(run_dirs))
+                    run_dir = (os.path.join(runs_root,
+                                            run_dirs[0])
+                               if len(run_dirs) == 1 else "")
+                    check("423 worker-investigate e2e: run "
+                          "dir is a real directory under the "
+                          "runs root",
+                          bool(run_dir)
+                          and os.path.isdir(run_dir)
+                          and os.path.abspath(run_dir).startswith(
+                              os.path.abspath(runs_root) + os.sep),
+                          run_dir)
+                    run_data = {}
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json,
+                                  encoding="utf-8") as f:
+                            run_data = json.load(f)
+                    diag = run_data.get("diagnosis") or {}
+                    brief_path = (os.path.join(
+                        run_dir, "INVESTIGATION_BRIEF.md")
+                        if run_dir else "")
+                    check("423 worker-investigate e2e: "
+                          "diagnosis brief is the run dir "
+                          "INVESTIGATION_BRIEF.md",
+                          diag.get("brief") == brief_path,
+                          str(diag.get("brief")))
+                    check("423 worker-investigate e2e: "
+                          "INVESTIGATION_BRIEF.md exists",
+                          bool(brief_path)
+                          and os.path.exists(brief_path),
+                          brief_path)
+                    report_text = ""
+                    report_path = (os.path.join(run_dir,
+                                                "REPORT.md")
+                                   if run_dir else "")
+                    if report_path and os.path.exists(
+                            report_path):
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            report_text = f.read()
+                    check("423 worker-investigate e2e: "
+                          "REPORT.md carries the investigator "
+                          "diagnosis section",
+                          "## Investigator diagnosis"
+                          in report_text, report_text[:400])
+                    rows = ledger.read_all()
+                    check("423 worker-investigate e2e: ledger "
+                          "has exactly 2 rows", len(rows) == 2,
+                          str(rows))
+                    row0 = rows[0] if len(rows) > 0 else {}
+                    row1 = rows[1] if len(rows) > 1 else {}
+                    outcome = {
+                        "job_status": row.get("status"),
+                        "job_note": row.get("note"),
+                        "job_run_dir": row.get("run_dir"),
+                        "status": run_data.get("status"),
+                        "failed_step": run_data.get(
+                            "failed_step"),
+                        "diag_mode": diag.get("mode"),
+                        "diag_model": diag.get("model"),
+                        "diag_tokens_in": diag.get("tokens_in"),
+                        "diag_tokens_out": diag.get(
+                            "tokens_out"),
+                        "diag_cost": diag.get("cost_usd_est"),
+                        "ledger_rows": len(rows),
+                        "first_kind": row0.get("kind"),
+                        "first_model": row0.get("model"),
+                        "first_cost": row0.get("cost_usd_est"),
+                        "second_kind": row1.get("kind"),
+                        "second_status": row1.get("status"),
+                        "second_cost": row1.get("cost_usd_est")}
+                    mismatch = worker_investigate_mismatch(
+                        outcome, exp)
+                    check("423 worker-investigate e2e: real "
+                          "composition pins the pinned fields "
+                          "exactly", mismatch is None,
+                          mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("423 worker-investigate e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
