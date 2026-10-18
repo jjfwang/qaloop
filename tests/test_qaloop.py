@@ -20371,6 +20371,269 @@ def test_issue_431_single_flow_keep_runs_prune_e2e():
           no_static_server(port), f"http.server still on {port}")
 
 
+def test_issue_433_worker_notify_e2e():
+    """Issue #433: pin the worker failure-notification
+    composition end to end. The existing notification tests
+    stub _run_one_flow and pin the payload against the literal
+    fake run dir /tmp/runs/f, so the real chain - a real
+    failing browser run through worker.handle_job, the
+    retry-budget gate in queue.record_failure, the real
+    run_dir threaded into _notify_failure, and the real POST
+    landing on a real receiver - could rot unobserved (the
+    notification is the only surface carrying the real run_dir
+    for a terminally failed job, whose row keeps run_dir
+    None). This test stubs NOTHING: it copies the
+    demo-steps-fail flow verbatim into a temp flows dir (its
+    investigate_on_failure stays false), removes
+    QALOOP_MODEL_API_KEY, enqueues a real verify-flow job with
+    max_retries=1 against a caller-owned static server, points
+    QALOOP_NOTIFY_URL at a genuine threaded HTTP receiver that
+    also records the Content-Type header, and drives the real
+    worker.handle_job twice - requeue silence first, then
+    exactly one terminal notification."""
+    import socket
+    import subprocess
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from qaloop import queue, worker
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_notify_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"first_notify_count": 0,
+                 "first_job_status": "pending", "first_attempts": 1,
+                 "notify_count": 1, "notify_job_id": 42,
+                 "notify_kind": "verify-flow",
+                 "notify_run_dir": "/tmp/real-runs/run-2",
+                 "notify_summary": "verify-flow -> failed (attempt 2)",
+                 "notify_content_type": "application/json",
+                 "job_status": "failed", "job_attempts": 2,
+                 "job_note": "verify-flow -> failed",
+                 "job_run_dir": None, "run_status": "failed"}
+    check("433 worker-notify e2e: exact expectations return "
+          "no mismatch",
+          worker_notify_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = worker_notify_mismatch(
+        dict(exp_probe, notify_run_dir="/tmp/wrong"), exp_probe)
+    check("433 worker-notify e2e: corrupted notify_run_dir "
+          "caught, names field",
+          probe is not None and probe.startswith("notify_run_dir:"),
+          probe or "")
+    probe = worker_notify_mismatch(
+        dict(exp_probe, first_notify_count=1), exp_probe)
+    check("433 worker-notify e2e: corrupted first_notify_count "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("first_notify_count:"),
+          probe or "")
+    if not os.path.exists(exe): check("433 worker-notify e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("433 worker-notify e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("433 worker-notify e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    received = []
+
+    class NotifyHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append((self.path,
+                             json.loads(self.rfile.read(n)),
+                             self.headers.get("Content-Type")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    recv_srv = HTTPServer(("127.0.0.1", 0), NotifyHandler)
+    recv_t = threading.Thread(target=recv_srv.serve_forever,
+                              daemon=True)
+    recv_t.start()
+    notify_url = f"http://127.0.0.1:{recv_srv.server_port}/notify"
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_NOTIFY_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/teardown-demo.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    flows_dir = os.path.join(td, "flows")
+                    os.makedirs(flows_dir)
+                    os.environ["QALOOP_LEDGER"] = os.path.join(
+                        td, "ledger.jsonl")
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ["TARGET_URL"] = (
+                        f"http://127.0.0.1:{port}")
+                    os.environ["QALOOP_NOTIFY_URL"] = notify_url
+                    with open(os.path.join(
+                            root, "flows",
+                            "demo-steps-fail.yaml"),
+                            encoding="utf-8") as f:
+                        flow_text = f.read()
+                    check("433 worker-notify e2e: source flow "
+                          "pins investigate_on_failure: false",
+                          "investigate_on_failure: false"
+                          in flow_text)
+                    with open(os.path.join(
+                            flows_dir, "demo-steps-fail.yaml"),
+                            "w", encoding="utf-8") as f:
+                        f.write(flow_text)
+                    jid = queue.enqueue(
+                        "verify-flow",
+                        {"flow": "demo-steps-fail.yaml",
+                         "target": f"http://127.0.0.1:{port}"},
+                        max_retries=1)
+                    job = queue.claim()
+                    check("433 worker-notify e2e: enqueued job "
+                          "claimed for attempt 1",
+                          job is not None and job["id"] == jid,
+                          str(job))
+                    if job is not None and job["id"] == jid:
+                        worker.handle_job(
+                            job, flows_dir=flows_dir,
+                            runs_root=runs_root, headless=True,
+                            executable_path=exe,
+                            repos_config={"repos": {}})
+                    row1 = _job_row(jid)
+                    first_listing = (
+                        sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+                    check("433 worker-notify e2e: exactly one "
+                          "run dir after attempt 1",
+                          len(first_listing) == 1,
+                          str(first_listing))
+                    first_notify_count = len(received)
+                    check("433 worker-notify e2e: requeue stays "
+                          "silent after attempt 1",
+                          first_notify_count == 0, str(received))
+                    check("433 worker-notify e2e: job pending "
+                          "with attempts 1 after attempt 1",
+                          row1["status"] == "pending"
+                          and row1["attempts"] == 1, str(row1))
+                    job = queue.claim()
+                    check("433 worker-notify e2e: requeued job "
+                          "claimed for attempt 2",
+                          job is not None and job["id"] == jid,
+                          str(job))
+                    if job is not None and job["id"] == jid:
+                        worker.handle_job(
+                            job, flows_dir=flows_dir,
+                            runs_root=runs_root, headless=True,
+                            executable_path=exe,
+                            repos_config={"repos": {}})
+                    row = _job_row(jid)
+                    listing = (sorted(os.listdir(runs_root))
+                               if os.path.isdir(runs_root)
+                               else [])
+                    check("433 worker-notify e2e: exactly two "
+                          "run dirs after attempt 2",
+                          len(listing) == 2, str(listing))
+                    new_names = [n for n in listing
+                                 if n not in first_listing]
+                    run_dir = (os.path.join(runs_root,
+                                            new_names[0])
+                               if len(new_names) == 1 else "")
+                    check("433 worker-notify e2e: terminal run "
+                          "dir is a real directory under the "
+                          "runs root",
+                          bool(run_dir)
+                          and os.path.isdir(run_dir)
+                          and os.path.abspath(run_dir).startswith(
+                              os.path.abspath(runs_root) + os.sep),
+                          run_dir)
+                    run_data = {}
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json,
+                                  encoding="utf-8") as f:
+                            run_data = json.load(f)
+                    payload = (received[0][1]
+                               if len(received) == 1 else {})
+                    outcome = {
+                        "first_notify_count": first_notify_count,
+                        "first_job_status": row1.get("status"),
+                        "first_attempts": row1.get("attempts"),
+                        "notify_count": len(received),
+                        "notify_job_id": payload.get("job_id"),
+                        "notify_kind": payload.get("kind"),
+                        "notify_run_dir": payload.get("run_dir"),
+                        "notify_summary": payload.get("summary"),
+                        "notify_content_type": (
+                            received[0][2]
+                            if len(received) == 1 else None),
+                        "job_status": row.get("status"),
+                        "job_attempts": row.get("attempts"),
+                        "job_note": row.get("note"),
+                        "job_run_dir": row.get("run_dir"),
+                        "run_status": run_data.get("status")}
+                    exp = {"first_notify_count": 0,
+                           "first_job_status": "pending",
+                           "first_attempts": 1,
+                           "notify_count": 1,
+                           "notify_job_id": jid,
+                           "notify_kind": "verify-flow",
+                           "notify_run_dir": run_dir,
+                           "notify_summary":
+                               "verify-flow -> failed (attempt 2)",
+                           "notify_content_type":
+                               "application/json",
+                           "job_status": "failed",
+                           "job_attempts": 2,
+                           "job_note": "verify-flow -> failed",
+                           "job_run_dir": None,
+                           "run_status": "failed"}
+                    mismatch = worker_notify_mismatch(outcome, exp)
+                    check("433 worker-notify e2e: real "
+                          "composition pins the pinned fields "
+                          "exactly", mismatch is None,
+                          mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        recv_srv.shutdown()
+        recv_t.join()
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("433 worker-notify e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
