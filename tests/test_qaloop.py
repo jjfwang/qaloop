@@ -17328,6 +17328,171 @@ def test_issue_401_webhook_to_worker_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_403_cli_enqueue_worker_e2e():
+    """Issue #403: pin the CLI enqueue-to-worker composition end to
+    end. Issue #310 pins cmd_enqueue plumbing with queue.enqueue
+    stubbed and issue #399 pins the worker loop driven directly, but
+    the README-advertised shell path itself - build_parser ->
+    cmd_enqueue assembling the verify-flow payload (setdefault flow,
+    conditional target) into a real pending queue row, then
+    cmd_worker resolving the runs root via QALOOP_RUNS and the
+    browser executable via the QALOOP_EXECUTABLE_PATH fallback -
+    could rot unobserved. This test stubs NOTHING: it serves the
+    repo root itself on a free port, drives the real CLI enqueue,
+    pins the pending row and the exact printed line, drives the real
+    CLI worker --once, and pins the job row done, run.json passed,
+    and no http.server process left behind."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def cli_enqueue_worker_mismatch(job_status, run_status,
+                                    exp_job_status, exp_run_status):
+        if job_status != exp_job_status: return (
+            f"job status: expected {exp_job_status}, got {job_status}")
+        if run_status != exp_run_status: return (
+            f"run.json status: expected {exp_run_status}, "
+            f"got {run_status}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    check("403 cli enqueue-to-worker e2e: exact expectations return "
+          "no mismatch",
+          cli_enqueue_worker_mismatch("done", "passed", "done",
+                                      "passed") is None)
+    probe = cli_enqueue_worker_mismatch("failed", "passed", "done",
+                                        "passed")
+    check("403 cli enqueue-to-worker e2e: corrupted job status "
+          "caught, names field",
+          probe is not None and "job status" in probe, probe or "")
+    probe = cli_enqueue_worker_mismatch("done", "failed", "done",
+                                        "passed")
+    check("403 cli enqueue-to-worker e2e: corrupted run.json status "
+          "caught, names field",
+          probe is not None and "run.json status" in probe,
+          probe or "")
+    if not os.path.exists(exe): check("403 cli enqueue-to-worker e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("403 cli enqueue-to-worker e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("403 cli enqueue-to-worker e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER",
+                "QALOOP_RUNS", "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    os.environ["QALOOP_LEDGER"] = os.path.join(
+                        td, "ledger.jsonl")
+                    os.environ["QALOOP_RUNS"] = runs_root
+                    os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_e = cli.cmd_enqueue(
+                            cli.build_parser().parse_args(
+                                ["enqueue", "--kind", "verify-flow",
+                                 "--flow", "demo-login-a.yaml",
+                                 "--target",
+                                 f"http://127.0.0.1:{port}"]))
+                    check("403 cli enqueue-to-worker e2e: enqueue "
+                          "exits 0", rc_e == 0, str(rc_e))
+                    jobs = queue.list_jobs(limit=100)
+                    check("403 cli enqueue-to-worker e2e: exactly "
+                          "one job enqueued", len(jobs) == 1,
+                          str(len(jobs)))
+                    job = jobs[0] if jobs else {}
+                    jid = job.get("id")
+                    check("403 cli enqueue-to-worker e2e: pending "
+                          "job kind", job.get("kind") == "verify-flow",
+                          str(job))
+                    check("403 cli enqueue-to-worker e2e: pending "
+                          "job status",
+                          job.get("status") == "pending", str(job))
+                    check("403 cli enqueue-to-worker e2e: pending "
+                          "job payload",
+                          job.get("payload") == {
+                              "flow": "demo-login-a.yaml",
+                              "target": f"http://127.0.0.1:{port}"},
+                          str(job.get("payload")))
+                    check("403 cli enqueue-to-worker e2e: enqueue "
+                          "printed line exact",
+                          buf.getvalue().strip() == (
+                              f"enqueued job #{jid} (verify-flow, "
+                              f"max_retries=0)"),
+                          buf.getvalue())
+                    if jid is not None:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            rc_w = cli.cmd_worker(
+                                cli.build_parser().parse_args(
+                                    ["worker", "--once", "--poll",
+                                     "0.01", "--flows",
+                                     os.path.join(root, "flows")]))
+                        check("403 cli enqueue-to-worker e2e: "
+                              "worker exits 0", rc_w == 0, str(rc_w))
+                        row = _job_row(jid)
+                        run_dir = row["run_dir"] or ""
+                        run_json = (os.path.join(run_dir, "run.json")
+                                    if run_dir else "")
+                        run_data = {}
+                        if run_json and os.path.exists(run_json):
+                            with open(run_json, encoding="utf-8") as f:
+                                run_data = json.load(f)
+                        mismatch = cli_enqueue_worker_mismatch(
+                            row["status"], run_data.get("status"),
+                            "done", "passed")
+                        check("403 cli enqueue-to-worker e2e: real "
+                              "worker completes job done with run.json "
+                              "passed", mismatch is None, mismatch or "")
+                        check("403 cli enqueue-to-worker e2e: "
+                              "run_dir is a real directory under the "
+                              "runs root",
+                              bool(run_dir) and os.path.isdir(run_dir)
+                              and os.path.abspath(run_dir).startswith(
+                                  os.path.abspath(runs_root) + os.sep),
+                              run_dir)
+                        check("403 cli enqueue-to-worker e2e: "
+                              "run.json exists in the run dir",
+                              bool(run_json)
+                              and os.path.exists(run_json), run_json)
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("403 cli enqueue-to-worker e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
