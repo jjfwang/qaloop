@@ -17910,6 +17910,231 @@ def test_issue_407_perform_cli_e2e():
           no_proc("demo/fake_model.py"))
 
 
+def test_issue_409_verify_dashboard_e2e():
+    """Issue #409: pin the verify-to-dashboard composition end to
+    end. The verify plumbing tests stub the runner and the
+    dashboard tests build from hand-written run records, so the
+    README-advertised shell path itself - build_parser ->
+    cmd_verify producing real run records and real scripted
+    ledger rows, then the real CLI dashboard command rendering
+    those runs - could rot unobserved. This test stubs NOTHING
+    (in particular not qaloop.dashboard.build): it serves the
+    repo root itself on a free port, drives the real CLI verify
+    of a passing and a designed-failure flow, then the real CLI
+    dashboard, and pins the cards, run rows, trend rows, and
+    cost-ledger line against the real records."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_dashboard_mismatch(outcome, exp):
+        if outcome.get("runs") != exp.get("runs"): return (
+            f"runs: expected {exp.get('runs')}, "
+            f"got {outcome.get('runs')}")
+        if outcome.get("demo-login-a") != exp.get("demo-login-a"): return (
+            f"demo-login-a status: expected {exp.get('demo-login-a')}, "
+            f"got {outcome.get('demo-login-a')}")
+        if outcome.get("demo-steps-fail") != exp.get("demo-steps-fail"): return (
+            f"demo-steps-fail status: expected "
+            f"{exp.get('demo-steps-fail')}, "
+            f"got {outcome.get('demo-steps-fail')}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_outcome = {"runs": 2, "demo-login-a": "passed",
+                   "demo-steps-fail": "failed"}
+    check("409 verify-dashboard e2e: exact expectations return "
+          "no mismatch",
+          verify_dashboard_mismatch(dict(exp_outcome),
+                                    exp_outcome) is None)
+    probe = verify_dashboard_mismatch(
+        dict(exp_outcome, runs=1), exp_outcome)
+    check("409 verify-dashboard e2e: corrupted runs count caught, "
+          "names field",
+          probe is not None and "runs" in probe, probe or "")
+    probe = verify_dashboard_mismatch(
+        dict(exp_outcome, **{"demo-login-a": "failed"}), exp_outcome)
+    check("409 verify-dashboard e2e: corrupted demo-login-a status "
+          "caught, names field",
+          probe is not None and "demo-login-a" in probe, probe or "")
+    probe = verify_dashboard_mismatch(
+        dict(exp_outcome, **{"demo-steps-fail": "passed"}), exp_outcome)
+    check("409 verify-dashboard e2e: corrupted demo-steps-fail "
+          "status caught, names field",
+          probe is not None and "demo-steps-fail" in probe,
+          probe or "")
+    if not os.path.exists(exe): check("409 verify-dashboard e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("409 verify-dashboard e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("409 verify-dashboard e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_a = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                flow_b = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_a, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_a = parsed.fn(parsed)
+                check("409 verify-dashboard e2e: real verify of "
+                      "demo-login-a exits 0", rc_a == 0, str(rc_a))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_b, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_b = parsed.fn(parsed)
+                check("409 verify-dashboard e2e: real verify of "
+                      "demo-steps-fail exits 1", rc_b == 1, str(rc_b))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("409 verify-dashboard e2e: exactly two run "
+                      "dirs written", len(run_dirs) == 2,
+                      str(run_dirs))
+                run_data_by_flow = {}
+                run_dir_by_flow = {}
+                for d in run_dirs:
+                    with open(os.path.join(runs_root, d, "run.json"),
+                              encoding="utf-8") as f:
+                        data = json.load(f)
+                    run_data_by_flow[data.get("flow_name")] = data
+                    run_dir_by_flow[data.get("flow_name")] = d
+                check("409 verify-dashboard e2e: run records carry "
+                      "both real flow names",
+                      set(run_data_by_flow) == {
+                          "demo-login-a", "demo-steps-fail"},
+                      str(sorted(run_data_by_flow)))
+                outcome = {
+                    "runs": len(run_dirs),
+                    "demo-login-a": (
+                        run_data_by_flow.get("demo-login-a")
+                        or {}).get("status"),
+                    "demo-steps-fail": (
+                        run_data_by_flow.get("demo-steps-fail")
+                        or {}).get("status")}
+                mismatch = verify_dashboard_mismatch(
+                    outcome, exp_outcome)
+                check("409 verify-dashboard e2e: real run records "
+                      "pin passed and failed statuses",
+                      mismatch is None, mismatch or "")
+                check("409 verify-dashboard e2e: steps-fail "
+                      "run.json failed_step is 2",
+                      (run_data_by_flow.get("demo-steps-fail")
+                       or {}).get("failed_step") == 2,
+                      str((run_data_by_flow.get("demo-steps-fail")
+                           or {}).get("failed_step")))
+                rows = ledger.read_all()
+                check("409 verify-dashboard e2e: exactly two ledger "
+                      "rows written", len(rows) == 2, str(rows))
+                check("409 verify-dashboard e2e: ledger rows are "
+                      "all scripted",
+                      all(r.get("kind") == "scripted" for r in rows),
+                      str(rows))
+                out_dir = os.path.join(td, "dashboard")
+                parsed = cli.build_parser().parse_args(
+                    ["dashboard", "--out", out_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_d = parsed.fn(parsed)
+                index_path = os.path.join(out_dir, "index.html")
+                check("409 verify-dashboard e2e: real dashboard "
+                      "exits 0", rc_d == 0, str(rc_d))
+                check("409 verify-dashboard e2e: dashboard printed "
+                      "line exact",
+                      buf.getvalue() == f"dashboard: {index_path}\n",
+                      buf.getvalue())
+                check("409 verify-dashboard e2e: dashboard "
+                      "index.html exists",
+                      os.path.exists(index_path), index_path)
+                html = ""
+                if os.path.exists(index_path):
+                    with open(index_path, encoding="utf-8") as f:
+                        html = f.read()
+                check("409 verify-dashboard e2e: dashboard card "
+                      "reads 2 runs", ">2</b>runs" in html,
+                      html[:200])
+                check("409 verify-dashboard e2e: dashboard card "
+                      "reads 1 passed",
+                      'class="pass">1</b>passed' in html, html[:200])
+                check("409 verify-dashboard e2e: dashboard card "
+                      "reads 1 failed",
+                      'class="fail">1</b>failed' in html, html[:200])
+                check("409 verify-dashboard e2e: dashboard card "
+                      "reads 0 investigations",
+                      ">0</b>investigations" in html, html[:200])
+                check("409 verify-dashboard e2e: dashboard run "
+                      "rows carry PASSED and FAILED badges",
+                      "<b>PASSED</b>" in html
+                      and "<b>FAILED</b>" in html, html[:200])
+                check("409 verify-dashboard e2e: dashboard names "
+                      "both real flows",
+                      "demo-login-a" in html
+                      and "demo-steps-fail" in html, html[:200])
+                for d in run_dirs:
+                    check("409 verify-dashboard e2e: dashboard row "
+                          f"links to REPORT.md for run {d}",
+                          f"../runs/{d}/REPORT.md" in html,
+                          html[:200])
+                check("409 verify-dashboard e2e: trend row pins "
+                      "demo-login-a at 100.0 percent",
+                      "<td>demo-login-a</td><td>1</td>"
+                      "<td>100.0% (1/1 passed)</td>" in html,
+                      html[:400])
+                check("409 verify-dashboard e2e: trend row pins "
+                      "demo-steps-fail at 0.0 percent",
+                      "<td>demo-steps-fail</td><td>1</td>"
+                      "<td>0.0% (0/1 passed)</td>" in html,
+                      html[:400])
+                check("409 verify-dashboard e2e: cost ledger reads "
+                      "scripted runs: 2",
+                      "scripted runs: 2" in html, html[:400])
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("409 verify-dashboard e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
