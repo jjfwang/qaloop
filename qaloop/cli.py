@@ -228,6 +228,10 @@ def _run_single_flow(args, flow_path: str, run_dir: str, ledger, upload_dir,
     ledger.append({"kind": "scripted", "run_dir": run_dir, "flow": spec.name,
                    "status": result.status, "duration_ms": result.duration_ms,
                    "cost_usd_est": 0.0})
+    if prune:
+        pruned = prune_old_runs(runs_root, keep_runs, current_run_dir=run_dir)
+        if pruned:
+            print(f"pruned {len(pruned)} old run dir(s) (--keep-runs {keep_runs})")
     rec.update(status=result.status, duration_ms=result.duration_ms,
                steps_passed=sum(1 for s in result.steps
                                 if s.status == "passed"),
