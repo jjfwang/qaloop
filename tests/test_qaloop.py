@@ -20917,6 +20917,326 @@ def test_issue_435_worker_retry_recover_e2e():
           f"flaky server still on {port}")
 
 
+def test_issue_437_tag_batch_verify_e2e():
+    """Issue #437: pin the tag-filtered batch verify
+    composition end to end with real flows. The existing
+    tag-filter coverage stubs the selection or the per-flow
+    path, so the real tag-filtered directory verify
+    composition - build_parser -> cmd_verify on a directory
+    with --tag, the real _select_flows filtering by tag, the
+    real _cmd_verify_batch running the selected flow for
+    real, the parent batch.json and REPORT.md written by
+    the real write_batch_summary, the per-flow
+    run.json/REPORT.md records, and the real scripted ledger
+    rows - could rot unobserved. This test stubs NOTHING: it
+    copies the two demo flows (plus the shared login
+    fragment) into a temp flows dir, tagging the login copy
+    nightly and leaving the designed-failure flow smoke,
+    serves the repo root on a free port, and drives the real
+    CLI verify twice - once with --tag nightly selecting
+    only the passing flow, once with --tag smoke selecting
+    only the failing flow in the same runs root and ledger."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def tag_batch_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"rc": 0, "flows_line": True, "batch_line": True,
+           "report_line_parent": True, "parent_count": 1,
+           "passed_count": 1,
+           "report_first_line": "# qaloop batch report [1/1 PASS]",
+           "table_row_0": "| 0 | `demo-login-a.yaml` | PASS | "
+           "4/4 | [demo-login-a](flows/demo-login-a/REPORT.md) |",
+           "batch_len": 1,
+           "batch0_file": "demo-login-a.yaml",
+           "batch0_status": "passed", "batch0_steps_passed": 4,
+           "batch0_steps_total": 4,
+           "batch0_report": "flows/demo-login-a/REPORT.md",
+           "batch0_error": None,
+           "login_status": "passed",
+           "login_report_exists": True, "ledger_rows": 1,
+           "first_kind": "scripted", "first_flow": "demo-login-a",
+           "first_status": "passed", "first_cost": 0.0}
+    check("437 tag-batch e2e: exact expectations return "
+          "no mismatch",
+          tag_batch_mismatch(dict(exp), exp) is None)
+    probe = tag_batch_mismatch(
+        dict(exp, batch0_file="demo-steps-fail.yaml"), exp)
+    check("437 tag-batch e2e: corrupted batch0_file "
+          "caught, names field",
+          probe is not None and probe.startswith("batch0_file:"),
+          probe or "")
+    probe = tag_batch_mismatch(
+        dict(exp, ledger_rows=2), exp)
+    check("437 tag-batch e2e: corrupted ledger_rows "
+          "caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+    if not os.path.exists(exe): check("437 tag-batch e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("437 tag-batch e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("437 tag-batch e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows",
+                                 "demo-steps-fail.yaml"),
+                    os.path.join(flows_dir,
+                                 "demo-steps-fail.yaml"))
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                with open(os.path.join(
+                        root, "flows", "demo-login-a.yaml"),
+                        encoding="utf-8") as f:
+                    login_text = f.read()
+                login_text = login_text.replace(
+                    "name: demo-login-a\n",
+                    "name: demo-login-a\ntags: [nightly]\n",
+                    1)
+                with open(os.path.join(flows_dir,
+                                       "demo-login-a.yaml"),
+                          "w", encoding="utf-8") as f:
+                    f.write(login_text)
+                args = cli.build_parser().parse_args(
+                    ["verify", flows_dir, "--tag", "nightly"])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                lines = buf.getvalue().splitlines()
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_lines = []
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                if report_path and os.path.exists(report_path):
+                    with open(report_path,
+                              encoding="utf-8") as f:
+                        report_lines = f.read().splitlines()
+                batch = []
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                if batch_path and os.path.exists(batch_path):
+                    with open(batch_path, encoding="utf-8") as f:
+                        batch = json.load(f)
+                batch0 = batch[0] if len(batch) > 0 else {}
+                login_data = {}
+                login_json = (os.path.join(
+                    parent, "flows", "demo-login-a", "run.json")
+                    if parent else "")
+                if login_json and os.path.exists(login_json):
+                    with open(login_json, encoding="utf-8") as f:
+                        login_data = json.load(f)
+                rows = ledger.read_all()
+                row0 = rows[0] if len(rows) > 0 else {}
+                outcome = {
+                    "rc": rc,
+                    "flows_line": (
+                        "flows: 1 (tag filter: nightly)"
+                        in lines),
+                    "batch_line": ("batch: 1/1 flows passed"
+                                   in lines),
+                    "report_line_parent": (
+                        bool(parent) and f"report: {report_path}"
+                        in lines),
+                    "parent_count": len(parents),
+                    "passed_count": sum(
+                        1 for e in batch
+                        if e.get("status") == "passed"),
+                    "report_first_line": (
+                        report_lines[0] if report_lines else None),
+                    "table_row_0": next(
+                        (l for l in report_lines
+                         if l.startswith("| 0 |")), None),
+                    "batch_len": len(batch),
+                    "batch0_file": batch0.get("file"),
+                    "batch0_status": batch0.get("status"),
+                    "batch0_steps_passed": batch0.get(
+                        "steps_passed"),
+                    "batch0_steps_total": batch0.get(
+                        "steps_total"),
+                    "batch0_report": batch0.get("report"),
+                    "batch0_error": batch0.get("error"),
+                    "login_status": login_data.get("status"),
+                    "login_report_exists": bool(parent) and (
+                        os.path.exists(os.path.join(
+                            parent, "flows", "demo-login-a",
+                            "REPORT.md"))),
+                    "ledger_rows": len(rows),
+                    "first_kind": row0.get("kind"),
+                    "first_flow": row0.get("flow"),
+                    "first_status": row0.get("status"),
+                    "first_cost": row0.get("cost_usd_est")}
+                mismatch = tag_batch_mismatch(outcome, exp)
+                check("437 tag-batch e2e: real composition "
+                      "pins the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+                before = (sorted(os.listdir(runs_root))
+                          if os.path.isdir(runs_root) else [])
+                args = cli.build_parser().parse_args(
+                    ["verify", flows_dir, "--tag", "smoke"])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                lines = buf.getvalue().splitlines()
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                new_names = [n for n in parents
+                             if n not in before]
+                parent = (os.path.join(runs_root, new_names[0])
+                          if len(new_names) == 1 else "")
+                report_lines = []
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                if report_path and os.path.exists(report_path):
+                    with open(report_path,
+                              encoding="utf-8") as f:
+                        report_lines = f.read().splitlines()
+                batch = []
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                if batch_path and os.path.exists(batch_path):
+                    with open(batch_path, encoding="utf-8") as f:
+                        batch = json.load(f)
+                batch0 = batch[0] if len(batch) > 0 else {}
+                fail_data = {}
+                fail_json = (os.path.join(
+                    parent, "flows", "demo-steps-fail",
+                    "run.json") if parent else "")
+                if fail_json and os.path.exists(fail_json):
+                    with open(fail_json, encoding="utf-8") as f:
+                        fail_data = json.load(f)
+                rows = ledger.read_all()
+                row1 = rows[1] if len(rows) > 1 else {}
+                exp2 = {"rc": 1, "flows_line": True,
+                        "batch_line": True,
+                        "report_line_parent": True,
+                        "parent_count": 2, "passed_count": 0,
+                        "report_first_line":
+                            "# qaloop batch report [0/1 PASS]",
+                        "table_row_0":
+                            "| 0 | `demo-steps-fail.yaml` | "
+                            "FAIL | 4/7 | [demo-steps-fail]"
+                            "(flows/demo-steps-fail/REPORT.md) |",
+                        "batch_len": 1,
+                        "batch0_file": "demo-steps-fail.yaml",
+                        "batch0_status": "failed",
+                        "batch0_steps_passed": 4,
+                        "batch0_steps_total": 7,
+                        "batch0_report":
+                            "flows/demo-steps-fail/REPORT.md",
+                        "batch0_error": None,
+                        "fail_status": "failed",
+                        "ledger_rows": 2,
+                        "second_kind": "scripted",
+                        "second_flow": "demo-steps-fail",
+                        "second_status": "failed",
+                        "second_cost": 0.0}
+                outcome = {
+                    "rc": rc,
+                    "flows_line": (
+                        "flows: 1 (tag filter: smoke)"
+                        in lines),
+                    "batch_line": ("batch: 0/1 flows passed"
+                                   in lines),
+                    "report_line_parent": (
+                        bool(parent) and f"report: {report_path}"
+                        in lines),
+                    "parent_count": len(parents),
+                    "passed_count": sum(
+                        1 for e in batch
+                        if e.get("status") == "passed"),
+                    "report_first_line": (
+                        report_lines[0] if report_lines else None),
+                    "table_row_0": next(
+                        (l for l in report_lines
+                         if l.startswith("| 0 |")), None),
+                    "batch_len": len(batch),
+                    "batch0_file": batch0.get("file"),
+                    "batch0_status": batch0.get("status"),
+                    "batch0_steps_passed": batch0.get(
+                        "steps_passed"),
+                    "batch0_steps_total": batch0.get(
+                        "steps_total"),
+                    "batch0_report": batch0.get("report"),
+                    "batch0_error": batch0.get("error"),
+                    "fail_status": fail_data.get("status"),
+                    "ledger_rows": len(rows),
+                    "second_kind": row1.get("kind"),
+                    "second_flow": row1.get("flow"),
+                    "second_status": row1.get("status"),
+                    "second_cost": row1.get("cost_usd_est")}
+                mismatch = tag_batch_mismatch(outcome, exp2)
+                check("437 tag-batch e2e: smoke phase pins "
+                      "the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("437 tag-batch e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
