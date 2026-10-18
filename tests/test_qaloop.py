@@ -18135,6 +18135,238 @@ def test_issue_409_verify_dashboard_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_411_evaluate_cli_e2e():
+    """Issue #411: pin the CLI evaluate composition end to end.
+    The evaluate unit tests script the judge internals and the
+    CLI plumbing tests use hand-built runs, so the advertised
+    shell path itself - build_parser -> cmd_verify producing a
+    real run record and a scripted ledger row, then
+    build_parser -> cmd_evaluate judging that real run with
+    only the model network seam (qaloop.evaluate._chat)
+    scripted, writing EVALUATION.md + evaluation.json into the
+    run dir and appending an evaluate ledger row - could rot
+    unobserved. This test serves the repo root on a free port,
+    drives the real verify, then the real evaluate, and pins
+    the printed lines, the verdict artefacts, the cost math,
+    and the ledger against the real records."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop import evaluate as evaluate_mod
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def evaluate_outcome_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_outcome = {
+        "verdict_line": "verdict: MAKES_SENSE (confidence: high)",
+        "rationale_line": ("rationale: the run record shows the "
+                           "login flow passing"),
+        "cost_line": "cost: tokens 200/100  est $0.000090",
+        "report_line": "report: <run_dir>/EVALUATION.md",
+        "stdout_lines": 4,
+        "chat_calls": 2,
+        "eval_verdict": "MAKES_SENSE",
+        "eval_confidence": "high",
+        "cost_tokens_in": 200,
+        "cost_tokens_out": 100,
+        "cost_usd_est": 9e-05,
+        "cost_model": "gpt-4o-mini",
+        "md_has_verdict": True,
+        "md_has_critic": True,
+        "ledger_total": 2,
+        "ledger_kind": "evaluate",
+        "ledger_scripted": 1,
+        "ledger_verdict": "MAKES_SENSE",
+        "ledger_claim": "the login demo passes"}
+    check("411 evaluate-cli e2e: exact expectations return "
+          "no mismatch",
+          evaluate_outcome_mismatch(dict(exp_outcome),
+                                    exp_outcome) is None)
+    probe = evaluate_outcome_mismatch(
+        dict(exp_outcome, verdict_line="verdict: BOGUS"), exp_outcome)
+    check("411 evaluate-cli e2e: corrupted verdict line caught, "
+          "names field",
+          probe is not None and "verdict" in probe, probe or "")
+    probe = evaluate_outcome_mismatch(
+        dict(exp_outcome, ledger_kind="scripted"), exp_outcome)
+    check("411 evaluate-cli e2e: corrupted ledger kind caught, "
+          "names field",
+          probe is not None and ("ledger" in probe or "kind" in probe),
+          probe or "")
+    if not os.path.exists(exe): check("411 evaluate-cli e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("411 evaluate-cli e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("411 evaluate-cli e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY",
+                "QALOOP_MODEL_NAME", "QALOOP_MODEL_PRICE_IN",
+                "QALOOP_MODEL_PRICE_OUT", "QALOOP_MODEL_BASE_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    real_chat = evaluate_mod._chat
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["QALOOP_MODEL_API_KEY"] = "probe-key-411"
+                for k in env_keys[5:]:
+                    os.environ.pop(k, None)
+                flow = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_v = parsed.fn(parsed)
+                check("411 evaluate-cli e2e: real verify of "
+                      "demo-login-a exits 0", rc_v == 0, str(rc_v))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("411 evaluate-cli e2e: exactly one run "
+                      "dir written", len(run_dirs) == 1,
+                      str(run_dirs))
+                run_dir = os.path.join(
+                    runs_root, run_dirs[0]) if run_dirs else os.path.join(
+                        runs_root, "missing")
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as f:
+                    run_data = json.load(f)
+                check("411 evaluate-cli e2e: run record flow_name "
+                      "is demo-login-a",
+                      run_data.get("flow_name") == "demo-login-a",
+                      str(run_data.get("flow_name")))
+                check("411 evaluate-cli e2e: run record status "
+                      "is passed",
+                      run_data.get("status") == "passed",
+                      str(run_data.get("status")))
+                verdict = {"verdict": "MAKES_SENSE",
+                           "confidence": "high",
+                           "rationale": ("the run record shows the "
+                                         "login flow passing"),
+                           "evidence": ['"the login demo passes" persists',
+                                        '"the login demo passes" renders'],
+                           "risks": []}
+                calls = []
+
+                def fake_chat(cfg, messages, timeout_s=90):
+                    calls.append(messages)
+                    return json.dumps(verdict), {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 50}
+
+                evaluate_mod._chat = fake_chat
+                diff_path = os.path.join(td, "change.diff")
+                with open(diff_path, "w", encoding="utf-8") as f:
+                    f.write("--- a/demo/demo-login.html\n"
+                            "+++ b/demo/demo-login.html\n"
+                            "@@ -1 +1 @@\n-old\n"
+                            "+the login demo passes\n")
+                parsed = cli.build_parser().parse_args(
+                    ["evaluate", "--claim", "the login demo passes",
+                     "--run", run_dir, "--diff", diff_path])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_e = parsed.fn(parsed)
+                check("411 evaluate-cli e2e: real evaluate exits 0",
+                      rc_e == 0, str(rc_e))
+                lines = buf.getvalue().splitlines()
+                eval_json_path = os.path.join(
+                    run_dir, "evaluation.json")
+                eval_md_path = os.path.join(run_dir, "EVALUATION.md")
+                check("411 evaluate-cli e2e: evaluation.json exists",
+                      os.path.exists(eval_json_path), eval_json_path)
+                check("411 evaluate-cli e2e: EVALUATION.md exists",
+                      os.path.exists(eval_md_path), eval_md_path)
+                eval_data = {}
+                if os.path.exists(eval_json_path):
+                    with open(eval_json_path, encoding="utf-8") as f:
+                        eval_data = json.load(f)
+                md_text = ""
+                if os.path.exists(eval_md_path):
+                    with open(eval_md_path, encoding="utf-8") as f:
+                        md_text = f.read()
+                rows = ledger.read_all()
+                eval_rows = [r for r in rows
+                             if r.get("kind") == "evaluate"]
+                eval_row = eval_rows[0] if eval_rows else {}
+                cost = eval_data.get("cost") or {}
+                verdict_data = eval_data.get("verdict") or {}
+                outcome = {
+                    "verdict_line": lines[0] if len(lines) > 0 else "",
+                    "rationale_line": lines[1] if len(lines) > 1 else "",
+                    "cost_line": lines[2] if len(lines) > 2 else "",
+                    "report_line": lines[3] if len(lines) > 3 else "",
+                    "stdout_lines": len(lines),
+                    "chat_calls": len(calls),
+                    "eval_verdict": verdict_data.get("verdict"),
+                    "eval_confidence": verdict_data.get("confidence"),
+                    "cost_tokens_in": cost.get("tokens_in"),
+                    "cost_tokens_out": cost.get("tokens_out"),
+                    "cost_usd_est": cost.get("cost_usd_est"),
+                    "cost_model": cost.get("model"),
+                    "md_has_verdict": "MAKES_SENSE" in md_text,
+                    "md_has_critic": "## Critic" in md_text,
+                    "ledger_total": len(rows),
+                    "ledger_kind": eval_row.get("kind"),
+                    "ledger_scripted": len(
+                        [r for r in rows
+                         if r.get("kind") == "scripted"]),
+                    "ledger_verdict": eval_row.get("verdict"),
+                    "ledger_claim": eval_row.get("claim")}
+                exp_real = dict(
+                    exp_outcome,
+                    report_line=f"report: {run_dir}/EVALUATION.md")
+                mismatch = evaluate_outcome_mismatch(outcome, exp_real)
+                check("411 evaluate-cli e2e: printed lines, verdict "
+                      "artefacts, cost and ledger pin exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        evaluate_mod._chat = real_chat
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("411 evaluate-cli e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
