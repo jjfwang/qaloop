@@ -20018,6 +20018,212 @@ def test_issue_427_matrix_verify_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_429_verify_dashboard_e2e():
+    """Issue #429: pin the verify-to-dashboard composition end
+    to end. The existing dashboard coverage handwrites run.json
+    files or stubs the run path, so the advertised shell path
+    itself - build_parser -> cmd_verify writing real run
+    records through the real runner/report path, then
+    build_parser -> cmd_dashboard rendering those exact records
+    through the real qaloop.dashboard.build (cards, per-run
+    rows, pass-rate trend) - could rot unobserved. This test
+    stubs NOTHING: it serves the repo root itself on a free
+    port, drives the real CLI verify of a passing and a
+    designed-failure flow, then drives the real CLI dashboard
+    command and pins its exact printed line and the rendered
+    index.html against the real run records."""
+    import re
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_dashboard_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_cards = {"runs": 2, "passed": 1, "failed": 1,
+                 "investigations": 0}
+    check("429 verify-dashboard e2e: exact expectations return "
+          "no mismatch",
+          verify_dashboard_mismatch(dict(exp_cards),
+                                    exp_cards) is None)
+    probe = verify_dashboard_mismatch(
+        dict(exp_cards, runs=3), exp_cards)
+    check("429 verify-dashboard e2e: corrupted runs caught, "
+          "names field",
+          probe is not None and probe.startswith("runs:"),
+          probe or "")
+    probe = verify_dashboard_mismatch(
+        dict(exp_cards, passed=2), exp_cards)
+    check("429 verify-dashboard e2e: corrupted passed caught, "
+          "names field",
+          probe is not None and probe.startswith("passed:"),
+          probe or "")
+    if not os.path.exists(exe): check("429 verify-dashboard e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("429 verify-dashboard e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("429 verify-dashboard e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_file = os.path.join(td, "ledger.jsonl")
+                out_dir = os.path.join(td, "dash")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_file
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_a = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                flow_b = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_a, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_a = parsed.fn(parsed)
+                check("429 verify-dashboard e2e: real verify of "
+                      "demo-login-a exits 0", rc_a == 0, str(rc_a))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_b, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_b = parsed.fn(parsed)
+                check("429 verify-dashboard e2e: real verify of "
+                      "demo-steps-fail exits 1", rc_b == 1, str(rc_b))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("429 verify-dashboard e2e: exactly two real "
+                      "run dirs written", len(run_dirs) == 2,
+                      str(run_dirs))
+                run_data_by_flow = {}
+                for d in run_dirs:
+                    with open(os.path.join(runs_root, d, "run.json"),
+                              encoding="utf-8") as f:
+                        data = json.load(f)
+                    run_data_by_flow[data.get("flow_name")] = data
+                check("429 verify-dashboard e2e: run records carry "
+                      "both real flow names",
+                      set(run_data_by_flow) == {
+                          "demo-login-a", "demo-steps-fail"},
+                      str(sorted(run_data_by_flow)))
+                parsed_d = cli.build_parser().parse_args(
+                    ["dashboard", "--out", out_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_d = parsed_d.fn(parsed_d)
+                check("429 verify-dashboard e2e: real cmd_dashboard "
+                      "exits 0", rc_d == 0, str(rc_d))
+                exp_line = "dashboard: " + os.path.join(
+                    out_dir, "index.html")
+                check("429 verify-dashboard e2e: dashboard printed "
+                      "line is the exact index.html path",
+                      buf.getvalue().strip() == exp_line,
+                      buf.getvalue())
+                index_path = os.path.join(out_dir, "index.html")
+                html = ""
+                if os.path.exists(index_path):
+                    with open(index_path, encoding="utf-8") as f:
+                        html = f.read()
+
+                def card_int(pattern):
+                    m = re.search(pattern, html)
+                    return int(m.group(1)) if m else None
+
+                outcome = {
+                    "runs": card_int(r"<b>(\d+)</b>runs"),
+                    "passed": card_int(
+                        r'<b class="pass">(\d+)</b>passed'),
+                    "failed": card_int(
+                        r'<b class="fail">(\d+)</b>failed'),
+                    "investigations": card_int(
+                        r"<b>(\d+)</b>investigations")}
+                mismatch = verify_dashboard_mismatch(
+                    outcome, exp_cards)
+                check("429 verify-dashboard e2e: dashboard cards "
+                      "pin the real run counts exactly",
+                      mismatch is None, mismatch or "")
+                check("429 verify-dashboard e2e: runs card raw "
+                      "markup", ">2</b>runs" in html, html[:400])
+                check("429 verify-dashboard e2e: passed card raw "
+                      "markup", ">1</b>passed" in html, html[:400])
+                check("429 verify-dashboard e2e: failed card raw "
+                      "markup", ">1</b>failed" in html, html[:400])
+                check("429 verify-dashboard e2e: investigations "
+                      "card raw markup",
+                      ">0</b>investigations" in html, html[:400])
+                row_segs = html.split("<tr>")
+
+                def row_for(flow_name):
+                    matches = [seg for seg in row_segs
+                               if f"<td>{flow_name}</td>" in seg]
+                    return matches[0] if matches else ""
+
+                for flow_name, exp_status in (
+                        ("demo-login-a", "PASSED"),
+                        ("demo-steps-fail", "FAILED")):
+                    record = run_data_by_flow.get(flow_name) or {}
+                    basename = os.path.basename(
+                        record.get("run_dir") or "")
+                    row = row_for(flow_name)
+                    check(f"429 verify-dashboard e2e: dashboard row "
+                          f"for {flow_name} pins its status and "
+                          f"report link",
+                          bool(basename)
+                          and (record.get("status") or "").upper()
+                          == exp_status
+                          and f"<b>{exp_status}</b>" in row
+                          and f"../runs/{basename}/REPORT.md" in row,
+                          row[:300])
+                check("429 verify-dashboard e2e: trend pins "
+                      "demo-login-a at 100.0% (1/1 passed)",
+                      "100.0% (1/1 passed)" in html, html[-600:])
+                check("429 verify-dashboard e2e: trend pins "
+                      "demo-steps-fail at 0.0% (0/1 passed)",
+                      "0.0% (0/1 passed)" in html, html[-600:])
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("429 verify-dashboard e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
