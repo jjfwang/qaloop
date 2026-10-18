@@ -17680,6 +17680,236 @@ def test_issue_405_investigate_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_407_perform_cli_e2e():
+    """Issue #407: pin the CLI perform composition end to end.
+    Issue #387 drives perform() directly against the fake model,
+    and the cmd_perform plumbing tests stub perform(), so the
+    README-advertised shell path itself - build_parser ->
+    cmd_perform resolving the runs root from QALOOP_RUNS, the
+    real perform() against the real fake model and proof server,
+    the exact printed status / summary / actions lines, and the
+    real ledger row cmd_perform appends via QALOOP_LEDGER - is
+    executed by no test. This test stubs NOTHING in that chain:
+    it boots the proof server and the fake model, drives the real
+    CLI perform of the signup task, and pins stdout, the single
+    run dir's perform.json and PERFORM.md, and the single ledger
+    row (4800/360 tokens, est $0.0009 at default prices)."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    task = "Sign up as Maya using the greeting signup form"
+    exp_summary = (
+        "Loaded the mocked greeting, filled the signup form as Maya "
+        "(maya@example.com), submitted, and confirmed 'Welcome, Maya!' "
+        "is visible.")
+    exp = {"status": "completed", "summary": exp_summary, "actions": 6,
+           "tokens_in": 4800, "tokens_out": 360, "cost_usd_est": 0.0009,
+           "kind": "perform", "ceiling_reached": False}
+
+    def perform_cli_mismatch(outcome, exp):
+        if outcome.get("status") != exp.get("status"): return (
+            f"status: expected {exp.get('status')}, "
+            f"got {outcome.get('status')}")
+        if outcome.get("summary") != exp.get("summary"): return (
+            f"summary: expected {exp.get('summary')!r}, "
+            f"got {outcome.get('summary')!r}")
+        if outcome.get("actions") != exp.get("actions"): return (
+            f"actions: expected {exp.get('actions')}, "
+            f"got {outcome.get('actions')}")
+        if outcome.get("tokens_in") != exp.get("tokens_in"): return (
+            f"tokens_in: expected {exp.get('tokens_in')}, "
+            f"got {outcome.get('tokens_in')}")
+        if outcome.get("tokens_out") != exp.get("tokens_out"): return (
+            f"tokens_out: expected {exp.get('tokens_out')}, "
+            f"got {outcome.get('tokens_out')}")
+        if outcome.get("cost_usd_est") != exp.get("cost_usd_est"): return (
+            f"cost_usd_est: expected {exp.get('cost_usd_est')}, "
+            f"got {outcome.get('cost_usd_est')}")
+        if outcome.get("kind") != exp.get("kind"): return (
+            f"kind: expected {exp.get('kind')}, got {outcome.get('kind')}")
+        if outcome.get("ceiling_reached") != exp.get("ceiling_reached"): return (
+            f"ceiling_reached: expected {exp.get('ceiling_reached')}, "
+            f"got {outcome.get('ceiling_reached')}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_greeting():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8933/api/greeting", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def no_proc(pattern):
+        return subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True).returncode != 0
+
+    probe = perform_cli_mismatch(dict(exp, status="failed"), exp)
+    check("407 perform cli e2e: corrupted status caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_cli_mismatch(dict(exp, summary="wrong summary"), exp)
+    check("407 perform cli e2e: corrupted summary caught, names field",
+          probe is not None and "summary" in probe, probe or "")
+    probe = perform_cli_mismatch(dict(exp, kind="scripted"), exp)
+    check("407 perform cli e2e: corrupted ledger kind caught, "
+          "names field", probe is not None and "kind" in probe,
+          probe or "")
+    check("407 perform cli e2e: exact expectations return no mismatch",
+          perform_cli_mismatch(dict(exp), exp) is None)
+    if not os.path.exists(exe): check("407 perform cli e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_API_KEY", "QALOOP_MODEL_NAME",
+                "QALOOP_MODEL_PRICE_IN", "QALOOP_MODEL_PRICE_OUT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    proof = None
+    fake = None
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(td, "ledger.jsonl")
+            os.environ["QALOOP_MODEL_BASE_URL"] = "http://127.0.0.1:8932"
+            os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-407"
+            os.environ["QALOOP_MODEL_NAME"] = "fake-model"
+            os.environ.pop("QALOOP_MODEL_PRICE_IN", None)
+            os.environ.pop("QALOOP_MODEL_PRICE_OUT", None)
+            occupied_8933 = not port_free(8933)
+            occupied_8932 = not port_free(8932)
+            check("407 perform cli e2e: port 8933 not already in use",
+                  not occupied_8933, "stale server already on 8933")
+            check("407 perform cli e2e: port 8932 not already in use",
+                  not occupied_8932, "stale server already on 8932")
+            check("407 perform cli e2e: no stale proof server answering",
+                  not poll_greeting())
+            check("407 perform cli e2e: no stale proof server process",
+                  no_proc("demo/proof_server.py"))
+            check("407 perform cli e2e: no stale fake model process",
+                  no_proc("demo/fake_model.py"))
+            if not occupied_8933 and not occupied_8932:
+                proof = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("407 perform cli e2e: proof server ready on 8933",
+                      ready)
+                if ready:
+                    fake = subprocess.Popen(
+                        [sys.executable, "demo/fake_model.py"], cwd=root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    deadline = time.time() + 10
+                    fake_ready = False
+                    while not fake_ready and time.time() < deadline:
+                        fake_ready = not port_free(8932)
+                        time.sleep(0 if fake_ready else 0.1)
+                    check("407 perform cli e2e: fake model ready on 8932",
+                          fake_ready)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = cli.cmd_perform(
+                            cli.build_parser().parse_args(
+                                ["perform", "--task", task,
+                                 "--target",
+                                 "http://127.0.0.1:8933/demo/mock-demo.html",
+                                 "--max-actions", "10",
+                                 "--executable-path", exe]))
+                    out = buf.getvalue()
+                    check("407 perform cli e2e: real CLI perform exits 0",
+                          rc == 0, str(rc))
+                    check("407 perform cli e2e: stdout pins status line",
+                          "status: completed" in out, out)
+                    check("407 perform cli e2e: stdout pins summary line",
+                          f"summary: {exp_summary}" in out, out)
+                    check("407 perform cli e2e: stdout pins actions line",
+                          "actions: 6  tokens 4800/360  est $0.0009" in out,
+                          out)
+                    run_dirs = sorted(os.listdir(runs_root)) \
+                        if os.path.isdir(runs_root) else []
+                    check("407 perform cli e2e: exactly one run dir "
+                          "written", len(run_dirs) == 1, str(run_dirs))
+                    if run_dirs:
+                        run_dir = os.path.join(runs_root, run_dirs[0])
+                        check("407 perform cli e2e: stdout pins report "
+                              "line", f"report: {os.path.join(run_dir, 'PERFORM.md')}" in out,
+                              out)
+                        pjson = os.path.join(run_dir, "perform.json")
+                        pdata = {}
+                        if os.path.exists(pjson):
+                            with open(pjson, encoding="utf-8") as f:
+                                pdata = json.load(f)
+                        rows = ledger.read_all()
+                        check("407 perform cli e2e: exactly one ledger "
+                              "row written", len(rows) == 1, str(rows))
+                        row = rows[0] if rows else {}
+                        outcome = {
+                            "status": pdata.get("status"),
+                            "summary": pdata.get("summary"),
+                            "actions": pdata.get("action_count"),
+                            "tokens_in": pdata.get("tokens_in"),
+                            "tokens_out": pdata.get("tokens_out"),
+                            "cost_usd_est": pdata.get("cost_usd_est"),
+                            "kind": row.get("kind"),
+                            "ceiling_reached": row.get("ceiling_reached")}
+                        mismatch = perform_cli_mismatch(outcome, exp)
+                        check("407 perform cli e2e: perform.json and "
+                              "ledger kind pin the completed outcome",
+                              mismatch is None, mismatch or "")
+                        check("407 perform cli e2e: PERFORM.md exists "
+                              "in the run dir",
+                              os.path.exists(os.path.join(
+                                  run_dir, "PERFORM.md")), run_dir)
+                        check("407 perform cli e2e: ledger run_dir is "
+                              "the discovered run dir",
+                              row.get("run_dir") == run_dir, str(row))
+                        check("407 perform cli e2e: ledger task is "
+                              "verbatim", row.get("task") == task, str(row))
+                        check("407 perform cli e2e: ledger status, "
+                              "actions and tokens pinned",
+                              row.get("status") == "completed"
+                              and row.get("actions") == 6
+                              and row.get("tokens_in") == 4800
+                              and row.get("tokens_out") == 360, str(row))
+                        check("407 perform cli e2e: ledger cost, ceiling "
+                              "fields and ts pinned",
+                              row.get("cost_usd_est") == 0.0009
+                              and row.get("max_cost_usd") == 0.0
+                              and row.get("ceiling_reached") is False
+                              and bool(row.get("ts")), str(row))
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            proof.terminate() if proof is not None else None
+            proof.wait() if proof is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("407 perform cli e2e: port 8933 free after cleanup",
+          port_free(8933))
+    check("407 perform cli e2e: port 8932 free after cleanup",
+          port_free(8932))
+    check("407 perform cli e2e: no proof server remains after cleanup",
+          no_proc("demo/proof_server.py"))
+    check("407 perform cli e2e: no fake model remains after cleanup",
+          no_proc("demo/fake_model.py"))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
