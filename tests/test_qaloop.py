@@ -20224,6 +20224,153 @@ def test_issue_429_verify_dashboard_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_431_single_flow_keep_runs_prune_e2e():
+    """Issue #431: pin single-flow verify --keep-runs pruning end
+    to end. Batch and matrix verify already prune the runs root
+    after their reports, but the plain single-flow path silently
+    ignored retention, so repeated single verifies accumulated
+    run dirs forever. This test stubs NOTHING: it serves the
+    repo root itself on a free port, drives the real CLI verify
+    of flows/demo-login-a.yaml three times with default
+    retention (dirs accumulate, no pruned line), then once with
+    --keep-runs 2 (the exact pruned line prints and exactly the
+    expected survivors remain, the current run included), then
+    once with --keep-runs 0 as the keep-everything control."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def keep_runs_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"pruned_count": 2, "survivors": {"run-a", "run-b"}}
+    check("431 keep-runs e2e: exact expectations return no mismatch",
+          keep_runs_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = keep_runs_mismatch(
+        dict(exp_probe, pruned_count=1), exp_probe)
+    check("431 keep-runs e2e: corrupted pruned_count caught, "
+          "names field",
+          probe is not None and probe.startswith("pruned_count:"),
+          probe or "")
+    probe = keep_runs_mismatch(
+        dict(exp_probe, survivors={"run-a"}), exp_probe)
+    check("431 keep-runs e2e: corrupted survivors caught, "
+          "names field",
+          probe is not None and probe.startswith("survivors:"),
+          probe or "")
+    if not os.path.exists(exe): check("431 keep-runs e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("431 keep-runs e2e: static port not already answering",
+          port_free(port), f"port {port} already in use")
+    check("431 keep-runs e2e: no http.server for the port yet",
+          no_static_server(port), f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_file = os.path.join(td, "ledger.jsonl")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_file
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_a = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+
+                def run_verify(extra):
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", flow_a, "--executable-path", exe]
+                        + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                for i in range(3):
+                    rc, lines = run_verify([])
+                    check(f"431 keep-runs e2e: default verify "
+                          f"{i + 1} exits 0", rc == 0, str(rc))
+                    check(f"431 keep-runs e2e: default verify "
+                          f"{i + 1} prints no pruned line",
+                          not any("pruned" in ln for ln in lines),
+                          str(lines))
+                snapshot = sorted(os.listdir(runs_root))
+                check("431 keep-runs e2e: exactly 3 run dirs "
+                      "accumulate under default retention",
+                      len(snapshot) == 3, str(snapshot))
+                rc, lines = run_verify(["--keep-runs", "2"])
+                check("431 keep-runs e2e: --keep-runs 2 verify "
+                      "exits 0", rc == 0, str(rc))
+                check("431 keep-runs e2e: exact pruned line printed",
+                      "pruned 2 old run dir(s) (--keep-runs 2)" in lines,
+                      str(lines))
+                after = sorted(os.listdir(runs_root))
+                new_names = [n for n in after if n not in snapshot]
+                current = new_names[0] if len(new_names) == 1 else ""
+                all_four = sorted(snapshot + [current])
+                exp_survivors = set(all_four[-2:]) | {current}
+                outcome = {
+                    "pruned_count": len(set(all_four) - set(after)),
+                    "survivors": set(after)}
+                exp_outcome = {"pruned_count": 2,
+                               "survivors": exp_survivors}
+                mismatch = keep_runs_mismatch(outcome, exp_outcome)
+                check("431 keep-runs e2e: pruned count and survivors "
+                      "pin exactly", mismatch is None, mismatch or "")
+                check("431 keep-runs e2e: current run dir survives "
+                      "pruning", current in set(after), str(after))
+                rc, lines = run_verify(["--keep-runs", "0"])
+                check("431 keep-runs e2e: --keep-runs 0 verify "
+                      "exits 0", rc == 0, str(rc))
+                check("431 keep-runs e2e: --keep-runs 0 prints no "
+                      "pruned line",
+                      not any("pruned" in ln for ln in lines),
+                      str(lines))
+                check("431 keep-runs e2e: --keep-runs 0 grows the "
+                      "runs root by exactly one (2 to 3)",
+                      len(os.listdir(runs_root)) == 3,
+                      str(sorted(os.listdir(runs_root))))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("431 keep-runs e2e: no http.server remains after cleanup",
+          no_static_server(port), f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
