@@ -20634,6 +20634,289 @@ def test_issue_433_worker_notify_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_435_worker_retry_recover_e2e():
+    """Issue #435: pin the worker retry-then-succeed
+    composition end to end with a real recovering job. The
+    retry unit tests stub the flow run, so the real chain -
+    a real failing browser run through worker.handle_job,
+    queue.record_failure requeueing within budget, the same
+    job re-claimed, and a second real browser run passing
+    against a page that has recovered, landing the job done
+    via queue.complete with the second run_dir - could rot
+    unobserved. This test stubs NOTHING: a caller-owned
+    in-process threaded server serves a stateful flaky page
+    (first GET of /flaky.html says still down, every later
+    GET says recovered and ready), the flow is written into
+    a temp flows dir with investigate_on_failure false,
+    QALOOP_MODEL_API_KEY is removed, and the real
+    worker.handle_job is driven twice."""
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from qaloop import queue, worker
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_retry_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    exp_probe = {"first_run_count": 1,
+                 "first_run_status": "failed",
+                 "first_job_status": "pending",
+                 "first_attempts": 1,
+                 "first_note":
+                     "verify-flow -> failed (retry 1 of 1)",
+                 "second_claim_id": 42, "run_count": 2,
+                 "second_run_status": "passed",
+                 "job_status": "done", "job_attempts": 1,
+                 "job_note": "verify-flow -> passed",
+                 "job_run_dir": "/tmp/real-runs/run-2",
+                 "page_hits": 2,
+                 "ledger_kinds": ["scripted", "scripted"],
+                 "ledger_statuses": ["failed", "passed"]}
+    check("435 worker-retry e2e: exact expectations return "
+          "no mismatch",
+          worker_retry_mismatch(dict(exp_probe), exp_probe)
+          is None)
+    probe = worker_retry_mismatch(
+        dict(exp_probe, job_status="failed"), exp_probe)
+    check("435 worker-retry e2e: corrupted job_status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    probe = worker_retry_mismatch(
+        dict(exp_probe, job_run_dir="/tmp/wrong"), exp_probe)
+    check("435 worker-retry e2e: corrupted job_run_dir "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("job_run_dir:"),
+          probe or "")
+    if not os.path.exists(exe): check("435 worker-retry e2e execution skipped (no browser)", True); return
+
+    hits = {"count": 0}
+
+    class FlakyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/flaky.html":
+                hits["count"] += 1
+                text = ("still down" if hits["count"] == 1
+                        else "recovered and ready")
+                body = ("<html><body><div id=\"out\">"
+                        + text + "</div></body></html>"
+                        ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length",
+                                 str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/health":
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length",
+                                 str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    port = find_free_port()
+    check("435 worker-retry e2e: flaky port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    base = f"http://127.0.0.1:{port}"
+    srv = HTTPServer(("127.0.0.1", port), FlakyHandler)
+    srv_t = threading.Thread(target=srv.serve_forever,
+                             daemon=True)
+    srv_t.start()
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        try:
+            wait_for_http(f"{base}/health")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    flows_dir = os.path.join(td, "flows")
+                    os.makedirs(flows_dir)
+                    ledger_path = os.path.join(td,
+                                               "ledger.jsonl")
+                    os.environ["QALOOP_LEDGER"] = ledger_path
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ["TARGET_URL"] = base
+                    flow_text = (
+                        "version: 1\n"
+                        "name: demo-worker-retry-recover\n"
+                        "target: ${TARGET_URL}\n"
+                        "\n"
+                        "steps:\n"
+                        "  - name: open the flaky page\n"
+                        "    goto: /flaky.html\n"
+                        "\n"
+                        "  - name: page recovers and is ready\n"
+                        "    timeout_ms: 3000\n"
+                        "    expect:\n"
+                        "      - text_contains: "
+                        "{selector: \"#out\", "
+                        "text: \"recovered and ready\"}\n"
+                        "\n"
+                        "artifacts: {screenshot: on-failure, "
+                        "ax_snapshot: on-failure, trace: false}\n"
+                        "timeouts: {step_ms: 15000, "
+                        "run_ms: 120000}\n"
+                        "investigate_on_failure: false\n")
+                    check("435 worker-retry e2e: flow pins "
+                          "investigate_on_failure: false",
+                          "investigate_on_failure: false"
+                          in flow_text)
+                    with open(os.path.join(flows_dir,
+                                           "flaky.yaml"),
+                              "w", encoding="utf-8") as f:
+                        f.write(flow_text)
+                    jid = queue.enqueue(
+                        "verify-flow",
+                        {"flow": "flaky.yaml", "target": base},
+                        max_retries=1)
+                    job = queue.claim()
+                    check("435 worker-retry e2e: enqueued job "
+                          "claimed for attempt 1",
+                          job is not None and job["id"] == jid,
+                          str(job))
+                    if job is not None and job["id"] == jid:
+                        worker.handle_job(
+                            job, flows_dir=flows_dir,
+                            runs_root=runs_root, headless=True,
+                            executable_path=exe,
+                            repos_config={"repos": {}})
+                    row1 = _job_row(jid)
+                    first_listing = (
+                        sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+                    first_data = {}
+                    if len(first_listing) == 1:
+                        first_json = os.path.join(
+                            runs_root, first_listing[0],
+                            "run.json")
+                        if os.path.exists(first_json):
+                            with open(first_json,
+                                      encoding="utf-8") as f:
+                                first_data = json.load(f)
+                    job2 = queue.claim()
+                    second_claim_id = (job2["id"]
+                                       if job2 is not None
+                                       else None)
+                    check("435 worker-retry e2e: requeued job "
+                          "claimed for attempt 2",
+                          job2 is not None
+                          and job2["id"] == jid, str(job2))
+                    if job2 is not None and job2["id"] == jid:
+                        worker.handle_job(
+                            job2, flows_dir=flows_dir,
+                            runs_root=runs_root, headless=True,
+                            executable_path=exe,
+                            repos_config={"repos": {}})
+                    row = _job_row(jid)
+                    listing = (sorted(os.listdir(runs_root))
+                               if os.path.isdir(runs_root)
+                               else [])
+                    new_names = [n for n in listing
+                                 if n not in first_listing]
+                    second_run_dir = (
+                        os.path.join(runs_root, new_names[0])
+                        if len(new_names) == 1 else "")
+                    second_data = {}
+                    if second_run_dir:
+                        second_json = os.path.join(
+                            second_run_dir, "run.json")
+                        if os.path.exists(second_json):
+                            with open(second_json,
+                                      encoding="utf-8") as f:
+                                second_data = json.load(f)
+                    ledger_rows = []
+                    if os.path.exists(ledger_path):
+                        with open(ledger_path,
+                                  encoding="utf-8") as f:
+                            ledger_rows = [
+                                json.loads(line)
+                                for line in f if line.strip()]
+                    outcome = {
+                        "first_run_count": len(first_listing),
+                        "first_run_status":
+                            first_data.get("status"),
+                        "first_job_status": row1.get("status"),
+                        "first_attempts": row1.get("attempts"),
+                        "first_note": row1.get("note"),
+                        "second_claim_id": second_claim_id,
+                        "run_count": len(listing),
+                        "second_run_status":
+                            second_data.get("status"),
+                        "job_status": row.get("status"),
+                        "job_attempts": row.get("attempts"),
+                        "job_note": row.get("note"),
+                        "job_run_dir": row.get("run_dir"),
+                        "page_hits": hits["count"],
+                        "ledger_kinds": [r.get("kind")
+                                         for r in ledger_rows],
+                        "ledger_statuses": [
+                            r.get("status")
+                            for r in ledger_rows]}
+                    exp = {"first_run_count": 1,
+                           "first_run_status": "failed",
+                           "first_job_status": "pending",
+                           "first_attempts": 1,
+                           "first_note":
+                               "verify-flow -> failed "
+                               "(retry 1 of 1)",
+                           "second_claim_id": jid,
+                           "run_count": 2,
+                           "second_run_status": "passed",
+                           "job_status": "done",
+                           "job_attempts": 1,
+                           "job_note": "verify-flow -> passed",
+                           "job_run_dir": second_run_dir,
+                           "page_hits": 2,
+                           "ledger_kinds": ["scripted",
+                                            "scripted"],
+                           "ledger_statuses": ["failed",
+                                               "passed"]}
+                    mismatch = worker_retry_mismatch(outcome,
+                                                     exp)
+                    check("435 worker-retry e2e: real "
+                          "composition pins the pinned fields "
+                          "exactly", mismatch is None,
+                          mismatch or "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            srv_t.join(timeout=10)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("435 worker-retry e2e: no flaky server remains "
+          "after cleanup",
+          port_free(port) and not srv_t.is_alive(),
+          f"flaky server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
