@@ -17493,6 +17493,193 @@ def test_issue_403_cli_enqueue_worker_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_405_investigate_e2e():
+    """Issue #405: pin the standalone investigate composition end
+    to end. Issue #316 pins cmd_investigate plumbing with
+    qaloop.investigate.investigate stubbed, and the manual-brief
+    tests call write_manual_brief / investigate() with RunResult
+    objects constructed in-process, so the real composition - a
+    real failed verify writing run.json, RunResult.from_dict
+    inside the real cmd_investigate, the real investigate() in
+    manual mode (no model key), and the INVESTIGATION_BRIEF.md
+    written from the deserialized record - is executed by no
+    test. This test stubs NOTHING in that chain: it serves the
+    repo root itself, drives the real CLI verify of the designed
+    steps-phase failure flow, then the real CLI investigate with
+    no --target (recorded-target fallback), and pins the manual
+    diagnosis, the brief path, and the brief content against the
+    real run record."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def investigate_mismatch(mode, cost, brief_path,
+                             exp_mode, exp_cost, exp_brief_path):
+        if mode != exp_mode: return (
+            f"mode: expected {exp_mode}, got {mode}")
+        if cost != exp_cost: return (
+            f"cost_usd_est: expected {exp_cost}, got {cost}")
+        if brief_path != exp_brief_path: return (
+            f"brief path: expected {exp_brief_path}, "
+            f"got {brief_path}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    def parse_diag(text):
+        try:
+            diag, _ = json.JSONDecoder().raw_decode(
+                text[text.index("{"):])
+            return diag
+        except ValueError:
+            return {}
+
+    check("405 investigate e2e: diagnosis parser skips the "
+          "manual-mode notice line",
+          parse_diag("no model configured\n{\"mode\": \"manual\"}\n")
+          == {"mode": "manual"})
+    check("405 investigate e2e: diagnosis parser returns empty "
+          "on non-JSON output", parse_diag("no json here") == {})
+    check("405 investigate e2e: exact expectations return no "
+          "mismatch",
+          investigate_mismatch("manual", 0.0, "/r/INVESTIGATION_BRIEF.md",
+                               "manual", 0.0,
+                               "/r/INVESTIGATION_BRIEF.md") is None)
+    probe = investigate_mismatch("agent", 0.0, "/r/INVESTIGATION_BRIEF.md",
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md")
+    check("405 investigate e2e: corrupted mode caught, names field",
+          probe is not None and "mode" in probe, probe or "")
+    probe = investigate_mismatch("manual", 1.5, "/r/INVESTIGATION_BRIEF.md",
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md")
+    check("405 investigate e2e: corrupted cost caught, names field",
+          probe is not None and "cost_usd_est" in probe, probe or "")
+    probe = investigate_mismatch("manual", 0.0, "/r/WRONG.md",
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md")
+    check("405 investigate e2e: corrupted brief path caught, "
+          "names field",
+          probe is not None and "brief path" in probe, probe or "")
+    if not os.path.exists(exe): check("405 investigate e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("405 investigate e2e: static port not already answering",
+          port_free(port), f"port {port} already in use")
+    check("405 investigate e2e: no http.server for the port yet",
+          no_static_server(port), f"stale http.server on {port}")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER", "QALOOP_MODEL_API_KEY",
+                "TARGET_URL", "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/teardown-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_path = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_v = cli.cmd_verify(
+                        cli.build_parser().parse_args(
+                            ["verify", flow_path]))
+                check("405 investigate e2e: real verify of the "
+                      "steps-fail flow exits 1", rc_v == 1, str(rc_v))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("405 investigate e2e: exactly one run dir "
+                      "written", len(run_dirs) == 1, str(run_dirs))
+                if run_dirs:
+                    run_dir = os.path.join(runs_root, run_dirs[0])
+                    with open(os.path.join(run_dir, "run.json"),
+                              encoding="utf-8") as f:
+                        run_data = json.load(f)
+                    check("405 investigate e2e: run.json status "
+                          "failed", run_data.get("status") == "failed",
+                          str(run_data.get("status")))
+                    check("405 investigate e2e: run.json failed_step "
+                          "is 2", run_data.get("failed_step") == 2,
+                          str(run_data.get("failed_step")))
+                    rec_error = ""
+                    all_steps = run_data.get("steps", [])
+                    fs = run_data.get("failed_step")
+                    if isinstance(fs, int) and 0 <= fs < len(all_steps):
+                        rec_error = all_steps[fs].get("error") or ""
+                    check("405 investigate e2e: recorded error is "
+                          "the STEPS-288 storage mismatch",
+                          "STEPS-288" in rec_error, rec_error)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_i = cli.cmd_investigate(
+                            cli.build_parser().parse_args(
+                                ["investigate", "--run", run_dir,
+                                 "--flow", flow_path]))
+                    check("405 investigate e2e: real investigate "
+                          "exits 0", rc_i == 0, str(rc_i))
+                    diag = parse_diag(buf.getvalue())
+                    exp_brief = os.path.join(
+                        run_dir, "INVESTIGATION_BRIEF.md")
+                    mismatch = investigate_mismatch(
+                        diag.get("mode"), diag.get("cost_usd_est"),
+                        diag.get("brief"),
+                        "manual", 0.0, exp_brief)
+                    check("405 investigate e2e: diagnosis is manual "
+                          "mode, zero cost, brief path in run dir",
+                          mismatch is None, mismatch or "")
+                    check("405 investigate e2e: brief file exists",
+                          os.path.exists(exp_brief), exp_brief)
+                    brief_text = ""
+                    if os.path.exists(exp_brief):
+                        with open(exp_brief, encoding="utf-8") as f:
+                            brief_text = f.read()
+                    check("405 investigate e2e: brief names the flow",
+                          "demo-steps-fail" in brief_text,
+                          brief_text[:200])
+                    check("405 investigate e2e: brief carries the "
+                          "failing-step header",
+                          "## Failing step" in brief_text,
+                          brief_text[:200])
+                    check("405 investigate e2e: brief contains the "
+                          "exact recorded error text",
+                          bool(rec_error) and rec_error in brief_text,
+                          rec_error)
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("405 investigate e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
