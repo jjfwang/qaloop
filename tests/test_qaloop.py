@@ -21448,6 +21448,235 @@ def test_issue_439_batch_keep_runs_prune_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_441_matrix_keep_runs_prune_e2e():
+    """Issue #441: pin the matrix verify --keep-runs pruning
+    composition end to end with real flows. The matrix verify
+    composition is pinned by #427 and the batch --keep-runs
+    pruning composition by #439, but the matrix call site -
+    build_parser -> cmd_verify on a matrix flow, the real
+    per-combination runs, the parent matrix summary written
+    by the real write_matrix_summary, then prune_old_runs
+    called on the runs root with the parent dir as current -
+    could rot unobserved. This test stubs NOTHING: it copies
+    flows/demo-matrix.yaml into a temp dir, adapts the copy
+    to an explicit two-combination matrix plus the signup
+    mock the demo page needs, serves the repo root on a free
+    port, and drives the real CLI verify five times - three
+    default verifies (parent run dirs accumulate, no pruned
+    line), one --keep-runs 2 verify (the exact pruned line
+    prints and exactly the two newest parents survive, the
+    just-finished parent's REPORT.md and both per-combo
+    run.json records intact), and one --keep-runs 0 verify
+    as the keep-everything control."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def keep_runs_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"pruned_count": 2, "survivors": {"run-a", "run-b"}}
+    check("441 matrix-keep-runs e2e: exact expectations return "
+          "no mismatch",
+          keep_runs_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = keep_runs_mismatch(
+        dict(exp_probe, pruned_count=1), exp_probe)
+    check("441 matrix-keep-runs e2e: corrupted pruned_count "
+          "caught, names field",
+          probe is not None and probe.startswith("pruned_count:"),
+          probe or "")
+    probe = keep_runs_mismatch(
+        dict(exp_probe, survivors={"run-a"}), exp_probe)
+    check("441 matrix-keep-runs e2e: corrupted survivors "
+          "caught, names field",
+          probe is not None and probe.startswith("survivors:"),
+          probe or "")
+    if not os.path.exists(exe): check("441 matrix-keep-runs e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("441 matrix-keep-runs e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("441 matrix-keep-runs e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                with open(os.path.join(
+                        root, "flows", "demo-matrix.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                matrix_block = ("matrix:\n  user: [ada, bob]\n"
+                                "  plan: [pro, free]")
+                check("441 matrix-keep-runs e2e: source matrix "
+                      "block pin present",
+                      matrix_block in flow_text)
+                greeting_pin = ('mock: {url: "**/api/greeting", '
+                                'json: {greeting: "Hello from '
+                                'mock"}}')
+                check("441 matrix-keep-runs e2e: source greeting "
+                      "mock pin present",
+                      greeting_pin in flow_text)
+                goto_pin = "  - name: open the demo page"
+                check("441 matrix-keep-runs e2e: source goto step "
+                      "pin present", goto_pin in flow_text)
+                flow_text = flow_text.replace(
+                    matrix_block,
+                    "matrix:\n  - {user: ada, plan: pro}\n"
+                    "  - {user: bob, plan: free}")
+                signup_step = (
+                    "  - name: mock the signup API\n"
+                    '    mock: {url: "**/api/signup", method: '
+                    'POST, json: {ok: true}}\n')
+                flow_text = flow_text.replace(
+                    goto_pin, signup_step + goto_pin)
+                flow_copy = os.path.join(td, "demo-matrix.yaml")
+                with open(flow_copy, "w",
+                          encoding="utf-8") as f:
+                    f.write(flow_text)
+
+                def parents():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(extra):
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", flow_copy] + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                for i in range(3):
+                    rc, lines = run_verify([])
+                    check(f"441 matrix-keep-runs e2e: default "
+                          f"verify {i + 1} exits 0", rc == 0,
+                          str(rc))
+                    check(f"441 matrix-keep-runs e2e: default "
+                          f"verify {i + 1} prints no pruned line",
+                          not any("pruned" in ln for ln in lines),
+                          str(lines))
+                check("441 matrix-keep-runs e2e: exactly 3 "
+                      "parent run dirs accumulate under "
+                      "default retention", len(parents()) == 3,
+                      str(parents()))
+                snapshot = parents()
+                rc, lines = run_verify(["--keep-runs", "2"])
+                check("441 matrix-keep-runs e2e: --keep-runs 2 "
+                      "verify exits 0", rc == 0, str(rc))
+                check("441 matrix-keep-runs e2e: exact pruned "
+                      "line printed",
+                      "pruned 2 old run dir(s) (--keep-runs 2)"
+                      in lines, str(lines))
+                after = parents()
+                new_names = [n for n in after if n not in snapshot]
+                current = new_names[0] if len(new_names) == 1 else ""
+                all_names = sorted(snapshot + [current])
+                exp_survivors = set(all_names[-2:]) | {current}
+                outcome = {
+                    "pruned_count": len(set(all_names) - set(after)),
+                    "survivors": set(after)}
+                exp_outcome = {"pruned_count": 2,
+                               "survivors": exp_survivors}
+                mismatch = keep_runs_mismatch(outcome, exp_outcome)
+                check("441 matrix-keep-runs e2e: pruned count "
+                      "and survivors pin exactly",
+                      mismatch is None, mismatch or "")
+                parent = os.path.join(runs_root, current)
+                report_path = os.path.join(parent, "REPORT.md")
+                check("441 matrix-keep-runs e2e: surviving "
+                      "parent REPORT.md exists",
+                      os.path.exists(report_path), report_path)
+                subdir0 = os.path.join(
+                    parent, "matrix", "00-user-ada-plan-pro")
+                subdir1 = os.path.join(
+                    parent, "matrix", "01-user-bob-plan-free")
+                check("441 matrix-keep-runs e2e: surviving "
+                      "parent matrix subdir 00 exists",
+                      os.path.isdir(subdir0), subdir0)
+                check("441 matrix-keep-runs e2e: surviving "
+                      "parent matrix subdir 01 exists",
+                      os.path.isdir(subdir1), subdir1)
+                sub0_data = {}
+                sub0_json = os.path.join(subdir0, "run.json")
+                if os.path.exists(sub0_json):
+                    with open(sub0_json, encoding="utf-8") as f:
+                        sub0_data = json.load(f)
+                sub1_data = {}
+                sub1_json = os.path.join(subdir1, "run.json")
+                if os.path.exists(sub1_json):
+                    with open(sub1_json, encoding="utf-8") as f:
+                        sub1_data = json.load(f)
+                check("441 matrix-keep-runs e2e: surviving "
+                      "subdir 00 run.json status passed",
+                      sub0_data.get("status") == "passed",
+                      str(sub0_data.get("status")))
+                check("441 matrix-keep-runs e2e: surviving "
+                      "subdir 01 run.json status passed",
+                      sub1_data.get("status") == "passed",
+                      str(sub1_data.get("status")))
+                rc, lines = run_verify(["--keep-runs", "0"])
+                check("441 matrix-keep-runs e2e: --keep-runs 0 "
+                      "verify exits 0", rc == 0, str(rc))
+                check("441 matrix-keep-runs e2e: --keep-runs 0 "
+                      "prints no pruned line",
+                      not any("pruned" in ln for ln in lines),
+                      str(lines))
+                check("441 matrix-keep-runs e2e: --keep-runs 0 "
+                      "grows the runs root by exactly one "
+                      "(2 to 3)", len(parents()) == 3,
+                      str(parents()))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("441 matrix-keep-runs e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
