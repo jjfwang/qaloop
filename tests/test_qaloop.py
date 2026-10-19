@@ -22400,6 +22400,246 @@ def test_issue_447_batch_verify_video_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_449_single_tag_gate_e2e():
+    """Issue #449: pin the single-flow verify --tag gate
+    composition end to end with a real flow. The batch
+    tag-filter composition is pinned by #437, but the
+    single-file gate in cmd_verify - build_parser ->
+    cmd_verify on one flow file with --tag, the real
+    _read_flow_tags light-parse, the exact SKIP line and
+    exit code 2 when any requested tag is missing, and
+    the real run plus scripted ledger row when every tag
+    matches - could rot unobserved. This test stubs
+    NOTHING: it copies the demo login flow (plus the
+    shared login fragment) into a temp flows dir, tagging
+    the copy nightly, serves the repo root on a free
+    port, and drives the real CLI verify three times in
+    the same runs root and ledger - a matching --tag
+    nightly run (real passed run, run.json status passed,
+    REPORT.md present, exactly one scripted ledger row),
+    a --tag smoke mismatch (exact SKIP line, exit 2, no
+    new run dir, no new ledger row), and a partial
+    --tag nightly --tag smoke match (the same exact SKIP
+    line naming only smoke, exit 2, still no new run dir
+    or ledger row)."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def single_tag_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = single_tag_mismatch("rc", 0, 0)
+    check("449 single-tag-gate e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = single_tag_mismatch("rc", 0, 2)
+    check("449 single-tag-gate e2e: corrupted rc caught, "
+          "names field",
+          probe is not None and probe.startswith("rc:"),
+          probe or "")
+    probe = single_tag_mismatch("run_dir_count", 1, 2)
+    check("449 single-tag-gate e2e: corrupted "
+          "run_dir_count caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_count:"),
+          probe or "")
+    if not os.path.exists(exe): check("449 single-tag-gate e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("449 single-tag-gate e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("449 single-tag-gate e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                with open(os.path.join(
+                        root, "flows", "demo-login-a.yaml"),
+                        encoding="utf-8") as f:
+                    login_text = f.read()
+                login_text = login_text.replace(
+                    "name: demo-login-a\n",
+                    "name: demo-login-a\ntags: [nightly]\n",
+                    1)
+                flow_path = os.path.join(flows_dir,
+                                         "demo-login-a.yaml")
+                with open(flow_path, "w",
+                          encoding="utf-8") as f:
+                    f.write(login_text)
+                skip_line = (
+                    f"SKIP: {flow_path} does not carry "
+                    f"tag(s) ['smoke'] (flow tags: ['nightly'])")
+
+                def run_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(tags):
+                    argv = ["verify", flow_path]
+                    for tag in tags:
+                        argv += ["--tag", tag]
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = single_tag_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                # Phase 1: matching tag runs the flow for real.
+                rc, _lines = run_verify(["nightly"])
+                dirs = run_dirs()
+                run_dir = (os.path.join(runs_root, dirs[0])
+                           if len(dirs) == 1 else "")
+                run_data = {}
+                run_json = (os.path.join(run_dir, "run.json")
+                            if run_dir else "")
+                if run_json and os.path.exists(run_json):
+                    with open(run_json, encoding="utf-8") as f:
+                        run_data = json.load(f)
+                rows = ledger.read_all()
+                row0 = rows[0] if rows else {}
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "exits 0", "rc", 0, rc)
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "leaves exactly one run dir",
+                    "run_dir_count", 1, len(dirs))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "run.json status passed", "run_status",
+                    "passed", run_data.get("status"))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "REPORT.md exists in the run dir",
+                    "report_exists", True,
+                    bool(run_dir) and os.path.exists(
+                        os.path.join(run_dir, "REPORT.md")))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "ledger holds exactly one row",
+                    "ledger_rows", 1, len(rows))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "ledger row kind scripted", "ledger_kind",
+                    "scripted", row0.get("kind"))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "ledger row flow demo-login-a",
+                    "ledger_flow", "demo-login-a",
+                    row0.get("flow"))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "ledger row status passed",
+                    "ledger_status", "passed",
+                    row0.get("status"))
+                phase_check(
+                    "449 single-tag-gate e2e: match phase "
+                    "ledger row cost 0.0", "ledger_cost", 0.0,
+                    row0.get("cost_usd_est"))
+
+                # Phase 2: a missing tag skips without running.
+                rc, lines = run_verify(["smoke"])
+                phase_check(
+                    "449 single-tag-gate e2e: mismatch phase "
+                    "exits 2", "rc", 2, rc)
+                phase_check(
+                    "449 single-tag-gate e2e: mismatch phase "
+                    "prints exactly the SKIP line",
+                    "stdout_lines", [skip_line], lines)
+                phase_check(
+                    "449 single-tag-gate e2e: mismatch phase "
+                    "adds no run dir", "run_dir_count", 1,
+                    len(run_dirs()))
+                phase_check(
+                    "449 single-tag-gate e2e: mismatch phase "
+                    "adds no ledger row", "ledger_rows", 1,
+                    len(ledger.read_all()))
+
+                # Phase 3: one missing tag of two still skips.
+                rc, lines = run_verify(["nightly", "smoke"])
+                phase_check(
+                    "449 single-tag-gate e2e: partial phase "
+                    "exits 2", "rc", 2, rc)
+                phase_check(
+                    "449 single-tag-gate e2e: partial phase "
+                    "prints exactly the SKIP line naming "
+                    "only smoke", "stdout_lines", [skip_line],
+                    lines)
+                phase_check(
+                    "449 single-tag-gate e2e: partial phase "
+                    "adds no run dir", "run_dir_count", 1,
+                    len(run_dirs()))
+                phase_check(
+                    "449 single-tag-gate e2e: partial phase "
+                    "adds no ledger row", "ledger_rows", 1,
+                    len(ledger.read_all()))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("449 single-tag-gate e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
