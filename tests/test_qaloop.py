@@ -21879,6 +21879,249 @@ def test_issue_443_verify_video_e2e():
 
 
 
+def test_issue_445_matrix_verify_video_e2e():
+    """Issue #445: pin the matrix verify --video recording
+    composition end to end with real flows. The matrix verify
+    composition is pinned by #427, the verify --video
+    composition by #443, and the matrix --keep-runs
+    composition by #441, but the matrix call site threading
+    video into each per-combination run_flow -
+    build_parser -> cmd_verify on a matrix flow with
+    --video, the real per-combination recordings collected
+    as <subdir>/video.webm, each combination's run.json
+    video_path and REPORT.md header link, the parent matrix
+    summary, and the scripted-matrix ledger rows - could rot
+    unobserved. This test stubs NOTHING: it copies
+    flows/demo-matrix.yaml into a temp dir, adapts the copy
+    to an explicit two-combination matrix plus the signup
+    mock the demo page needs, serves the repo root on a free
+    port, and drives the real CLI verify twice - a control
+    verify without --video (no video.webm anywhere, empty
+    video_path, no REPORT.md video mention) and a --video
+    verify (a real non-empty video.webm per combination,
+    video_path equal to that combination's own file, its
+    REPORT.md mentioning video.webm exactly once)."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def matrix_video_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"video_present": True, "report_mentions": 1}
+    check("445 matrix-video e2e: exact expectations return "
+          "no mismatch",
+          matrix_video_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = matrix_video_mismatch(
+        dict(exp_probe, video_present=False), exp_probe)
+    check("445 matrix-video e2e: corrupted video_present "
+          "caught, names field",
+          probe is not None and probe.startswith("video_present:"),
+          probe or "")
+    probe = matrix_video_mismatch(
+        dict(exp_probe, report_mentions=0), exp_probe)
+    check("445 matrix-video e2e: corrupted report_mentions "
+          "caught, names field",
+          probe is not None and probe.startswith("report_mentions:"),
+          probe or "")
+    if not os.path.exists(exe): check("445 matrix-video e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("445 matrix-video e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("445 matrix-video e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                with open(os.path.join(
+                        root, "flows", "demo-matrix.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                matrix_block = ("matrix:\n  user: [ada, bob]\n"
+                                "  plan: [pro, free]")
+                check("445 matrix-video e2e: source matrix "
+                      "block pin present",
+                      matrix_block in flow_text)
+                greeting_pin = ('mock: {url: "**/api/greeting", '
+                                'json: {greeting: "Hello from '
+                                'mock"}}')
+                check("445 matrix-video e2e: source greeting "
+                      "mock pin present",
+                      greeting_pin in flow_text)
+                goto_pin = "  - name: open the demo page"
+                check("445 matrix-video e2e: source goto step "
+                      "pin present", goto_pin in flow_text)
+                flow_text = flow_text.replace(
+                    matrix_block,
+                    "matrix:\n  - {user: ada, plan: pro}\n"
+                    "  - {user: bob, plan: free}")
+                signup_step = (
+                    "  - name: mock the signup API\n"
+                    '    mock: {url: "**/api/signup", method: '
+                    'POST, json: {ok: true}}\n')
+                flow_text = flow_text.replace(
+                    goto_pin, signup_step + goto_pin)
+                flow_copy = os.path.join(td, "demo-matrix.yaml")
+                with open(flow_copy, "w",
+                          encoding="utf-8") as f:
+                    f.write(flow_text)
+                combos = ("00-user-ada-plan-pro",
+                          "01-user-bob-plan-free")
+
+                def parents():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(extra):
+                    before = parents()
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", flow_copy] + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    new = [n for n in parents() if n not in before]
+                    parent = (os.path.join(runs_root, new[0])
+                              if len(new) == 1 else "")
+                    return rc, parent
+
+                def combo_outcome(parent, combo):
+                    subdir = os.path.join(parent, "matrix", combo)
+                    video = os.path.join(subdir, "video.webm")
+                    data = {}
+                    run_json = os.path.join(subdir, "run.json")
+                    if os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    report = ""
+                    report_path = os.path.join(subdir, "REPORT.md")
+                    if os.path.exists(report_path):
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            report = f.read()
+                    return {
+                        "status": data.get("status"),
+                        "video_present": os.path.exists(video),
+                        "video_nonzero": (
+                            os.path.exists(video)
+                            and os.path.getsize(video) > 0),
+                        "video_path": data.get("video_path"),
+                        "report_mentions": report.count(
+                            "video.webm"),
+                    }, video
+
+                # Control phase: no --video, nothing recorded.
+                rc, parent = run_verify([])
+                check("445 matrix-video e2e: control verify "
+                      "exits 0", rc == 0, str(rc))
+                check("445 matrix-video e2e: control verify "
+                      "leaves exactly one parent run dir",
+                      len(parents()) == 1 and bool(parent),
+                      str(parents()))
+                for combo in combos:
+                    outcome, _video = combo_outcome(parent, combo)
+                    exp = {"status": "passed",
+                           "video_present": False,
+                           "video_path": "",
+                           "report_mentions": 0}
+                    mismatch = matrix_video_mismatch(outcome, exp)
+                    check(f"445 matrix-video e2e: control "
+                          f"{combo} records no video, empty "
+                          f"video_path, no REPORT.md mention",
+                          mismatch is None, mismatch or "")
+
+                # Video phase: --video records per combination.
+                rc, parent = run_verify(["--video"])
+                check("445 matrix-video e2e: --video verify "
+                      "exits 0", rc == 0, str(rc))
+                check("445 matrix-video e2e: --video verify "
+                      "leaves a second parent run dir",
+                      len(parents()) == 2 and bool(parent),
+                      str(parents()))
+                check("445 matrix-video e2e: --video parent "
+                      "REPORT.md exists",
+                      bool(parent) and os.path.exists(
+                          os.path.join(parent, "REPORT.md")),
+                      parent)
+                for combo in combos:
+                    outcome, video = combo_outcome(parent, combo)
+                    exp = {"status": "passed",
+                           "video_present": True,
+                           "video_nonzero": True,
+                           "video_path": video,
+                           "report_mentions": 1}
+                    mismatch = matrix_video_mismatch(outcome, exp)
+                    check(f"445 matrix-video e2e: --video "
+                          f"{combo} pins its own real video.webm, "
+                          f"video_path and one REPORT.md mention",
+                          mismatch is None, mismatch or "")
+
+                rows = []
+                if os.path.exists(ledger_path):
+                    with open(ledger_path, encoding="utf-8") as f:
+                        rows = [json.loads(ln) for ln in f
+                                if ln.strip()]
+                check("445 matrix-video e2e: ledger holds "
+                      "exactly 2 scripted-matrix rows",
+                      len(rows) == 2 and all(
+                          r.get("kind") == "scripted-matrix"
+                          for r in rows), str(rows))
+                check("445 matrix-video e2e: both ledger rows "
+                      "passed",
+                      all(r.get("status") == "passed" for r in rows)
+                      and len(rows) == 2, str(rows))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("445 matrix-video e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
