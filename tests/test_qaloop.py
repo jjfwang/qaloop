@@ -23377,6 +23377,269 @@ def test_issue_455_matrix_investigate_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_457_batch_matrix_e2e():
+    """Issue #457: pin the batch verify matrix-flow
+    composition end to end with a real e2e test. The batch
+    composition is pinned by #425 and the matrix composition
+    by #427, but a matrix flow INSIDE a batch - build_parser
+    -> cmd_verify on a directory holding one plain flow and
+    one matrix flow, the real _cmd_verify_batch dispatching
+    the matrix flow through the real _cmd_verify_matrix, the
+    parent batch.json and REPORT.md written by the real
+    write_batch_summary (steps column showing combinations
+    passed/total for the matrix flow), the per-combination
+    run.json records under the flow subdir, and the real
+    scripted plus scripted-matrix ledger rows - could rot
+    unobserved. This test stubs NOTHING: it copies the two
+    demo flows (plus the shared login fragment) into a temp
+    flows dir, adapts the matrix copy exactly as #427 does,
+    serves the repo root on a free port, and drives the real
+    CLI verify of the whole directory."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def batch_matrix_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"rc": 0, "parent_count": 1,
+           "report_first_line": "# qaloop batch report [2/2 PASS]",
+           "table_row_0": "| 0 | `demo-login-a.yaml` | PASS | "
+           "4/4 | [demo-login-a](flows/demo-login-a/REPORT.md) |",
+           "table_row_1": "| 1 | `demo-matrix.yaml` | PASS | "
+           "2/2 | [demo-matrix](flows/demo-matrix/REPORT.md) |",
+           "batch_len": 2,
+           "batch0_file": "demo-login-a.yaml",
+           "batch0_status": "passed", "batch0_steps_passed": 4,
+           "batch0_steps_total": 4,
+           "batch0_report": "flows/demo-login-a/REPORT.md",
+           "batch1_file": "demo-matrix.yaml",
+           "batch1_status": "passed", "batch1_steps_passed": 2,
+           "batch1_steps_total": 2,
+           "batch1_report": "flows/demo-matrix/REPORT.md",
+           "matrix_report_exists": True,
+           "combo0_status": "passed", "combo1_status": "passed",
+           "ledger_rows": 2,
+           "first_kind": "scripted", "first_flow": "demo-login-a",
+           "first_status": "passed", "first_cost": 0.0,
+           "second_kind": "scripted-matrix",
+           "second_flow": "demo-matrix",
+           "second_status": "passed", "second_combinations": 2,
+           "second_passed": 2, "second_cost": 0.0}
+    check("457 batch-matrix e2e: exact expectations return "
+          "no mismatch",
+          batch_matrix_mismatch(dict(exp), exp) is None)
+    probe = batch_matrix_mismatch(
+        dict(exp, batch1_steps_passed=7), exp)
+    check("457 batch-matrix e2e: corrupted batch1_steps_passed "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("batch1_steps_passed:"),
+          probe or "")
+    probe = batch_matrix_mismatch(
+        dict(exp, second_kind="scripted"), exp)
+    check("457 batch-matrix e2e: corrupted second_kind "
+          "caught, names field",
+          probe is not None and probe.startswith("second_kind:"),
+          probe or "")
+    if not os.path.exists(exe): check("457 batch-matrix e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("457 batch-matrix e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("457 batch-matrix e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows", "demo-login-a.yaml"),
+                    os.path.join(flows_dir, "demo-login-a.yaml"))
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                with open(os.path.join(
+                        root, "flows", "demo-matrix.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                matrix_block = ("matrix:\n  user: [ada, bob]\n"
+                                "  plan: [pro, free]")
+                check("457 batch-matrix e2e: source matrix "
+                      "block pin present",
+                      matrix_block in flow_text)
+                greeting_pin = ('mock: {url: "**/api/greeting", '
+                                'json: {greeting: "Hello from '
+                                'mock"}}')
+                check("457 batch-matrix e2e: source greeting "
+                      "mock pin present",
+                      greeting_pin in flow_text)
+                goto_pin = "  - name: open the demo page"
+                check("457 batch-matrix e2e: source goto step "
+                      "pin present", goto_pin in flow_text)
+                flow_text = flow_text.replace(
+                    matrix_block,
+                    "matrix:\n  - {user: ada, plan: pro}\n"
+                    "  - {user: bob, plan: free}")
+                signup_step = (
+                    "  - name: mock the signup API\n"
+                    '    mock: {url: "**/api/signup", method: '
+                    'POST, json: {ok: true}}\n')
+                flow_text = flow_text.replace(
+                    goto_pin, signup_step + goto_pin)
+                with open(os.path.join(flows_dir,
+                                       "demo-matrix.yaml"),
+                          "w", encoding="utf-8") as f:
+                    f.write(flow_text)
+                args = cli.build_parser().parse_args(
+                    ["verify", flows_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_lines = []
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                if report_path and os.path.exists(report_path):
+                    with open(report_path,
+                              encoding="utf-8") as f:
+                        report_lines = f.read().splitlines()
+                batch = []
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                if batch_path and os.path.exists(batch_path):
+                    with open(batch_path, encoding="utf-8") as f:
+                        batch = json.load(f)
+                batch0 = batch[0] if len(batch) > 0 else {}
+                batch1 = batch[1] if len(batch) > 1 else {}
+                combo0_data = {}
+                combo0_json = (os.path.join(
+                    parent, "flows", "demo-matrix", "matrix",
+                    "00-user-ada-plan-pro", "run.json")
+                    if parent else "")
+                if combo0_json and os.path.exists(combo0_json):
+                    with open(combo0_json, encoding="utf-8") as f:
+                        combo0_data = json.load(f)
+                combo1_data = {}
+                combo1_json = (os.path.join(
+                    parent, "flows", "demo-matrix", "matrix",
+                    "01-user-bob-plan-free", "run.json")
+                    if parent else "")
+                if combo1_json and os.path.exists(combo1_json):
+                    with open(combo1_json, encoding="utf-8") as f:
+                        combo1_data = json.load(f)
+                rows = ledger.read_all()
+                row0 = rows[0] if len(rows) > 0 else {}
+                row1 = rows[1] if len(rows) > 1 else {}
+                outcome = {
+                    "rc": rc,
+                    "parent_count": len(parents),
+                    "report_first_line": (
+                        report_lines[0] if report_lines else None),
+                    "table_row_0": next(
+                        (l for l in report_lines
+                         if l.startswith("| 0 |")), None),
+                    "table_row_1": next(
+                        (l for l in report_lines
+                         if l.startswith("| 1 |")), None),
+                    "batch_len": len(batch),
+                    "batch0_file": batch0.get("file"),
+                    "batch0_status": batch0.get("status"),
+                    "batch0_steps_passed": batch0.get(
+                        "steps_passed"),
+                    "batch0_steps_total": batch0.get(
+                        "steps_total"),
+                    "batch0_report": batch0.get("report"),
+                    "batch1_file": batch1.get("file"),
+                    "batch1_status": batch1.get("status"),
+                    "batch1_steps_passed": batch1.get(
+                        "steps_passed"),
+                    "batch1_steps_total": batch1.get(
+                        "steps_total"),
+                    "batch1_report": batch1.get("report"),
+                    "matrix_report_exists": bool(parent) and (
+                        os.path.exists(os.path.join(
+                            parent, "flows", "demo-matrix",
+                            "REPORT.md"))),
+                    "combo0_status": combo0_data.get("status"),
+                    "combo1_status": combo1_data.get("status"),
+                    "ledger_rows": len(rows),
+                    "first_kind": row0.get("kind"),
+                    "first_flow": row0.get("flow"),
+                    "first_status": row0.get("status"),
+                    "first_cost": row0.get("cost_usd_est"),
+                    "second_kind": row1.get("kind"),
+                    "second_flow": row1.get("flow"),
+                    "second_status": row1.get("status"),
+                    "second_combinations": row1.get(
+                        "combinations"),
+                    "second_passed": row1.get("passed"),
+                    "second_cost": row1.get("cost_usd_est")}
+                mismatch = batch_matrix_mismatch(outcome, exp)
+                check("457 batch-matrix e2e: real composition "
+                      "pins the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("457 batch-matrix e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
