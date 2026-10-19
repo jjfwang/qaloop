@@ -24267,6 +24267,338 @@ def test_issue_461_batch_target_override_e2e():
           f"http.server still on {port}")
 
 
+
+def test_issue_463_matrix_target_override_e2e():
+    """Issue #463: pin the matrix verify --target
+    override composition end to end with a real e2e
+    test. The single-flow --target override is pinned
+    by #459 and the batch override by #461, but the
+    matrix chain - build_parser -> cmd_verify on one
+    matrix flow file -> the real matrix dispatch
+    resolving args.target over the flow's declared
+    spec target for every combination (SPEC.md Flags:
+    --target overrides the spec's target for this run;
+    without the flag, the flow's declared target is
+    used), the printed target line, the per-combination
+    run.json / REPORT.md target records under the
+    parent run dir's matrix/<slug> subdirs, and the
+    scripted-matrix ledger rows - could rot unobserved:
+    the matrix e2e tests never pass --target. This test
+    stubs NOTHING: it copies flows/demo-matrix.yaml
+    into a temp flows dir, rewrites the copy's target
+    line to a literal dead target (a 127.0.0.1 port
+    bound-then-closed so nothing listens), adapts the
+    matrix to an explicit two-combination list plus
+    the signup mock the demo page needs, serves the
+    repo root on a free port, and drives the real CLI
+    verify twice in the same runs root and ledger."""
+    import contextlib
+    import io
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    slugs = ("00-user-ada-plan-pro", "01-user-bob-plan-free")
+
+    def matrix_target_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = matrix_target_mismatch("rc", 1, 1)
+    check("463 matrix target-override e2e: equal values "
+          "return no mismatch", mismatch is None,
+          mismatch or "")
+    probe = matrix_target_mismatch(
+        "combo_target", "http://127.0.0.1:1", "http://127.0.0.1:2")
+    check("463 matrix target-override e2e: corrupted "
+          "combo-target caught, names field",
+          probe is not None and probe.startswith("combo_target:"),
+          probe or "")
+    probe = matrix_target_mismatch(
+        "combo_status", "passed", "failed")
+    check("463 matrix target-override e2e: corrupted combo "
+          "status caught, names field",
+          probe is not None and probe.startswith("combo_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("463 matrix target-override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    dead_port = find_free_port()
+    dead_target = f"http://127.0.0.1:{dead_port}"
+    override_target = f"http://127.0.0.1:{port}"
+    check("463 matrix target-override e2e: dead port differs "
+          "from the server port", dead_port != port,
+          f"dead={dead_port} server={port}")
+    check("463 matrix target-override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("463 matrix target-override e2e: dead port not "
+          "answering (bound-then-closed)", port_free(dead_port),
+          f"dead port {dead_port} already in use")
+    check("463 matrix target-override e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(flows_dir)
+                os.environ["TARGET_URL"] = override_target
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                with open(os.path.join(
+                        root, "flows", "demo-matrix.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                check("463 matrix target-override e2e: source "
+                      "target line pin present",
+                      "target: ${TARGET_URL}" in flow_text)
+                matrix_block = ("matrix:\n  user: [ada, bob]\n"
+                                "  plan: [pro, free]")
+                check("463 matrix target-override e2e: source "
+                      "matrix block pin present",
+                      matrix_block in flow_text)
+                goto_pin = "  - name: open the demo page"
+                check("463 matrix target-override e2e: source "
+                      "goto step pin present",
+                      goto_pin in flow_text)
+                flow_text = flow_text.replace(
+                    "target: ${TARGET_URL}",
+                    f"target: {dead_target}", 1)
+                flow_text = flow_text.replace(
+                    matrix_block,
+                    "matrix:\n  - {user: ada, plan: pro}\n"
+                    "  - {user: bob, plan: free}")
+                signup_step = (
+                    "  - name: mock the signup API\n"
+                    '    mock: {url: "**/api/signup", method: '
+                    'POST, json: {ok: true}}\n')
+                flow_text = flow_text.replace(
+                    goto_pin, signup_step + goto_pin)
+                flow_copy = os.path.join(flows_dir,
+                                         "demo-matrix.yaml")
+                with open(flow_copy, "w",
+                          encoding="utf-8") as f:
+                    f.write(flow_text)
+
+                def parent_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(extra):
+                    argv = ["verify", flow_copy] + extra
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                def load_combo(parent, slug):
+                    combo_dir = (os.path.join(
+                        runs_root, parent, "matrix", slug)
+                        if parent else "")
+                    data = {}
+                    run_json = (os.path.join(combo_dir, "run.json")
+                                if combo_dir else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    report_lines = []
+                    report_path = (os.path.join(
+                        combo_dir, "REPORT.md")
+                        if combo_dir else "")
+                    if report_path and os.path.exists(report_path):
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            report_lines = f.read().splitlines()
+                    return data, report_lines
+
+                def printed_targets(lines):
+                    return [l for l in lines
+                            if l.startswith("target:")]
+
+                def report_target(report_lines):
+                    return next(
+                        (l for l in report_lines
+                         if l.startswith("- target:")), None)
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = matrix_target_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                check("463 matrix target-override e2e: empty "
+                      "parent loads as empty combo",
+                      load_combo("", slugs[0]) == ({}, []))
+                check("463 matrix target-override e2e: missing "
+                      "parent loads as empty combo",
+                      load_combo("no-such-parent", slugs[0])
+                      == ({}, []))
+
+                # Phase 1: declared dead target, no override.
+                rc, lines = run_verify([])
+                parents = parent_dirs()
+                parent1 = parents[0] if len(parents) == 1 else ""
+                rows = ledger.read_all()
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase exits 1", "rc", 1, rc)
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase printed target lines name the dead "
+                    "target", "printed_targets",
+                    [f"target:  {dead_target}"],
+                    printed_targets(lines))
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase leaves exactly one parent run dir",
+                    "parent_dir_count", 1, len(parents))
+                for slug in slugs:
+                    run_data, report_lines = load_combo(
+                        parent1, slug)
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"control phase {slug} run.json status "
+                        f"failed", "combo_status", "failed",
+                        run_data.get("status"))
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"control phase {slug} run.json target "
+                        f"is the dead target", "combo_target",
+                        dead_target, run_data.get("target"))
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"control phase {slug} REPORT.md "
+                        f"target line names the dead target",
+                        "report_target",
+                        f"- target: `{dead_target}`",
+                        report_target(report_lines))
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase parent REPORT.md exists",
+                    "parent_report_exists", True,
+                    bool(parent1) and os.path.exists(os.path.join(
+                        runs_root, parent1, "REPORT.md")))
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase ledger holds exactly one row",
+                    "ledger_rows", 1, len(rows))
+                phase_check(
+                    "463 matrix target-override e2e: control "
+                    "phase ledger row is scripted-matrix "
+                    "demo-matrix failed 2 combinations 0 "
+                    "passed cost 0.0", "ledger_row",
+                    [("scripted-matrix", "demo-matrix", "failed",
+                      2, 0, 0.0)],
+                    [(r.get("kind"), r.get("flow"),
+                      r.get("status"), r.get("combinations"),
+                      r.get("passed"), r.get("cost_usd_est"))
+                     for r in rows])
+
+                # Phase 2: --target override points at the server.
+                rc, lines = run_verify(
+                    ["--target", override_target])
+                parents = parent_dirs()
+                new_parents = [p for p in parents if p != parent1]
+                parent2 = (new_parents[0]
+                           if len(new_parents) == 1 else "")
+                rows = ledger.read_all()
+                phase_check(
+                    "463 matrix target-override e2e: override "
+                    "phase exits 0", "rc", 0, rc)
+                phase_check(
+                    "463 matrix target-override e2e: override "
+                    "phase printed target lines name the "
+                    "override", "printed_targets",
+                    [f"target:  {override_target}"],
+                    printed_targets(lines))
+                phase_check(
+                    "463 matrix target-override e2e: override "
+                    "phase leaves exactly two parent run dirs",
+                    "parent_dir_count", 2, len(parents))
+                phase_check(
+                    "463 matrix target-override e2e: override "
+                    "phase adds exactly one new parent run dir",
+                    "new_parent_dir_count", 1, len(new_parents))
+                for slug in slugs:
+                    run_data, report_lines = load_combo(
+                        parent2, slug)
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"override phase {slug} run.json status "
+                        f"passed", "combo_status", "passed",
+                        run_data.get("status"))
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"override phase {slug} run.json target "
+                        f"is the override", "combo_target",
+                        override_target, run_data.get("target"))
+                    phase_check(
+                        f"463 matrix target-override e2e: "
+                        f"override phase {slug} REPORT.md "
+                        f"target line names the override",
+                        "report_target",
+                        f"- target: `{override_target}`",
+                        report_target(report_lines))
+                phase_check(
+                    "463 matrix target-override e2e: ledger "
+                    "holds exactly two rows after both phases",
+                    "ledger_rows", 2, len(rows))
+                phase_check(
+                    "463 matrix target-override e2e: ledger "
+                    "rows in order failed 2/0 then passed 2/2",
+                    "ledger_order",
+                    [("scripted-matrix", "demo-matrix", "failed",
+                      2, 0, 0.0),
+                     ("scripted-matrix", "demo-matrix", "passed",
+                      2, 2, 0.0)],
+                    [(r.get("kind"), r.get("flow"),
+                      r.get("status"), r.get("combinations"),
+                      r.get("passed"), r.get("cost_usd_est"))
+                     for r in rows])
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("463 matrix target-override e2e: no http.server "
+          "remains after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
