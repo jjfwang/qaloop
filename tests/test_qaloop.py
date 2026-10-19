@@ -22925,6 +22925,218 @@ def test_issue_451_matrix_tag_gate_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_453_batch_investigate_e2e():
+    """Issue #453: pin the batch verify --investigate
+    carve-out end to end with real flows. The single-flow
+    verify --investigate composition is pinned by #421 and
+    the batch verify composition by #425/#447, but the
+    batch carve-out itself - build_parser -> cmd_verify on
+    a directory with --investigate, the exact note that
+    --investigate is not applied in batch mode printed
+    once, the failing flow carrying
+    investigate_on_failure: true yet receiving no
+    investigator (no diagnosis section in its REPORT.md,
+    no investigation ledger row), and the real scripted
+    ledger rows plus batch.json statuses - could rot
+    unobserved. This test stubs NOTHING: it copies the
+    two demo flows (plus the shared login fragment) into
+    a temp flows dir with the failing flow's
+    investigate_on_failure flipped to true, removes
+    QALOOP_MODEL_API_KEY so a leak would take the
+    investigator's manual branch and be observable,
+    serves the repo root on a free port, and drives the
+    real CLI verify once against real browser runs."""
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def batch_investigate_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp = {"exit_code": 1, "note_count": 1, "parent_count": 1,
+           "batch_statuses": {"demo-login-a.yaml": "passed",
+                              "demo-steps-fail.yaml": "failed"},
+           "ledger_rows": 2,
+           "ledger_kinds": ["scripted", "scripted"],
+           "ledger_pairs": [("demo-login-a", "passed"),
+                            ("demo-steps-fail", "failed")],
+           "report_has_diagnosis": False}
+    check("453 batch-investigate e2e: exact expectations return "
+          "no mismatch",
+          batch_investigate_mismatch(dict(exp), exp) is None)
+    probe = batch_investigate_mismatch(dict(exp, note_count=0), exp)
+    check("453 batch-investigate e2e: corrupted note_count "
+          "caught, names field",
+          probe is not None and probe.startswith("note_count:"),
+          probe or "")
+    probe = batch_investigate_mismatch(
+        dict(exp, ledger_kinds=["investigation", "scripted"]), exp)
+    check("453 batch-investigate e2e: corrupted ledger_kinds "
+          "caught, names field",
+          probe is not None and probe.startswith("ledger_kinds:"),
+          probe or "")
+    if not os.path.exists(exe): check("453 batch-investigate e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("453 batch-investigate e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("453 batch-investigate e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows", "demo-login-a.yaml"),
+                    os.path.join(flows_dir, "demo-login-a.yaml"))
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                with open(os.path.join(
+                        root, "flows", "demo-steps-fail.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                check("453 batch-investigate e2e: source flow "
+                      "pins investigate_on_failure: false",
+                      "investigate_on_failure: false" in flow_text)
+                with open(os.path.join(
+                        flows_dir, "demo-steps-fail.yaml"),
+                        "w", encoding="utf-8") as f:
+                    f.write(flow_text.replace(
+                        "investigate_on_failure: false",
+                        "investigate_on_failure: true"))
+                args = cli.build_parser().parse_args(
+                    ["verify", flows_dir, "--investigate"])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = args.fn(args)
+                out = buf.getvalue()
+                note = ("note: --investigate is not applied "
+                        "in batch mode")
+                check("453 batch-investigate e2e: real batch "
+                      "verify exits 1 (designed failure in batch)",
+                      rc == 1, str(rc))
+                check("453 batch-investigate e2e: stdout prints "
+                      "the batch carve-out note exactly once",
+                      out.count(note) == 1, out[-400:])
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                check("453 batch-investigate e2e: exactly one "
+                      "parent batch dir", len(parents) == 1,
+                      str(parents))
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                batch_statuses = {}
+                batch_path = os.path.join(parent, "batch.json")
+                if os.path.exists(batch_path):
+                    with open(batch_path, encoding="utf-8") as f:
+                        batch = json.load(f)
+                    batch_statuses = {e.get("file"): e.get("status")
+                                      for e in batch}
+                check("453 batch-investigate e2e: batch.json "
+                      "pins demo-login-a passed and "
+                      "demo-steps-fail failed",
+                      batch_statuses == exp["batch_statuses"],
+                      str(batch_statuses))
+                rows = []
+                if os.path.exists(ledger_path):
+                    with open(ledger_path, encoding="utf-8") as f:
+                        rows = [json.loads(line) for line in f
+                                if line.strip()]
+                check("453 batch-investigate e2e: ledger holds "
+                      "exactly 2 rows", len(rows) == 2, str(rows))
+                check("453 batch-investigate e2e: ledger kinds "
+                      "are both scripted, no investigation row",
+                      [r.get("kind") for r in rows]
+                      == ["scripted", "scripted"], str(rows))
+                check("453 batch-investigate e2e: ledger rows in "
+                      "order demo-login-a passed, demo-steps-fail "
+                      "failed",
+                      [(r.get("flow"), r.get("status"))
+                       for r in rows] == exp["ledger_pairs"],
+                      str(rows))
+                report_text = ""
+                report_path = os.path.join(
+                    parent, "flows", "demo-steps-fail", "REPORT.md")
+                if os.path.exists(report_path):
+                    with open(report_path, encoding="utf-8") as f:
+                        report_text = f.read()
+                check("453 batch-investigate e2e: failing flow "
+                      "REPORT.md has no investigator diagnosis",
+                      "## Investigator diagnosis" not in report_text,
+                      report_text[:400])
+                outcome = {
+                    "exit_code": rc,
+                    "note_count": out.count(note),
+                    "parent_count": len(parents),
+                    "batch_statuses": batch_statuses,
+                    "ledger_rows": len(rows),
+                    "ledger_kinds": [r.get("kind") for r in rows],
+                    "ledger_pairs": [(r.get("flow"),
+                                      r.get("status"))
+                                     for r in rows],
+                    "report_has_diagnosis": (
+                        "## Investigator diagnosis" in report_text)}
+                mismatch = batch_investigate_mismatch(outcome, exp)
+                check("453 batch-investigate e2e: real run pins "
+                      "the pinned fields exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("453 batch-investigate e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
