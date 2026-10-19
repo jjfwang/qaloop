@@ -21237,6 +21237,217 @@ def test_issue_437_tag_batch_verify_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_439_batch_keep_runs_prune_e2e():
+    """Issue #439: pin the batch verify --keep-runs pruning
+    composition end to end with real flows. The single-flow
+    keep-runs path is pinned by #431 and the tag-filtered
+    batch composition by #437, but the batch call site -
+    build_parser -> cmd_verify on a directory, the real
+    per-flow runs, the parent batch report written by the
+    real write_batch_summary, then prune_old_runs called
+    once after the batch report with the parent dir as
+    current - could rot unobserved. This test stubs
+    NOTHING: it copies the two demo flows (plus the shared
+    login fragment) plainly into a temp flows dir, serves
+    the repo root on a free port, and drives the real CLI
+    verify five times - three default verifies (parent
+    batch dirs accumulate, no pruned line), one
+    --keep-runs 2 verify (the exact pruned line prints and
+    exactly the two newest parents survive, the
+    just-finished parent's batch.json and REPORT.md
+    intact), and one --keep-runs 0 verify as the
+    keep-everything control. Every batch exits 1 because
+    demo-steps-fail fails by design (1/2 flows passed)."""
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def keep_runs_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"pruned_count": 2, "survivors": {"run-a", "run-b"}}
+    check("439 batch-keep-runs e2e: exact expectations return "
+          "no mismatch",
+          keep_runs_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = keep_runs_mismatch(
+        dict(exp_probe, pruned_count=1), exp_probe)
+    check("439 batch-keep-runs e2e: corrupted pruned_count "
+          "caught, names field",
+          probe is not None and probe.startswith("pruned_count:"),
+          probe or "")
+    probe = keep_runs_mismatch(
+        dict(exp_probe, survivors={"run-a"}), exp_probe)
+    check("439 batch-keep-runs e2e: corrupted survivors "
+          "caught, names field",
+          probe is not None and probe.startswith("survivors:"),
+          probe or "")
+    if not os.path.exists(exe): check("439 batch-keep-runs e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("439 batch-keep-runs e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("439 batch-keep-runs e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                for name in ("demo-login-a.yaml",
+                             "demo-steps-fail.yaml"):
+                    shutil.copyfile(
+                        os.path.join(root, "flows", name),
+                        os.path.join(flows_dir, name))
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+
+                def parents():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_batch(extra):
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", flows_dir] + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                for i in range(3):
+                    rc, lines = run_batch([])
+                    check(f"439 batch-keep-runs e2e: default "
+                          f"verify {i + 1} exits 1 (designed "
+                          f"failure in batch)", rc == 1, str(rc))
+                    check(f"439 batch-keep-runs e2e: default "
+                          f"verify {i + 1} prints no pruned line",
+                          not any("pruned" in ln for ln in lines),
+                          str(lines))
+                check("439 batch-keep-runs e2e: exactly 3 "
+                      "parent batch dirs accumulate under "
+                      "default retention", len(parents()) == 3,
+                      str(parents()))
+                snapshot = parents()
+                rc, lines = run_batch(["--keep-runs", "2"])
+                check("439 batch-keep-runs e2e: --keep-runs 2 "
+                      "verify exits 1 (designed failure in "
+                      "batch)", rc == 1, str(rc))
+                check("439 batch-keep-runs e2e: exact pruned "
+                      "line printed",
+                      "pruned 2 old run dir(s) (--keep-runs 2)"
+                      in lines, str(lines))
+                after = parents()
+                new_names = [n for n in after if n not in snapshot]
+                current = new_names[0] if len(new_names) == 1 else ""
+                all_names = sorted(snapshot + [current])
+                exp_survivors = set(all_names[-2:]) | {current}
+                outcome = {
+                    "pruned_count": len(set(all_names) - set(after)),
+                    "survivors": set(after)}
+                exp_outcome = {"pruned_count": 2,
+                               "survivors": exp_survivors}
+                mismatch = keep_runs_mismatch(outcome, exp_outcome)
+                check("439 batch-keep-runs e2e: pruned count "
+                      "and survivors pin exactly",
+                      mismatch is None, mismatch or "")
+                parent = os.path.join(runs_root, current)
+                batch_path = os.path.join(parent, "batch.json")
+                report_path = os.path.join(parent, "REPORT.md")
+                check("439 batch-keep-runs e2e: surviving "
+                      "parent batch.json exists",
+                      os.path.exists(batch_path), batch_path)
+                check("439 batch-keep-runs e2e: surviving "
+                      "parent REPORT.md exists",
+                      os.path.exists(report_path), report_path)
+                batch = []
+                if os.path.exists(batch_path):
+                    with open(batch_path, encoding="utf-8") as f:
+                        batch = json.load(f)
+                entries = {e.get("file"): e.get("status")
+                           for e in batch}
+                check("439 batch-keep-runs e2e: surviving "
+                      "batch.json pins exactly the two flow "
+                      "entries",
+                      len(batch) == 2 and entries == {
+                          "demo-login-a.yaml": "passed",
+                          "demo-steps-fail.yaml": "failed"},
+                      str(entries))
+                report_lines = []
+                if os.path.exists(report_path):
+                    with open(report_path, encoding="utf-8") as f:
+                        report_lines = f.read().splitlines()
+                check("439 batch-keep-runs e2e: surviving "
+                      "parent REPORT.md intact",
+                      bool(report_lines) and report_lines[0] == (
+                          "# qaloop batch report [1/2 PASS]"),
+                      str(report_lines[:1]))
+                rc, lines = run_batch(["--keep-runs", "0"])
+                check("439 batch-keep-runs e2e: --keep-runs 0 "
+                      "verify exits 1 (designed failure in "
+                      "batch)", rc == 1, str(rc))
+                check("439 batch-keep-runs e2e: --keep-runs 0 "
+                      "prints no pruned line",
+                      not any("pruned" in ln for ln in lines),
+                      str(lines))
+                check("439 batch-keep-runs e2e: --keep-runs 0 "
+                      "grows the runs root by exactly one "
+                      "(2 to 3)", len(parents()) == 3,
+                      str(parents()))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("439 batch-keep-runs e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
