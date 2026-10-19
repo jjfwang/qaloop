@@ -22122,6 +22122,284 @@ def test_issue_445_matrix_verify_video_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_447_batch_verify_video_e2e():
+    """Issue #447: pin the batch verify --video recording
+    composition end to end with real flows. The batch verify
+    composition is pinned by #425, the single-flow verify
+    --video composition by #443, and the matrix --video
+    composition by #445, but the batch call site threading
+    video into each per-flow run - build_parser ->
+    cmd_verify on a directory with --video, the real
+    per-flow recordings collected as
+    <parent>/flows/<stem>/video.webm, each flow's run.json
+    video_path and REPORT.md video mentions, the parent
+    batch.json and REPORT.md written by the real
+    write_batch_summary, and the real scripted ledger rows -
+    could rot unobserved. This test stubs NOTHING: it copies
+    the two demo flows (plus the shared login fragment)
+    plainly into a temp flows dir, serves the repo root on a
+    free port, and drives the real CLI verify twice in the
+    same runs root - a control verify without --video (no
+    video.webm anywhere, empty video_path, no REPORT.md
+    video mention) and a --video verify (a real non-empty
+    video.webm per flow, video_path equal to that flow's own
+    file, the passing flow's REPORT.md mentioning video.webm
+    exactly once and the failing flow's exactly twice:
+    header plus failing-step section). Every batch exits 1
+    because demo-steps-fail fails by design (1/2 flows
+    passed)."""
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def batch_video_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"video_present": True, "report_mentions": 1}
+    check("447 batch-video e2e: exact expectations return "
+          "no mismatch",
+          batch_video_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = batch_video_mismatch(
+        dict(exp_probe, video_present=False), exp_probe)
+    check("447 batch-video e2e: corrupted video_present "
+          "caught, names field",
+          probe is not None and probe.startswith("video_present:"),
+          probe or "")
+    probe = batch_video_mismatch(
+        dict(exp_probe, report_mentions=0), exp_probe)
+    check("447 batch-video e2e: corrupted report_mentions "
+          "caught, names field",
+          probe is not None and probe.startswith("report_mentions:"),
+          probe or "")
+    if not os.path.exists(exe): check("447 batch-video e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("447 batch-video e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("447 batch-video e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                for name in ("demo-login-a.yaml",
+                             "demo-steps-fail.yaml"):
+                    shutil.copyfile(
+                        os.path.join(root, "flows", name),
+                        os.path.join(flows_dir, name))
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+
+                def parents():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_batch(extra):
+                    before = parents()
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", flows_dir] + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    new = [n for n in parents() if n not in before]
+                    parent = (os.path.join(runs_root, new[0])
+                              if len(new) == 1 else "")
+                    return rc, parent
+
+                def flow_outcome(parent, stem):
+                    subdir = os.path.join(parent, "flows", stem)
+                    video = os.path.join(subdir, "video.webm")
+                    data = {}
+                    run_json = os.path.join(subdir, "run.json")
+                    if os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    report = ""
+                    report_path = os.path.join(subdir, "REPORT.md")
+                    if os.path.exists(report_path):
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            report = f.read()
+                    return {
+                        "status": data.get("status"),
+                        "video_present": os.path.exists(video),
+                        "video_nonzero": (
+                            os.path.exists(video)
+                            and os.path.getsize(video) > 0),
+                        "video_path": data.get("video_path"),
+                        "report_mentions": report.count(
+                            "video.webm"),
+                    }, video
+
+                def batch_entries(parent):
+                    batch = []
+                    batch_path = os.path.join(parent, "batch.json")
+                    if os.path.exists(batch_path):
+                        with open(batch_path, encoding="utf-8") as f:
+                            batch = json.load(f)
+                    return {e.get("file"): e.get("status")
+                            for e in batch}
+
+                def parent_report(parent):
+                    report_path = os.path.join(parent, "REPORT.md")
+                    exists = os.path.exists(report_path)
+                    mentions = 0
+                    if exists:
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            mentions = f.read().count("video.webm")
+                    return exists, mentions
+
+                exp_entries = {"demo-login-a.yaml": "passed",
+                               "demo-steps-fail.yaml": "failed"}
+
+                # Control phase: no --video, nothing recorded.
+                rc, parent = run_batch([])
+                check("447 batch-video e2e: control verify "
+                      "exits 1 (designed failure in batch)",
+                      rc == 1, str(rc))
+                check("447 batch-video e2e: control verify "
+                      "leaves exactly one parent batch dir",
+                      len(parents()) == 1 and bool(parent),
+                      str(parents()))
+                control_entries = batch_entries(parent)
+                check("447 batch-video e2e: control batch.json "
+                      "pins demo-login-a passed and "
+                      "demo-steps-fail failed",
+                      control_entries == exp_entries,
+                      str(control_entries))
+                exists, mentions = parent_report(parent)
+                check("447 batch-video e2e: control parent "
+                      "REPORT.md exists with no video mention",
+                      exists and mentions == 0,
+                      f"exists={exists} mentions={mentions}")
+                for stem, exp_status in (
+                        ("demo-login-a", "passed"),
+                        ("demo-steps-fail", "failed")):
+                    outcome, _video = flow_outcome(parent, stem)
+                    exp = {"status": exp_status,
+                           "video_present": False,
+                           "video_nonzero": False,
+                           "video_path": "",
+                           "report_mentions": 0}
+                    mismatch = batch_video_mismatch(outcome, exp)
+                    check(f"447 batch-video e2e: control "
+                          f"{stem} records no video, empty "
+                          f"video_path, no REPORT.md mention",
+                          mismatch is None, mismatch or "")
+
+                # Video phase: --video records per flow.
+                rc, parent = run_batch(["--video"])
+                check("447 batch-video e2e: --video verify "
+                      "exits 1 (designed failure in batch)",
+                      rc == 1, str(rc))
+                check("447 batch-video e2e: --video verify "
+                      "leaves a second parent batch dir",
+                      len(parents()) == 2 and bool(parent),
+                      str(parents()))
+                exists, mentions = parent_report(parent)
+                check("447 batch-video e2e: --video parent "
+                      "REPORT.md exists with no video mention",
+                      exists and mentions == 0,
+                      f"exists={exists} mentions={mentions}")
+                check("447 batch-video e2e: --video batch.json "
+                      "entries unchanged from control",
+                      batch_entries(parent) == exp_entries
+                      and batch_entries(parent) == control_entries,
+                      str(batch_entries(parent)))
+                for stem, exp_status, exp_mentions in (
+                        ("demo-login-a", "passed", 1),
+                        ("demo-steps-fail", "failed", 2)):
+                    outcome, video = flow_outcome(parent, stem)
+                    exp = {"status": exp_status,
+                           "video_present": True,
+                           "video_nonzero": True,
+                           "video_path": video,
+                           "report_mentions": exp_mentions}
+                    mismatch = batch_video_mismatch(outcome, exp)
+                    check(f"447 batch-video e2e: --video "
+                          f"{stem} pins its own real video.webm, "
+                          f"video_path and {exp_mentions} "
+                          f"REPORT.md mention(s)",
+                          mismatch is None, mismatch or "")
+
+                rows = []
+                if os.path.exists(ledger_path):
+                    with open(ledger_path, encoding="utf-8") as f:
+                        rows = [json.loads(ln) for ln in f
+                                if ln.strip()]
+                check("447 batch-video e2e: ledger holds "
+                      "exactly 4 scripted rows",
+                      len(rows) == 4 and all(
+                          r.get("kind") == "scripted"
+                          for r in rows), str(rows))
+                check("447 batch-video e2e: ledger rows in "
+                      "order demo-login-a passed, "
+                      "demo-steps-fail failed, twice",
+                      [(r.get("flow"), r.get("status"))
+                       for r in rows] == [
+                          ("demo-login-a", "passed"),
+                          ("demo-steps-fail", "failed"),
+                          ("demo-login-a", "passed"),
+                          ("demo-steps-fail", "failed")],
+                      str(rows))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("447 batch-video e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
