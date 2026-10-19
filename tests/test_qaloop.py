@@ -23944,6 +23944,329 @@ def test_issue_459_target_override_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_461_batch_target_override_e2e():
+    """Issue #461: pin the batch verify --target
+    override composition end to end with a real e2e
+    test. The single-flow --target override is pinned
+    by #459, but the batch chain - build_parser ->
+    cmd_verify on a directory -> _cmd_verify_batch ->
+    _batch_run_one -> _run_single_flow resolving
+    args.target over each flow's loaded spec target,
+    the per-flow run.json / REPORT.md target records,
+    the batch.json aggregation, and the scripted
+    ledger rows - could rot unobserved: the batch e2e
+    tests never pass --target, and the issue-300
+    --target contract stubs run_flow with an echo
+    fake against targets no browser visits. This test
+    stubs NOTHING: it copies the two demo login flows
+    (plus the shared login fragment) into a temp flows
+    dir, rewrites each copy's target line to a literal
+    dead target (a 127.0.0.1 port bound-then-closed so
+    nothing listens), serves the repo root on a free
+    port, and drives the real CLI batch verify twice
+    in the same runs root and ledger."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    flow_names = ("demo-login-a", "demo-login-b")
+
+    def batch_target_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = batch_target_mismatch("rc", 1, 1)
+    check("461 batch target-override e2e: equal values "
+          "return no mismatch", mismatch is None,
+          mismatch or "")
+    probe = batch_target_mismatch(
+        "run_target", "http://127.0.0.1:1", "http://127.0.0.1:2")
+    check("461 batch target-override e2e: corrupted "
+          "run-target caught, names field",
+          probe is not None and probe.startswith("run_target:"),
+          probe or "")
+    probe = batch_target_mismatch("batch_status", "passed", "failed")
+    check("461 batch target-override e2e: corrupted batch "
+          "status caught, names field",
+          probe is not None and probe.startswith("batch_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("461 batch target-override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    dead_port = find_free_port()
+    dead_target = f"http://127.0.0.1:{dead_port}"
+    override_target = f"http://127.0.0.1:{port}"
+    check("461 batch target-override e2e: dead port differs "
+          "from the server port", dead_port != port,
+          f"dead={dead_port} server={port}")
+    check("461 batch target-override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("461 batch target-override e2e: dead port not "
+          "answering (bound-then-closed)", port_free(dead_port),
+          f"dead port {dead_port} already in use")
+    check("461 batch target-override e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = override_target
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                for name in flow_names:
+                    with open(os.path.join(
+                            root, "flows", f"{name}.yaml"),
+                            encoding="utf-8") as f:
+                        flow_text = f.read()
+                    check(f"461 batch target-override e2e: "
+                          f"{name} source target line pin present",
+                          "target: ${TARGET_URL}" in flow_text)
+                    flow_text = flow_text.replace(
+                        "target: ${TARGET_URL}",
+                        f"target: {dead_target}", 1)
+                    with open(os.path.join(
+                            flows_dir, f"{name}.yaml"),
+                            "w", encoding="utf-8") as f:
+                        f.write(flow_text)
+
+                def batch_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(extra):
+                    argv = ["verify", flows_dir] + extra
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                def load_batch(parent):
+                    batch_path = (os.path.join(
+                        runs_root, parent, "batch.json")
+                        if parent else "")
+                    if batch_path and os.path.exists(batch_path):
+                        with open(batch_path, encoding="utf-8") as f:
+                            return json.load(f)
+                    return []
+
+                def load_flow_run(parent, name):
+                    run_dir = (os.path.join(
+                        runs_root, parent, "flows", name)
+                        if parent else "")
+                    data = {}
+                    run_json = os.path.join(run_dir, "run.json")
+                    if run_dir and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    report_lines = []
+                    report_path = os.path.join(run_dir, "REPORT.md")
+                    if run_dir and os.path.exists(report_path):
+                        with open(report_path,
+                                  encoding="utf-8") as f:
+                            report_lines = f.read().splitlines()
+                    return data, report_lines
+
+                def printed_targets(lines):
+                    return [l for l in lines
+                            if l.startswith("target:")]
+
+                def report_target(report_lines):
+                    return next(
+                        (l for l in report_lines
+                         if l.startswith("- target:")), None)
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = batch_target_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                check("461 batch target-override e2e: missing "
+                      "batch dir loads as empty",
+                      load_batch("no-such-batch") == [])
+
+                # Phase 1: declared dead targets, no override.
+                rc, lines = run_verify([])
+                parents = batch_dirs()
+                parent1 = parents[0] if len(parents) == 1 else ""
+                batch1 = load_batch(parent1)
+                rows = ledger.read_all()
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase exits 1", "rc", 1, rc)
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase leaves exactly one batch dir",
+                    "batch_dir_count", 1, len(parents))
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase printed target lines name the dead "
+                    "target for both flows", "printed_targets",
+                    [f"target:  {dead_target}"] * 2,
+                    printed_targets(lines))
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase batch.json pins both flows failed",
+                    "batch_statuses",
+                    [("demo-login-a.yaml", "failed"),
+                     ("demo-login-b.yaml", "failed")],
+                    [(e.get("file"), e.get("status"))
+                     for e in batch1])
+                for name in flow_names:
+                    run_data, _ = load_flow_run(parent1, name)
+                    phase_check(
+                        f"461 batch target-override e2e: control "
+                        f"phase {name} run.json status failed",
+                        "run_status", "failed",
+                        run_data.get("status"))
+                    phase_check(
+                        f"461 batch target-override e2e: control "
+                        f"phase {name} run.json target is the "
+                        f"dead target", "run_target", dead_target,
+                        run_data.get("target"))
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase ledger holds exactly two rows",
+                    "ledger_rows", 2, len(rows))
+                phase_check(
+                    "461 batch target-override e2e: control "
+                    "phase ledger rows in order demo-login-a "
+                    "failed then demo-login-b failed",
+                    "ledger_order",
+                    [("scripted", "demo-login-a", "failed"),
+                     ("scripted", "demo-login-b", "failed")],
+                    [(r.get("kind"), r.get("flow"),
+                      r.get("status")) for r in rows])
+
+                # Phase 2: --target override points at the server.
+                rc, lines = run_verify(
+                    ["--target", override_target])
+                parents = batch_dirs()
+                new_parents = [p for p in parents if p != parent1]
+                parent2 = (new_parents[0]
+                           if len(new_parents) == 1 else "")
+                batch2 = load_batch(parent2)
+                rows = ledger.read_all()
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase exits 0", "rc", 0, rc)
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase leaves exactly two batch dirs",
+                    "batch_dir_count", 2, len(parents))
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase adds exactly one new batch dir",
+                    "new_batch_dir_count", 1, len(new_parents))
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase printed target lines name the "
+                    "override for both flows", "printed_targets",
+                    [f"target:  {override_target}"] * 2,
+                    printed_targets(lines))
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase batch.json pins both flows passed",
+                    "batch_statuses",
+                    [("demo-login-a.yaml", "passed"),
+                     ("demo-login-b.yaml", "passed")],
+                    [(e.get("file"), e.get("status"))
+                     for e in batch2])
+                phase_check(
+                    "461 batch target-override e2e: override "
+                    "phase batch.json pins steps 4/4 for both "
+                    "flows", "batch_steps",
+                    [(4, 4), (4, 4)],
+                    [(e.get("steps_passed"), e.get("steps_total"))
+                     for e in batch2])
+                for name in flow_names:
+                    run_data, report_lines = load_flow_run(
+                        parent2, name)
+                    phase_check(
+                        f"461 batch target-override e2e: override "
+                        f"phase {name} run.json status passed",
+                        "run_status", "passed",
+                        run_data.get("status"))
+                    phase_check(
+                        f"461 batch target-override e2e: override "
+                        f"phase {name} run.json target is the "
+                        f"override", "run_target", override_target,
+                        run_data.get("target"))
+                    phase_check(
+                        f"461 batch target-override e2e: override "
+                        f"phase {name} REPORT.md target line "
+                        f"names the override", "report_target",
+                        f"- target: `{override_target}`",
+                        report_target(report_lines))
+                phase_check(
+                    "461 batch target-override e2e: ledger "
+                    "holds exactly four rows after both phases",
+                    "ledger_rows", 4, len(rows))
+                phase_check(
+                    "461 batch target-override e2e: ledger rows "
+                    "in order failed, failed, passed, passed",
+                    "ledger_order",
+                    [("scripted", "demo-login-a", "failed"),
+                     ("scripted", "demo-login-b", "failed"),
+                     ("scripted", "demo-login-a", "passed"),
+                     ("scripted", "demo-login-b", "passed")],
+                    [(r.get("kind"), r.get("flow"),
+                      r.get("status")) for r in rows])
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("461 batch target-override e2e: no http.server "
+          "remains after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
