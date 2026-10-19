@@ -23640,6 +23640,310 @@ def test_issue_457_batch_matrix_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_459_target_override_e2e():
+    """Issue #459: pin the verify --target override
+    composition end to end with a real e2e test. The
+    single-flow verify path is pinned by #449, but the
+    --target override composition - build_parser ->
+    cmd_verify on one flow whose declared target is a
+    literal dead URL, the printed target line, the
+    run.json and REPORT.md target records, and the
+    scripted ledger row, first with the declared target
+    (real failed run) and then with --target pointing
+    at a live server (real passed run) - could rot
+    unobserved. This test stubs NOTHING: it copies the
+    demo login flow (plus the shared login fragment)
+    into a temp flows dir, rewrites the copy's target
+    line to a literal dead target (a 127.0.0.1 port
+    bound-then-closed so nothing listens), serves the
+    repo root on a free port, and drives the real CLI
+    verify twice in the same runs root and ledger."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def target_override_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = target_override_mismatch("rc", 1, 1)
+    check("459 target-override e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = target_override_mismatch(
+        "run_target", "http://127.0.0.1:1", "http://127.0.0.1:2")
+    check("459 target-override e2e: corrupted run-target "
+          "caught, names field",
+          probe is not None and probe.startswith("run_target:"),
+          probe or "")
+    probe = target_override_mismatch("run_status", "passed", "failed")
+    check("459 target-override e2e: corrupted status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("459 target-override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    dead_port = find_free_port()
+    dead_target = f"http://127.0.0.1:{dead_port}"
+    override_target = f"http://127.0.0.1:{port}"
+    check("459 target-override e2e: dead port differs "
+          "from the server port", dead_port != port,
+          f"dead={dead_port} server={port}")
+    check("459 target-override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("459 target-override e2e: dead port not "
+          "answering (bound-then-closed)", port_free(dead_port),
+          f"dead port {dead_port} already in use")
+    check("459 target-override e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(os.path.join(flows_dir, "fragments"))
+                os.environ["TARGET_URL"] = override_target
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                shutil.copyfile(
+                    os.path.join(root, "flows", "fragments",
+                                 "login.yaml"),
+                    os.path.join(flows_dir, "fragments",
+                                 "login.yaml"))
+                with open(os.path.join(
+                        root, "flows", "demo-login-a.yaml"),
+                        encoding="utf-8") as f:
+                    login_text = f.read()
+                check("459 target-override e2e: source "
+                      "target line pin present",
+                      "target: ${TARGET_URL}" in login_text)
+                login_text = login_text.replace(
+                    "target: ${TARGET_URL}",
+                    f"target: {dead_target}", 1)
+                flow_path = os.path.join(flows_dir,
+                                         "demo-login-a.yaml")
+                with open(flow_path, "w",
+                          encoding="utf-8") as f:
+                    f.write(login_text)
+
+                def run_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_verify(extra):
+                    argv = ["verify", flow_path] + extra
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                def load_run(run_dir):
+                    data = {}
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    report_lines = []
+                    report_path = (os.path.join(run_dir, "REPORT.md")
+                                   if run_dir else "")
+                    if report_path and os.path.exists(report_path):
+                        with open(report_path, encoding="utf-8") as f:
+                            report_lines = f.read().splitlines()
+                    return data, report_lines
+
+                def printed_target(lines):
+                    return next(
+                        (l for l in lines
+                         if l.startswith("target:")), None)
+
+                def report_target(report_lines):
+                    return next(
+                        (l for l in report_lines
+                         if l.startswith("- target:")), None)
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = target_override_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                # Phase 1: declared dead target, no override.
+                rc, lines = run_verify([])
+                dirs = run_dirs()
+                control_dir = (os.path.join(runs_root, dirs[0])
+                               if len(dirs) == 1 else "")
+                run_data, report_lines = load_run(control_dir)
+                rows = ledger.read_all()
+                row0 = rows[0] if rows else {}
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "exits 1", "rc", 1, rc)
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "printed target line names the dead target",
+                    "printed_target", f"target:  {dead_target}",
+                    printed_target(lines))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "leaves exactly one run dir",
+                    "run_dir_count", 1, len(dirs))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "run.json status failed", "run_status",
+                    "failed", run_data.get("status"))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "run.json target is the dead target",
+                    "run_target", dead_target,
+                    run_data.get("target"))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "REPORT.md target line names the dead target",
+                    "report_target", f"- target: `{dead_target}`",
+                    report_target(report_lines))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "ledger holds exactly one row",
+                    "ledger_rows", 1, len(rows))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "ledger row kind scripted", "ledger_kind",
+                    "scripted", row0.get("kind"))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "ledger row flow demo-login-a",
+                    "ledger_flow", "demo-login-a",
+                    row0.get("flow"))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "ledger row status failed",
+                    "ledger_status", "failed",
+                    row0.get("status"))
+                phase_check(
+                    "459 target-override e2e: control phase "
+                    "ledger row cost 0.0", "ledger_cost", 0.0,
+                    row0.get("cost_usd_est"))
+
+                # Phase 2: --target override points at the server.
+                rc, lines = run_verify(["--target", override_target])
+                dirs = run_dirs()
+                new_dirs = [d for d in dirs
+                            if os.path.join(runs_root, d) != control_dir]
+                override_dir = (os.path.join(runs_root, new_dirs[0])
+                                if len(new_dirs) == 1 else "")
+                run_data, report_lines = load_run(override_dir)
+                rows = ledger.read_all()
+                row1 = rows[1] if len(rows) > 1 else {}
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "exits 0", "rc", 0, rc)
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "printed target line names the override",
+                    "printed_target", f"target:  {override_target}",
+                    printed_target(lines))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "leaves exactly two run dirs",
+                    "run_dir_count", 2, len(dirs))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "adds exactly one new run dir",
+                    "new_run_dir_count", 1, len(new_dirs))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "run.json status passed", "run_status",
+                    "passed", run_data.get("status"))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "run.json target is the override",
+                    "run_target", override_target,
+                    run_data.get("target"))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "REPORT.md target line names the override",
+                    "report_target",
+                    f"- target: `{override_target}`",
+                    report_target(report_lines))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "ledger holds exactly two rows",
+                    "ledger_rows", 2, len(rows))
+                phase_check(
+                    "459 target-override e2e: ledger rows in "
+                    "order demo-login-a failed then passed",
+                    "ledger_order",
+                    [("demo-login-a", "failed"),
+                     ("demo-login-a", "passed")],
+                    [(r.get("flow"), r.get("status")) for r in rows])
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "ledger row kind scripted", "ledger_kind",
+                    "scripted", row1.get("kind"))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "ledger row flow demo-login-a",
+                    "ledger_flow", "demo-login-a",
+                    row1.get("flow"))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "ledger row status passed",
+                    "ledger_status", "passed",
+                    row1.get("status"))
+                phase_check(
+                    "459 target-override e2e: override phase "
+                    "ledger row cost 0.0", "ledger_cost", 0.0,
+                    row1.get("cost_usd_est"))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("459 target-override e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
