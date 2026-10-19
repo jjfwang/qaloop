@@ -24599,6 +24599,267 @@ def test_issue_463_matrix_target_override_e2e():
           "remains after cleanup", no_static_server(port),
           f"http.server still on {port}")
 
+
+def test_issue_465_baselines_target_override_e2e():
+    """Issue #465: pin the baselines --target override
+    composition end to end with a real executing test.
+    SPEC.md documents --target for qaloop baselines,
+    but the baselines e2e pinned by #419 drives the
+    real cmd_baselines without ever passing --target,
+    and the issue-300 --target contract stubs run_flow
+    with an echo fake against targets no browser
+    visits, so the baselines chain - build_parser ->
+    cmd_baselines resolving args.target over the
+    flow's declared spec target, the printed target
+    line, and the run.json target record, first with
+    the declared target (real failed run, no baseline
+    saved) and then with --target pointing at a live
+    server (real passed run, baseline PNG saved) -
+    could rot unobserved. This test stubs NOTHING: it
+    copies the demo-mock-ux flow into a temp flows
+    dir, rewrites the copy's target line to a literal
+    dead target (a 127.0.0.1 port bound-then-closed
+    so nothing listens), serves the repo root on a
+    free port, and drives the real CLI baselines
+    command twice in the same runs root."""
+    import contextlib
+    import io
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def baselines_target_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = baselines_target_mismatch("rc", 1, 1)
+    check("465 baselines target-override e2e: equal values "
+          "return no mismatch", mismatch is None, mismatch or "")
+    probe = baselines_target_mismatch(
+        "run_target", "http://127.0.0.1:1", "http://127.0.0.1:2")
+    check("465 baselines target-override e2e: corrupted "
+          "run-target caught, names field",
+          probe is not None and probe.startswith("run_target:"),
+          probe or "")
+    probe = baselines_target_mismatch("run_status", "passed", "failed")
+    check("465 baselines target-override e2e: corrupted status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("465 baselines target-override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    dead_port = find_free_port()
+    dead_target = f"http://127.0.0.1:{dead_port}"
+    override_target = f"http://127.0.0.1:{port}"
+    check("465 baselines target-override e2e: dead port differs "
+          "from the server port", dead_port != port,
+          f"dead={dead_port} server={port}")
+    check("465 baselines target-override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("465 baselines target-override e2e: dead port not "
+          "answering (bound-then-closed)", port_free(dead_port),
+          f"dead port {dead_port} already in use")
+    check("465 baselines target-override e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                ledger_path = os.path.join(td, "ledger.jsonl")
+                flows_dir = os.path.join(td, "flows")
+                os.makedirs(flows_dir)
+                os.environ["TARGET_URL"] = override_target
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                with open(os.path.join(
+                        root, "flows", "demo-mock-ux.yaml"),
+                        encoding="utf-8") as f:
+                    flow_text = f.read()
+                check("465 baselines target-override e2e: source "
+                      "target line pin present",
+                      "target: ${TARGET_URL}" in flow_text)
+                flow_text = flow_text.replace(
+                    "target: ${TARGET_URL}",
+                    f"target: {dead_target}", 1)
+                flow_path = os.path.join(flows_dir,
+                                         "demo-mock-ux.yaml")
+                with open(flow_path, "w",
+                          encoding="utf-8") as f:
+                    f.write(flow_text)
+                baseline_png = os.path.join(
+                    flows_dir, "baselines", "mock-demo.png")
+
+                def run_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_baselines(extra):
+                    argv = ["baselines", flow_path,
+                            "--executable-path", exe] + extra
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                def load_run(run_dir):
+                    data = {}
+                    run_json = (os.path.join(run_dir, "run.json")
+                                if run_dir else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json, encoding="utf-8") as f:
+                            data = json.load(f)
+                    return data
+
+                def printed_target(lines):
+                    return next(
+                        (l for l in lines
+                         if l.startswith("target:")), None)
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = baselines_target_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                # Phase 1: declared dead target, no override.
+                rc, lines = run_baselines([])
+                dirs = run_dirs()
+                control_dir = (os.path.join(runs_root, dirs[0])
+                               if len(dirs) == 1 else "")
+                run_data = load_run(control_dir)
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase exits 1", "rc", 1, rc)
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase printed target line names the dead "
+                    "target", "printed_target",
+                    f"target:  {dead_target}",
+                    printed_target(lines))
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase leaves exactly one run dir",
+                    "run_dir_count", 1, len(dirs))
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase run.json status failed", "run_status",
+                    "failed", run_data.get("status"))
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase run.json target is the dead target",
+                    "run_target", dead_target,
+                    run_data.get("target"))
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase run dir has no REPORT.md",
+                    "report_present", False,
+                    os.path.exists(os.path.join(
+                        control_dir, "REPORT.md"))
+                    if control_dir else False)
+                phase_check(
+                    "465 baselines target-override e2e: control "
+                    "phase baseline PNG absent",
+                    "baseline_png_present", False,
+                    os.path.exists(baseline_png))
+
+                # Phase 2: --target override points at the server.
+                rc, lines = run_baselines(
+                    ["--target", override_target])
+                dirs = run_dirs()
+                new_dirs = [d for d in dirs
+                            if os.path.join(runs_root, d) != control_dir]
+                override_dir = (os.path.join(runs_root, new_dirs[0])
+                                if len(new_dirs) == 1 else "")
+                run_data = load_run(override_dir)
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase exits 0", "rc", 0, rc)
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase printed target line names the override",
+                    "printed_target", f"target:  {override_target}",
+                    printed_target(lines))
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase leaves exactly two run dirs",
+                    "run_dir_count", 2, len(dirs))
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase adds exactly one new run dir",
+                    "new_run_dir_count", 1, len(new_dirs))
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase run.json status passed", "run_status",
+                    "passed", run_data.get("status"))
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase run.json target is the override",
+                    "run_target", override_target,
+                    run_data.get("target"))
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase run dir has no REPORT.md",
+                    "report_present", False,
+                    os.path.exists(os.path.join(
+                        override_dir, "REPORT.md"))
+                    if override_dir else False)
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase baseline PNG written and non-empty",
+                    "baseline_png_nonempty", True,
+                    os.path.exists(baseline_png)
+                    and os.path.getsize(baseline_png) > 0)
+                phase_check(
+                    "465 baselines target-override e2e: override "
+                    "phase prints the baseline saved line",
+                    "baseline_saved_line", True,
+                    any("screenshot_matches: baseline saved to"
+                        in line for line in lines))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("465 baselines target-override e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
