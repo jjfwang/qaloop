@@ -21677,6 +21677,208 @@ def test_issue_441_matrix_keep_runs_prune_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_443_verify_video_e2e():
+    """Issue #443: pin the verify --video recording composition
+    end to end with real flows. Issue #90 tests video through
+    the fake sync_playwright seam (a FakeVideo file moved into
+    place) and issue #304 pins only the CLI plumbing that
+    threads video= into the run calls with run_flow stubbed,
+    so the real chain - build_parser -> cmd_verify --video ->
+    run_flow recording -> the collected <run_dir>/video.webm
+    -> run.json video_path -> the REPORT.md header link and
+    failing-step links - could rot unobserved. This test stubs
+    NOTHING: it serves the repo root on a free port and drives
+    the real CLI verify three times - a control verify of
+    demo-login-a without --video (no video.webm, empty
+    video_path), a passing verify of demo-login-a with
+    --video (real non-empty video.webm, video_path equal to
+    that file, REPORT.md linking it), and a failing verify of
+    demo-steps-fail with --video (exit 1 by design, real
+    video.webm, video_path set, REPORT.md mentioning
+    video.webm at least twice: header plus failing-step
+    section)."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def video_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"video_present": True, "report_mentions": 2}
+    check("443 video e2e: exact expectations return "
+          "no mismatch",
+          video_mismatch(dict(exp_probe), exp_probe) is None)
+    probe = video_mismatch(
+        dict(exp_probe, video_present=False), exp_probe)
+    check("443 video e2e: corrupted video_present "
+          "caught, names field",
+          probe is not None and probe.startswith("video_present:"),
+          probe or "")
+    probe = video_mismatch(
+        dict(exp_probe, report_mentions=1), exp_probe)
+    check("443 video e2e: corrupted report_mentions "
+          "caught, names field",
+          probe is not None and probe.startswith("report_mentions:"),
+          probe or "")
+    if not os.path.exists(exe): check("443 video e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("443 video e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("443 video e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/mock-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+
+                def run_verify(flow, extra):
+                    parsed = cli.build_parser().parse_args(
+                        ["verify", os.path.join(
+                            root, "flows", flow)] + extra)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                    return rc, dirs
+
+                def phase_outcome(run_dir):
+                    video = os.path.join(run_dir, "video.webm")
+                    with open(os.path.join(
+                            run_dir, "run.json"),
+                            encoding="utf-8") as f:
+                        data = json.load(f)
+                    with open(os.path.join(
+                            run_dir, "REPORT.md"),
+                            encoding="utf-8") as f:
+                        report = f.read()
+                    return {
+                        "status": data.get("status"),
+                        "video_present": os.path.exists(video),
+                        "video_nonzero": (
+                            os.path.exists(video)
+                            and os.path.getsize(video) > 0),
+                        "video_path": data.get("video_path"),
+                        "report_mentions": report.count(
+                            "video.webm"),
+                    }, video
+
+                # Control phase: no --video, nothing recorded.
+                rc, dirs = run_verify("demo-login-a.yaml", [])
+                check("443 video e2e: control verify exits 0",
+                      rc == 0, str(rc))
+                check("443 video e2e: control verify leaves "
+                      "exactly one run dir", len(dirs) == 1,
+                      str(dirs))
+                outcome, _video = phase_outcome(
+                    os.path.join(runs_root, dirs[-1]))
+                exp = {"status": "passed",
+                       "video_present": False,
+                       "video_path": ""}
+                mismatch = video_mismatch(outcome, exp)
+                check("443 video e2e: control records no "
+                      "video and an empty video_path",
+                      mismatch is None, mismatch or "")
+
+                # Pass phase: --video records a real video.
+                rc, dirs = run_verify(
+                    "demo-login-a.yaml", ["--video"])
+                check("443 video e2e: pass --video verify "
+                      "exits 0", rc == 0, str(rc))
+                check("443 video e2e: pass verify leaves a "
+                      "second run dir", len(dirs) == 2,
+                      str(dirs))
+                run_dir = os.path.join(runs_root, dirs[-1])
+                outcome, video = phase_outcome(run_dir)
+                exp = {"status": "passed",
+                       "video_present": True,
+                       "video_nonzero": True,
+                       "video_path": video}
+                mismatch = video_mismatch(outcome, exp)
+                check("443 video e2e: pass --video pins real "
+                      "video.webm, its size and video_path",
+                      mismatch is None, mismatch or "")
+                check("443 video e2e: pass REPORT.md links "
+                      "video.webm",
+                      outcome["report_mentions"] >= 1,
+                      str(outcome["report_mentions"]))
+
+                # Fail phase: --video still records, exit 1.
+                rc, dirs = run_verify(
+                    "demo-steps-fail.yaml", ["--video"])
+                check("443 video e2e: fail --video verify "
+                      "exits 1 by design", rc == 1, str(rc))
+                check("443 video e2e: fail verify leaves a "
+                      "third run dir", len(dirs) == 3,
+                      str(dirs))
+                run_dir = os.path.join(runs_root, dirs[-1])
+                outcome, video = phase_outcome(run_dir)
+                exp = {"status": "failed",
+                       "video_present": True,
+                       "video_nonzero": True,
+                       "video_path": video}
+                mismatch = video_mismatch(outcome, exp)
+                check("443 video e2e: fail --video pins real "
+                      "video.webm, its size and video_path",
+                      mismatch is None, mismatch or "")
+                check("443 video e2e: fail REPORT.md mentions "
+                      "video.webm at least twice (header plus "
+                      "failing-step section)",
+                      outcome["report_mentions"] >= 2,
+                      str(outcome["report_mentions"]))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("443 video e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
