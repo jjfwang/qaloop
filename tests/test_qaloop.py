@@ -26510,6 +26510,298 @@ def test_issue_477_worker_upload_dir_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_479_perform_upload_dir_guard_e2e():
+    """Issue #479: pin the CLI perform --upload-dir guard
+    composition end to end. Issue #387 drives perform()
+    directly with an explicit upload_dir and #407 drives
+    the CLI perform path with no upload at all, so the
+    composition - build_parser -> cmd_perform passing
+    args.upload_dir straight into perform() (no
+    QALOOP_UPLOAD_DIR consultation, unlike verify) ->
+    Performer.act -> the shared guard
+    qaloop.upload.check_upload_path BEFORE
+    set_input_files - could rot unobserved. This test
+    stubs NOTHING in that chain: it boots the proof
+    server once and a fresh fake_model_upload per phase
+    (its SCRIPT/state is module-global), and drives the
+    real CLI perform of the upload task three times:
+    --upload-dir naming the demo dir accepts the upload,
+    --upload-dir naming a wrong empty dir rejects it
+    (the scripted done still completes the run), and
+    no --upload-dir defaults the guard to the run dir
+    itself, which also rejects the demo fixture."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    task = "Upload the resume fixture file"
+    target = "http://127.0.0.1:8933/demo/upload-demo.html"
+    demo_dir = os.path.join(root, "demo")
+    fixture = os.path.join(demo_dir, "upload-fixture.txt")
+
+    def perform_upload_mismatch(outcome, exp):
+        for field in ("status", "action_count", "rec1", "rec2"):
+            e, a = exp.get(field), outcome.get(field)
+            ok = (all(s in (a or "") for s in e)
+                  if isinstance(e, tuple) else a == e)
+            if not ok: return f"{field}: expected {e!r}, got {a!r}"
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_greeting():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8933/api/greeting", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def no_proc(pattern):
+        return subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True).returncode != 0
+
+    def start_fake():
+        proc = subprocess.Popen(
+            [sys.executable, "demo/fake_model_upload.py", fixture],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        ready = False
+        while not ready and time.time() < deadline:
+            ready = not port_free(8932)
+            time.sleep(0 if ready else 0.1)
+        return proc, ready
+
+    def stop_fake(proc):
+        proc.terminate()
+        proc.wait()
+
+    accepted = {"status": "completed", "action_count": 3,
+                "rec1": "uploaded upload-fixture.txt",
+                "rec2": "wait satisfied"}
+    probe = perform_upload_mismatch(
+        dict(accepted, status="failed"), accepted)
+    check("479 perform upload-dir guard e2e: corrupted status "
+          "caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_upload_mismatch(
+        dict(accepted, action_count=99), accepted)
+    check("479 perform upload-dir guard e2e: corrupted count "
+          "caught, names field",
+          probe is not None and "action_count" in probe,
+          probe or "")
+    probe = perform_upload_mismatch(
+        dict(accepted, rec1="wrong result"), accepted)
+    check("479 perform upload-dir guard e2e: corrupted rec1 "
+          "caught, names field",
+          probe is not None and "rec1" in probe, probe or "")
+    probe = perform_upload_mismatch(
+        dict(accepted, rec2="wrong result"), accepted)
+    check("479 perform upload-dir guard e2e: corrupted rec2 "
+          "caught, names field",
+          probe is not None and "rec2" in probe, probe or "")
+    check("479 perform upload-dir guard e2e: exact expectations "
+          "return no mismatch",
+          perform_upload_mismatch(dict(accepted), accepted) is None)
+    check("479 perform upload-dir guard e2e: tuple expectations "
+          "return no mismatch",
+          perform_upload_mismatch(
+              accepted, dict(accepted, rec1=("uploaded",
+                                             "upload-fixture.txt"),
+                             rec2=("wait",))) is None)
+    probe = perform_upload_mismatch(
+        accepted, dict(accepted, rec1=("is outside the upload dir",)))
+    check("479 perform upload-dir guard e2e: corrupted tuple "
+          "rec1 caught, names field",
+          probe is not None and "rec1" in probe, probe or "")
+    if not os.path.exists(exe): check("479 perform upload-dir guard e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_NAME", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_UPLOAD_DIR")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    proof = None
+    fake = None
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            runs_root = os.path.join(td, "runs")
+            wrong_dir = os.path.join(td, "wrong")
+            os.makedirs(wrong_dir)
+            os.environ["QALOOP_MODEL_BASE_URL"] = "http://127.0.0.1:8932"
+            os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-479"
+            os.environ["QALOOP_MODEL_NAME"] = "fake-model"
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(td, "ledger.jsonl")
+            os.environ.pop("QALOOP_UPLOAD_DIR", None)
+            occupied_8933 = not port_free(8933)
+            occupied_8932 = not port_free(8932)
+            check("479 perform upload-dir guard e2e: port 8933 not "
+                  "already in use", not occupied_8933,
+                  "stale server already on 8933")
+            check("479 perform upload-dir guard e2e: port 8932 not "
+                  "already in use", not occupied_8932,
+                  "stale server already on 8932")
+            check("479 perform upload-dir guard e2e: no stale proof "
+                  "server answering", not poll_greeting())
+            check("479 perform upload-dir guard e2e: no stale proof "
+                  "server process", no_proc("demo/proof_server.py"))
+            check("479 perform upload-dir guard e2e: no stale fake "
+                  "model process", no_proc("demo/fake_model_upload.py"))
+
+            def run_phase(extra):
+                before = (sorted(os.listdir(runs_root))
+                          if os.path.isdir(runs_root) else [])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_perform(
+                        cli.build_parser().parse_args(
+                            ["perform", "--task", task,
+                             "--target", target,
+                             "--max-actions", "10",
+                             "--executable-path", exe] + extra))
+                after = (sorted(os.listdir(runs_root))
+                         if os.path.isdir(runs_root) else [])
+                new_dirs = [d for d in after if d not in before]
+                run_dir = (os.path.join(runs_root, new_dirs[0])
+                           if len(new_dirs) == 1 else "")
+                pdata = {}
+                pjson = (os.path.join(run_dir, "perform.json")
+                         if run_dir else "")
+                if pjson and os.path.exists(pjson):
+                    with open(pjson, encoding="utf-8") as f:
+                        pdata = json.load(f)
+                return rc, new_dirs, run_dir, pdata
+
+            def outcome_of(pdata):
+                acts = pdata.get("actions") or []
+                return {
+                    "status": pdata.get("status"),
+                    "action_count": pdata.get("action_count"),
+                    "rec1": (acts[0].get("result")
+                             if len(acts) > 0 else None),
+                    "rec2": (acts[1].get("result")
+                             if len(acts) > 1 else None)}
+
+            if not occupied_8933 and not occupied_8932:
+                proof = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("479 perform upload-dir guard e2e: proof server "
+                      "ready on 8933", ready)
+                if ready:
+                    # Phase 1: --upload-dir names the demo dir -
+                    # the guard accepts the fixture upload.
+                    fake, fake_ready = start_fake()
+                    check("479 perform upload-dir guard e2e: accepted "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, new_dirs, run_dir, pdata = run_phase(
+                        ["--upload-dir", demo_dir])
+                    check("479 perform upload-dir guard e2e: accepted "
+                          "phase exits 0", rc == 0, str(rc))
+                    check("479 perform upload-dir guard e2e: accepted "
+                          "phase adds exactly one run dir",
+                          len(new_dirs) == 1, str(new_dirs))
+                    mismatch = perform_upload_mismatch(
+                        outcome_of(pdata), accepted)
+                    check("479 perform upload-dir guard e2e: accepted "
+                          "phase pins the completed upload outcome",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("479 perform upload-dir guard e2e: port "
+                          "8932 free after accepted fake stops",
+                          port_free(8932))
+                    # Phase 2: --upload-dir names a wrong empty
+                    # dir - the guard rejects record 1, the wait
+                    # for the never-uploaded name times out, and
+                    # the scripted done still completes the run.
+                    rejected = {
+                        "status": "completed", "action_count": 3,
+                        "rec1": ("FAILED", "is outside the upload dir",
+                                 wrong_dir),
+                        "rec2": ("FAILED",)}
+                    fake, fake_ready = start_fake()
+                    check("479 perform upload-dir guard e2e: rejection "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, new_dirs, run_dir, pdata = run_phase(
+                        ["--upload-dir", wrong_dir])
+                    check("479 perform upload-dir guard e2e: rejection "
+                          "phase exits 0", rc == 0, str(rc))
+                    check("479 perform upload-dir guard e2e: rejection "
+                          "phase adds exactly one run dir",
+                          len(new_dirs) == 1, str(new_dirs))
+                    mismatch = perform_upload_mismatch(
+                        outcome_of(pdata), rejected)
+                    check("479 perform upload-dir guard e2e: rejection "
+                          "phase pins the guard rejection outcome",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("479 perform upload-dir guard e2e: port "
+                          "8932 free after rejection fake stops",
+                          port_free(8932))
+                    # Phase 3: no --upload-dir - perform()
+                    # defaults the guard to this phase's own run
+                    # dir, so the demo fixture is rejected naming
+                    # that run dir (not verify's undeclared
+                    # fail-closed error).
+                    fake, fake_ready = start_fake()
+                    check("479 perform upload-dir guard e2e: default "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, new_dirs, run_dir, pdata = run_phase([])
+                    check("479 perform upload-dir guard e2e: default "
+                          "phase exits 0", rc == 0, str(rc))
+                    check("479 perform upload-dir guard e2e: default "
+                          "phase adds exactly one run dir",
+                          len(new_dirs) == 1, str(new_dirs))
+                    defaulted = {
+                        "status": "completed", "action_count": 3,
+                        "rec1": ("FAILED", "is outside the upload dir",
+                                 run_dir),
+                        "rec2": ("FAILED",)}
+                    mismatch = perform_upload_mismatch(
+                        outcome_of(pdata), defaulted)
+                    check("479 perform upload-dir guard e2e: default "
+                          "phase pins the run-dir guard outcome",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("479 perform upload-dir guard e2e: port "
+                          "8932 free after default fake stops",
+                          port_free(8932))
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            proof.terminate() if proof is not None else None
+            proof.wait() if proof is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("479 perform upload-dir guard e2e: port 8933 free after "
+          "cleanup", port_free(8933))
+    check("479 perform upload-dir guard e2e: port 8932 free after "
+          "cleanup", port_free(8932))
+    check("479 perform upload-dir guard e2e: no proof server remains "
+          "after cleanup", no_proc("demo/proof_server.py"))
+    check("479 perform upload-dir guard e2e: no fake model remains "
+          "after cleanup", no_proc("demo/fake_model_upload.py"))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
