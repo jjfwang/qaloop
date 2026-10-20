@@ -27374,6 +27374,342 @@ def test_issue_483_perform_allow_publish_e2e():
     check("483 perform allow-publish e2e: no fake model remains "
           "after cleanup", no_proc("fake_publish_483"))
 
+def test_issue_485_perform_max_actions_e2e():
+    """Issue #485: pin the CLI perform --max-actions
+    budget-exhaustion composition end to end. The parser
+    and unit tests pin --max-actions parsing and the
+    Performer loop in isolation, but no test drives the
+    real chain - build_parser -> cmd_perform ->
+    perform(max_actions=...) -> Performer over a real
+    browser run -> perform.json / ledger - with a budget
+    small enough to exhaust, so the incomplete status,
+    the exact exhaustion summary, and the exit-1 contract
+    could rot unobserved. This test stubs NOTHING in
+    that chain: it serves a temp page whose Refresh
+    button is a real button element from a caller-owned
+    static server, boots a fresh scripted fake model per
+    phase (its script state is module-global), and
+    drives the real CLI perform twice: --max-actions 2
+    with an endless click script exhausts the budget
+    (status incomplete, exit 1), and --max-actions 10
+    with a click-then-done script completes."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    task = "Keep refreshing the page"
+    target = "http://127.0.0.1:8941/refresh.html"
+    refresh_html = "\n".join([
+        "<!doctype html>",
+        "<html><body>",
+        '<button type="button">Refresh</button>',
+        '<p id="status"></p>',
+        "<script>",
+        "document.querySelector('button').addEventListener("
+        "'click', function () { document.getElementById('status')"
+        ".textContent = 'Refreshed!'; });",
+        "</script>",
+        "</body></html>",
+    ])
+    done_summary = "Refreshed once and finished."
+    click_step = ('    {"action": "click", "target": '
+                  '{"role": "button", "name": "Refresh"}},')
+
+    def fake_src(script_lines):
+        return "\n".join([
+            "import json",
+            "from http.server import BaseHTTPRequestHandler, HTTPServer",
+            "SCRIPT = [",
+            *script_lines,
+            "]",
+            'state = {"n": 0}',
+            "class H(BaseHTTPRequestHandler):",
+            "    def do_POST(self):",
+            '        ln = int(self.headers.get("Content-Length", 0))',
+            "        self.rfile.read(ln)",
+            '        i = min(state["n"], len(SCRIPT) - 1)',
+            '        state["n"] += 1',
+            "        body = json.dumps({",
+            '            "choices": [{"message": {"role": "assistant",',
+            "                                     \"content\": json.dumps(SCRIPT[i])}}],",
+            '            "usage": {"prompt_tokens": 800, "completion_tokens": 60},',
+            "        }).encode()",
+            "        self.send_response(200)",
+            '        self.send_header("Content-Type", "application/json")',
+            '        self.send_header("Content-Length", str(len(body)))',
+            "        self.end_headers()",
+            "        self.wfile.write(body)",
+            "    def log_message(self, *a):",
+            "        pass",
+            'HTTPServer(("127.0.0.1", 8932), H).serve_forever()',
+        ])
+
+    exhaust_script = [click_step]
+    control_script = [
+        click_step,
+        '    {"action": "done", "summary": "' + done_summary + '"},',
+    ]
+    exhaust_exp = {
+        "status": "incomplete",
+        "summary": "used all 2 actions without finishing",
+        "action_count": 2, "actions_len": 2,
+        "tokens_in": 1600, "tokens_out": 120,
+        "cost_usd_est": 0.0003, "ceiling_hit": False,
+        "rec1": ("clicked", "Refresh"),
+        "rec2": ("clicked", "Refresh"),
+        "ledger_status": "incomplete", "ledger_actions": 2,
+        "ledger_ceiling_reached": False}
+    control_exp = {
+        "status": "completed",
+        "summary": done_summary,
+        "action_count": 2, "actions_len": 2,
+        "tokens_in": 1600, "tokens_out": 120,
+        "cost_usd_est": 0.0003, "ceiling_hit": False,
+        "rec1": ("clicked", "Refresh"),
+        "rec2": "done",
+        "ledger_status": "completed", "ledger_actions": 2,
+        "ledger_ceiling_reached": False}
+
+    def perform_max_actions_mismatch(outcome, exp):
+        for field in ("status", "summary", "action_count",
+                      "actions_len", "tokens_in", "tokens_out",
+                      "cost_usd_est", "ceiling_hit", "rec1", "rec2",
+                      "ledger_status", "ledger_actions",
+                      "ledger_ceiling_reached"):
+            e, a = exp.get(field), outcome.get(field)
+            ok = (all(s in (a or "") for s in e)
+                  if isinstance(e, tuple) else a == e)
+            if not ok: return f"{field}: expected {e!r}, got {a!r}"
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_refresh():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8941/refresh.html", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def no_proc(pattern):
+        return subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True).returncode != 0
+
+    def start_fake(fake_path):
+        proc = subprocess.Popen(
+            [sys.executable, fake_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        ready = False
+        while not ready and time.time() < deadline:
+            ready = not port_free(8932)
+            time.sleep(0 if ready else 0.1)
+        return proc, ready
+
+    def stop_fake(proc):
+        proc.terminate()
+        proc.wait()
+
+    probe = perform_max_actions_mismatch(
+        dict(exhaust_exp, status="completed"), exhaust_exp)
+    check("485 perform max-actions e2e: corrupted status "
+          "caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_max_actions_mismatch(
+        dict(exhaust_exp, summary="wrong summary"), exhaust_exp)
+    check("485 perform max-actions e2e: corrupted summary "
+          "caught, names field",
+          probe is not None and "summary" in probe, probe or "")
+    probe = perform_max_actions_mismatch(
+        dict(exhaust_exp, action_count=99), exhaust_exp)
+    check("485 perform max-actions e2e: corrupted count "
+          "caught, names field",
+          probe is not None and "action_count" in probe,
+          probe or "")
+    check("485 perform max-actions e2e: exact expectations "
+          "return no mismatch",
+          perform_max_actions_mismatch(dict(exhaust_exp),
+                                       exhaust_exp) is None)
+    if not os.path.exists(exe): check("485 perform max-actions e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_NAME", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_UPLOAD_DIR")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    site = None
+    fake = None
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            site_dir = os.path.join(td, "site")
+            os.makedirs(site_dir)
+            with open(os.path.join(site_dir, "refresh.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(refresh_html)
+            fake_path = os.path.join(td, "fake_max_actions_485.py")
+            occupied_8941 = not port_free(8941)
+            occupied_8932 = not port_free(8932)
+            check("485 perform max-actions e2e: port 8941 not "
+                  "already in use", not occupied_8941,
+                  "stale server already on 8941")
+            check("485 perform max-actions e2e: port 8932 not "
+                  "already in use", not occupied_8932,
+                  "stale server already on 8932")
+            check("485 perform max-actions e2e: no stale site "
+                  "server answering", not poll_refresh())
+            check("485 perform max-actions e2e: no stale fake "
+                  "model process", no_proc("fake_max_actions_485"))
+
+            def run_phase(name, extra_args):
+                phase_td = os.path.join(td, name)
+                os.makedirs(phase_td)
+                runs_root = os.path.join(phase_td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    phase_td, "ledger.jsonl")
+                os.environ["QALOOP_MODEL_BASE_URL"] = \
+                    "http://127.0.0.1:8932"
+                os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-485"
+                os.environ["QALOOP_MODEL_NAME"] = "fake-model"
+                os.environ.pop("QALOOP_MODEL_PRICE_IN", None)
+                os.environ.pop("QALOOP_MODEL_PRICE_OUT", None)
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_perform(
+                        cli.build_parser().parse_args(
+                            ["perform", "--task", task,
+                             "--target", target,
+                             "--executable-path", exe] + extra_args))
+                out = buf.getvalue()
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                pdata = {}
+                if len(run_dirs) == 1:
+                    pjson = os.path.join(
+                        runs_root, run_dirs[0], "perform.json")
+                    if os.path.exists(pjson):
+                        with open(pjson, encoding="utf-8") as f:
+                            pdata = json.load(f)
+                rows = ledger.read_all()
+                row = rows[0] if len(rows) == 1 else {}
+                acts = pdata.get("actions") or []
+                outcome = {
+                    "status": pdata.get("status"),
+                    "summary": pdata.get("summary"),
+                    "action_count": pdata.get("action_count"),
+                    "actions_len": len(acts),
+                    "tokens_in": pdata.get("tokens_in"),
+                    "tokens_out": pdata.get("tokens_out"),
+                    "cost_usd_est": pdata.get("cost_usd_est"),
+                    "ceiling_hit": pdata.get("ceiling_hit"),
+                    "rec1": (acts[0].get("result")
+                             if len(acts) > 0 else None),
+                    "rec2": (acts[1].get("result")
+                             if len(acts) > 1 else None),
+                    "ledger_status": row.get("status"),
+                    "ledger_actions": row.get("actions"),
+                    "ledger_ceiling_reached":
+                        row.get("ceiling_reached")}
+                return rc, out, run_dirs, rows, outcome
+
+            if not occupied_8941 and not occupied_8932:
+                site = subprocess.Popen(
+                    [sys.executable, "-m", "http.server", "8941",
+                     "--bind", "127.0.0.1"], cwd=site_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_refresh()
+                    time.sleep(0 if ready else 0.1)
+                check("485 perform max-actions e2e: site server "
+                      "ready on 8941", ready)
+                if ready:
+                    with open(fake_path, "w", encoding="utf-8") as f:
+                        f.write(fake_src(exhaust_script))
+                    fake, fake_ready = start_fake(fake_path)
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, out, run_dirs, rows, outcome = run_phase(
+                        "exhaustion", ["--max-actions", "2"])
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase exits 1", rc == 1, str(rc))
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase stdout pins status incomplete",
+                          "status: incomplete" in out, out)
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase stdout pins exhaustion summary",
+                          "summary: used all 2 actions without "
+                          "finishing" in out, out)
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase adds exactly one run dir",
+                          len(run_dirs) == 1, str(run_dirs))
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase writes exactly one ledger row",
+                          len(rows) == 1, str(rows))
+                    mismatch = perform_max_actions_mismatch(
+                        outcome, exhaust_exp)
+                    check("485 perform max-actions e2e: exhaustion "
+                          "phase pins perform.json and ledger",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("485 perform max-actions e2e: port "
+                          "8932 free after exhaustion fake stops",
+                          port_free(8932))
+                    with open(fake_path, "w", encoding="utf-8") as f:
+                        f.write(fake_src(control_script))
+                    fake, fake_ready = start_fake(fake_path)
+                    check("485 perform max-actions e2e: control "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, out, run_dirs, rows, outcome = run_phase(
+                        "control", ["--max-actions", "10"])
+                    check("485 perform max-actions e2e: control "
+                          "phase exits 0", rc == 0, str(rc))
+                    check("485 perform max-actions e2e: control "
+                          "phase stdout pins status completed",
+                          "status: completed" in out, out)
+                    check("485 perform max-actions e2e: control "
+                          "phase adds exactly one run dir",
+                          len(run_dirs) == 1, str(run_dirs))
+                    check("485 perform max-actions e2e: control "
+                          "phase writes exactly one ledger row",
+                          len(rows) == 1, str(rows))
+                    mismatch = perform_max_actions_mismatch(
+                        outcome, control_exp)
+                    check("485 perform max-actions e2e: control "
+                          "phase pins perform.json and ledger",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("485 perform max-actions e2e: port "
+                          "8932 free after control fake stops",
+                          port_free(8932))
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            site.terminate() if site is not None else None
+            site.wait() if site is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("485 perform max-actions e2e: port 8941 free after "
+          "cleanup", port_free(8941))
+    check("485 perform max-actions e2e: port 8932 free after "
+          "cleanup", port_free(8932))
+    check("485 perform max-actions e2e: no fake model remains "
+          "after cleanup", no_proc("fake_max_actions_485"))
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
