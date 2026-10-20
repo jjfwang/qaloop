@@ -24860,6 +24860,307 @@ def test_issue_465_baselines_target_override_e2e():
           "after cleanup", no_static_server(port),
           f"http.server still on {port}")
 
+
+def test_issue_467_worker_target_override_e2e():
+    """Issue #467: pin the worker verify-flow payload --target
+    override composition end to end with a real executing test.
+    SPEC.md documents enqueue --target as stored in the job
+    payload when given, and the worker running verify-flow jobs
+    with the payload target, but the real worker e2e tests
+    (#395, #403) use the shipped demo-login-a.yaml, whose target
+    is the env interpolation ${TARGET_URL}, and
+    worker._run_one_flow itself sets TARGET_URL from the payload
+    target before loading the spec - so those tests cannot
+    distinguish the payload target passed to run_flow from the
+    env interpolation resolving to the same URL. A flow with a
+    literal declared target is never driven through the queue
+    path, so the chain - build_parser -> cmd_enqueue payload
+    assembly -> queue row -> cmd_worker -> handle_job payload
+    target -> _run_one_flow target kwarg -> browser navigation
+    -> run.json target - could rot unobserved. This test stubs
+    NOTHING in that chain: it copies demo-login-a.yaml plus
+    fragments/login.yaml into a temp flows dir, rewrites the
+    copy's target line to a literal dead target A (a
+    bound-then-closed 127.0.0.1 port), enqueues it with
+    --target dead B (a second distinct dead port), drives the
+    real CLI worker --once, and pins the job failed with
+    run.json recording dead B, never dead A; then enqueues the
+    same copy with --target at a caller-owned static server and
+    pins the second job done with run.json passed at the live
+    override."""
+    import contextlib
+    import io
+    import socket
+    import subprocess
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_target_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = worker_target_mismatch("rc", 0, 0)
+    check("467 worker target-override e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = worker_target_mismatch(
+        "run_target", "http://127.0.0.1:1", "http://127.0.0.1:2")
+    check("467 worker target-override e2e: corrupted run-target "
+          "caught, names field",
+          probe is not None and probe.startswith("run_target:"),
+          probe or "")
+    probe = worker_target_mismatch("job_status", "done", "failed")
+    check("467 worker target-override e2e: corrupted job-status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("467 worker target-override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    dead_a_port = find_free_port()
+    dead_b_port = find_free_port()
+    dead_a = f"http://127.0.0.1:{dead_a_port}"
+    dead_b = f"http://127.0.0.1:{dead_b_port}"
+    live_target = f"http://127.0.0.1:{port}"
+    check("467 worker target-override e2e: dead A, dead B and "
+          "server ports all distinct",
+          len({port, dead_a_port, dead_b_port}) == 3,
+          f"server={port} dead_a={dead_a_port} dead_b={dead_b_port}")
+    check("467 worker target-override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("467 worker target-override e2e: dead A port not "
+          "answering (bound-then-closed)", port_free(dead_a_port),
+          f"dead A port {dead_a_port} already in use")
+    check("467 worker target-override e2e: dead B port not "
+          "answering (bound-then-closed)", port_free(dead_b_port),
+          f"dead B port {dead_b_port} already in use")
+    check("467 worker target-override e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_RUNS",
+                "QALOOP_LEDGER", "QALOOP_EXECUTABLE_PATH",
+                "QALOOP_MODEL_API_KEY")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    ledger_path = os.path.join(td, "ledger.jsonl")
+                    flows_dir = os.path.join(td, "flows")
+                    os.makedirs(os.path.join(flows_dir, "fragments"))
+                    os.environ.pop("TARGET_URL", None)
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ["QALOOP_RUNS"] = runs_root
+                    os.environ["QALOOP_LEDGER"] = ledger_path
+                    os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                    with open(os.path.join(
+                            root, "flows", "demo-login-a.yaml"),
+                            encoding="utf-8") as f:
+                        flow_text = f.read()
+                    check("467 worker target-override e2e: source "
+                          "target line pin present",
+                          "target: ${TARGET_URL}" in flow_text)
+                    flow_text = flow_text.replace(
+                        "target: ${TARGET_URL}",
+                        f"target: {dead_a}", 1)
+                    with open(os.path.join(
+                            flows_dir, "demo-login-a.yaml"),
+                            "w", encoding="utf-8") as f:
+                        f.write(flow_text)
+                    with open(os.path.join(
+                            root, "flows", "fragments",
+                            "login.yaml"), encoding="utf-8") as f:
+                        fragment_text = f.read()
+                    with open(os.path.join(
+                            flows_dir, "fragments", "login.yaml"),
+                            "w", encoding="utf-8") as f:
+                        f.write(fragment_text)
+
+                    def run_dirs():
+                        return (sorted(os.listdir(runs_root))
+                                if os.path.isdir(runs_root) else [])
+
+                    def load_run(run_dir):
+                        data = {}
+                        run_json = (os.path.join(run_dir, "run.json")
+                                    if run_dir else "")
+                        if run_json and os.path.exists(run_json):
+                            with open(run_json, encoding="utf-8") as f:
+                                data = json.load(f)
+                        return data
+
+                    def job_rows():
+                        return sorted(queue.list_jobs(limit=100),
+                                      key=lambda j: j.get("id") or 0)
+
+                    def scripted_statuses():
+                        rows = []
+                        if os.path.exists(ledger_path):
+                            with open(ledger_path,
+                                      encoding="utf-8") as f:
+                                rows = [json.loads(line)
+                                        for line in f if line.strip()]
+                        return [r.get("status") for r in rows
+                                if r.get("kind") == "scripted"]
+
+                    def enqueue(target):
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            rc = cli.cmd_enqueue(
+                                cli.build_parser().parse_args(
+                                    ["enqueue", "--kind", "verify-flow",
+                                     "--flow", "demo-login-a.yaml",
+                                     "--target", target]))
+                        return rc
+
+                    def run_worker_once():
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            return cli.cmd_worker(
+                                cli.build_parser().parse_args(
+                                    ["worker", "--once", "--poll",
+                                     "0.01", "--flows", flows_dir]))
+
+                    def phase_check(label, field, expected, actual):
+                        mismatch = worker_target_mismatch(
+                            field, expected, actual)
+                        check(label, mismatch is None,
+                              mismatch or "")
+
+                    # Phase 1: payload target dead B wins over the
+                    # declared dead A; the run fails at dead B.
+                    rc_e = enqueue(dead_b)
+                    jobs = job_rows()
+                    job = jobs[0] if jobs else {}
+                    payload = job.get("payload") or {}
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "exactly one job queued", "job_count", 1,
+                        len(jobs))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "job pending", "job_status", "pending",
+                        job.get("status"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "payload flow is demo-login-a.yaml",
+                        "payload_flow", "demo-login-a.yaml",
+                        payload.get("flow"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "payload target is dead B", "payload_target",
+                        dead_b, payload.get("target"))
+                    rc_w = run_worker_once()
+                    jobs = job_rows()
+                    job = jobs[0] if jobs else {}
+                    dirs = run_dirs()
+                    run_data = load_run(
+                        os.path.join(runs_root, dirs[0])
+                        if len(dirs) == 1 else "")
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "job terminal failed", "job_status",
+                        "failed", job.get("status"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "exactly one run dir", "run_dir_count", 1,
+                        len(dirs))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "run.json status failed", "run_status",
+                        "failed", run_data.get("status"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "run.json target is dead B (payload wins)",
+                        "run_target", dead_b, run_data.get("target"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 1 "
+                        "run.json target is not the declared dead A",
+                        "run_target_is_declared", False,
+                        run_data.get("target") == dead_a)
+
+                    # Phase 2: payload target is the live server;
+                    # the same declared-dead-A copy passes there.
+                    rc_e = enqueue(live_target)
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "enqueue exits 0", "rc", 0, rc_e)
+                    rc_w = run_worker_once()
+                    jobs = job_rows()
+                    job2 = jobs[1] if len(jobs) == 2 else {}
+                    dirs = run_dirs()
+                    run_data2 = load_run(
+                        os.path.join(runs_root, dirs[1])
+                        if len(dirs) == 2 else "")
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "exactly two jobs queued", "job_count", 2,
+                        len(jobs))
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "second job done", "job_status", "done",
+                        job2.get("status"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "exactly two run dirs", "run_dir_count", 2,
+                        len(dirs))
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "run.json status passed", "run_status",
+                        "passed", run_data2.get("status"))
+                    phase_check(
+                        "467 worker target-override e2e: phase 2 "
+                        "run.json target is the live override",
+                        "run_target", live_target,
+                        run_data2.get("target"))
+                    phase_check(
+                        "467 worker target-override e2e: exactly "
+                        "two scripted ledger rows in order failed "
+                        "then passed", "ledger_statuses",
+                        ["failed", "passed"], scripted_statuses())
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("467 worker target-override e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
