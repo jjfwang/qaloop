@@ -24469,6 +24469,269 @@ def test_issue_473_upload_dir_guard_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_475_baselines_upload_dir_guard_e2e():
+    """Issue #475: pin the baselines --upload-dir guard
+    composition end to end with a real browser. The
+    upload guard itself is unit-pinned, the verify
+    composition is pinned by #473, and the #419 pattern
+    proves parsed.fn works for baselines, but the
+    baselines composition - build_parser ->
+    cmd_baselines -> resolve_upload_dir (flag wins
+    over the QALOOP_UPLOAD_DIR env var) -> the runner
+    guard calling check_upload_path BEFORE
+    locator.set_input_files - could rot unobserved:
+    no e2e test drives baselines with --upload-dir
+    against a live page. This test stubs NOTHING: it
+    serves the repo root on a free port, writes a temp
+    flow whose single upload step (no continue_on_fail)
+    uploads the demo fixture to the upload demo page
+    with an inline #picked expectation, and drives the
+    real CLI baselines command three times in the same
+    runs root with the env var naming a wrong (empty)
+    dir in every phase: the flag naming the same wrong
+    dir is rejected, the flag naming the demo dir wins
+    over the env and passes, and with no flag the env
+    fallback is rejected again. A guard rejection
+    proves no file was set, because the guard raises
+    before set_input_files is reached."""
+    import contextlib
+    import io
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def baselines_upload_dir_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = baselines_upload_dir_mismatch("rc", 1, 1)
+    check("475 baselines upload-dir guard e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = baselines_upload_dir_mismatch("run_status", "passed", "failed")
+    check("475 baselines upload-dir guard e2e: corrupted run-status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = baselines_upload_dir_mismatch(
+        "upload_step_status", "passed", "failed")
+    check("475 baselines upload-dir guard e2e: corrupted step-status "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("upload_step_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("475 baselines upload-dir guard e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    live_target = f"http://127.0.0.1:{port}"
+    check("475 baselines upload-dir guard e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("475 baselines upload-dir guard e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_EXECUTABLE_PATH", "QALOOP_MODEL_API_KEY",
+                "QALOOP_UPLOAD_DIR", "QALOOP_UPLOAD_FILE")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/upload-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.makedirs(runs_root)
+                wrong_dir = os.path.join(td, "wrong")
+                os.makedirs(wrong_dir)
+                demo_dir = os.path.join(root, "demo")
+                fixture = os.path.join(
+                    demo_dir, "upload-fixture.txt")
+                os.environ["TARGET_URL"] = live_target
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                os.environ["QALOOP_UPLOAD_FILE"] = fixture
+                os.environ["QALOOP_UPLOAD_DIR"] = wrong_dir
+                flow_path = os.path.join(
+                    td, "issue-475-upload.yaml")
+                with open(flow_path, "w",
+                          encoding="utf-8") as f:
+                    f.write(
+                        "name: issue-475-upload-guard\n"
+                        f"target: {live_target}\n"
+                        "setup:\n"
+                        "  - name: open the upload demo page\n"
+                        "    goto: /demo/upload-demo.html\n"
+                        "steps:\n"
+                        "  - name: upload a fixture file to "
+                        "the file input\n"
+                        "    upload: {target: \"#resume\", "
+                        "path: \"${QALOOP_UPLOAD_FILE}\"}\n"
+                        "    expect:\n"
+                        "      - text_contains: "
+                        "{selector: \"#picked\", "
+                        "text: \"upload-fixture.txt\"}\n"
+                        "teardown: []\n"
+                        "artifacts: {screenshot: on-failure, "
+                        "ax_snapshot: on-failure, trace: false}\n"
+                        "timeouts: {step_ms: 15000, "
+                        "run_ms: 120000}\n"
+                        "investigate_on_failure: false\n")
+
+                def run_dirs():
+                    return (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+
+                def run_baselines(extra):
+                    argv = ["baselines", flow_path] + extra
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc
+
+                def load_run(run_dir_name):
+                    data = {}
+                    run_json = (
+                        os.path.join(runs_root, run_dir_name,
+                                     "run.json")
+                        if run_dir_name else "")
+                    if run_json and os.path.exists(run_json):
+                        with open(run_json,
+                                  encoding="utf-8") as fh:
+                            data = json.load(fh)
+                    return data
+
+                def phase_check(label, field, expected, actual):
+                    mismatch = baselines_upload_dir_mismatch(
+                        field, expected, actual)
+                    check(label, mismatch is None,
+                          mismatch or "")
+
+                # Phase 1: flag names the wrong (empty) dir,
+                # env names it too - the guard rejects.
+                rc = run_baselines(["--upload-dir", wrong_dir])
+                dirs = run_dirs()
+                run_data = load_run(
+                    dirs[0] if len(dirs) == 1 else "")
+                upload_steps = [
+                    s for s in run_data.get("steps", [])
+                    if s.get("op") == "upload"]
+                upload_step = (
+                    upload_steps[0] if upload_steps else {})
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase exits 1", "rc", 1, rc)
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase leaves exactly one run dir",
+                    "run_dir_count", 1, len(dirs))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase run.json status failed",
+                    "run_status", "failed",
+                    run_data.get("status"))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase has exactly one upload step",
+                    "upload_step_count", 1, len(upload_steps))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase upload step failed",
+                    "upload_step_status", "failed",
+                    upload_step.get("status"))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: rejection "
+                    "phase error names the upload-dir guard",
+                    "upload_guard_error", True,
+                    "outside the upload dir"
+                    in (upload_step.get("error") or ""))
+
+                # Phase 2: flag names the demo dir while the
+                # env still names the wrong dir - flag wins.
+                before = dirs
+                rc = run_baselines(["--upload-dir", demo_dir])
+                dirs = run_dirs()
+                new_dirs = [d for d in dirs if d not in before]
+                run_data = load_run(
+                    new_dirs[0] if len(new_dirs) == 1 else "")
+                phase_check(
+                    "475 baselines upload-dir guard e2e: flag-wins "
+                    "phase exits 0", "rc", 0, rc)
+                phase_check(
+                    "475 baselines upload-dir guard e2e: flag-wins "
+                    "phase leaves exactly two run dirs",
+                    "run_dir_count", 2, len(dirs))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: flag-wins "
+                    "phase adds exactly one new run dir",
+                    "new_run_dir_count", 1, len(new_dirs))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: flag-wins "
+                    "phase run.json status passed",
+                    "run_status", "passed",
+                    run_data.get("status"))
+
+                # Phase 3: no flag - the env fallback names
+                # the wrong dir and the guard rejects again.
+                before = dirs
+                rc = run_baselines([])
+                dirs = run_dirs()
+                new_dirs = [d for d in dirs if d not in before]
+                run_data = load_run(
+                    new_dirs[0] if len(new_dirs) == 1 else "")
+                phase_check(
+                    "475 baselines upload-dir guard e2e: env-fallback "
+                    "phase exits 1", "rc", 1, rc)
+                phase_check(
+                    "475 baselines upload-dir guard e2e: env-fallback "
+                    "phase leaves exactly three run dirs",
+                    "run_dir_count", 3, len(dirs))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: env-fallback "
+                    "phase adds exactly one new run dir",
+                    "new_run_dir_count", 1, len(new_dirs))
+                phase_check(
+                    "475 baselines upload-dir guard e2e: env-fallback "
+                    "phase run.json status failed",
+                    "run_status", "failed",
+                    run_data.get("status"))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("475 baselines upload-dir guard e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 def test_issue_461_batch_target_override_e2e():
     """Issue #461: pin the batch verify --target
     override composition end to end with a real e2e
