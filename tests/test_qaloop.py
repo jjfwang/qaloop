@@ -25423,6 +25423,235 @@ def test_issue_467_worker_target_override_e2e():
     check("467 worker target-override e2e: no http.server remains "
           "after cleanup", no_static_server(port),
           f"http.server still on {port}")
+def test_issue_471_worker_keep_runs_prune_e2e():
+    """Issue #471: pin the worker --keep-runs prune composition
+    end to end with a real executing test. SPEC.md documents
+    run-dir retention (after the report is written, at most the
+    N newest run dirs are kept and the oldest are deleted first;
+    default 0 keeps everything) and the worker --keep-runs flag
+    (the flag wins over QALOOP_KEEP_RUNS), and the chain -
+    build_parser -> cmd_enqueue -> cmd_worker resolving
+    keep_runs -> worker.handle_job -> _run_one_flow ->
+    prune_old_runs(runs_root, keep_runs,
+    current_run_dir=run_dir) - could rot unobserved: the worker
+    discards prune_old_runs' return value and prints no pruned
+    line, so only the directory state after a real worker run
+    pins it. This test stubs NOTHING in that chain: it serves
+    the repo root on a free port, seeds the runs root with two
+    old run dirs, drives the real CLI enqueue plus worker --once
+    with no --keep-runs and pins all three run dirs surviving,
+    then drives a second round with --keep-runs 1 and pins that
+    exactly one dir remains - the phase-2 run dir itself, with
+    run.json passed - while the seeded dirs and the phase-1 dir
+    are gone."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    flows_dir = os.path.join(root, "flows")
+
+    def worker_keep_runs_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = worker_keep_runs_mismatch("survivors", ["a"], ["a"])
+    check("471 worker keep-runs e2e: exact expectations return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = worker_keep_runs_mismatch(
+        "survivors", ["a"], ["a", "b"])
+    check("471 worker keep-runs e2e: corrupted survivor-set "
+          "caught, names field",
+          probe is not None and probe.startswith("survivors:"),
+          probe or "")
+    probe = worker_keep_runs_mismatch("run_status", "passed", "failed")
+    check("471 worker keep-runs e2e: corrupted run-status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = worker_keep_runs_mismatch("job_status", "done", "failed")
+    check("471 worker keep-runs e2e: corrupted job-status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("471 worker keep-runs e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    target = f"http://127.0.0.1:{port}"
+    check("471 worker keep-runs e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("471 worker keep-runs e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_LEDGER",
+                "QALOOP_RUNS", "QALOOP_EXECUTABLE_PATH",
+                "QALOOP_MODEL_API_KEY", "QALOOP_KEEP_RUNS")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(f"{target}/demo/demo-login.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    ledger_path = os.path.join(td, "ledger.jsonl")
+                    os.makedirs(runs_root)
+                    os.environ.pop("TARGET_URL", None)
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ.pop("QALOOP_KEEP_RUNS", None)
+                    os.environ["QALOOP_LEDGER"] = ledger_path
+                    os.environ["QALOOP_RUNS"] = runs_root
+                    os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                    seeded = ["20200101T000000Z-demo-login-a-aaaaaa",
+                              "20200102T000000Z-demo-login-a-bbbbbb"]
+                    for name in seeded:
+                        os.makedirs(os.path.join(
+                            runs_root, name, "steps"))
+
+                    def phase_check(label, field, expected, actual):
+                        mismatch = worker_keep_runs_mismatch(
+                            field, expected, actual)
+                        check(label, mismatch is None,
+                              mismatch or "")
+
+                    def scripted_statuses():
+                        rows = []
+                        if os.path.exists(ledger_path):
+                            with open(ledger_path,
+                                      encoding="utf-8") as f:
+                                rows = [json.loads(line)
+                                        for line in f if line.strip()]
+                        return [r.get("status") for r in rows
+                                if r.get("kind") == "scripted"]
+
+                    def run_round(extra_worker_args):
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            rc_e = cli.cmd_enqueue(
+                                cli.build_parser().parse_args(
+                                    ["enqueue", "--kind",
+                                     "verify-flow", "--flow",
+                                     "demo-login-a.yaml",
+                                     "--target", target]))
+                        jobs = queue.list_jobs(limit=100)
+                        pending = [j for j in jobs
+                                   if j.get("status") == "pending"]
+                        jid = pending[0]["id"] if pending else None
+                        wbuf = io.StringIO()
+                        with contextlib.redirect_stdout(wbuf):
+                            rc_w = cli.cmd_worker(
+                                cli.build_parser().parse_args(
+                                    ["worker", "--once", "--poll",
+                                     "0.01", "--flows", flows_dir]
+                                    + extra_worker_args))
+                        row = _job_row(jid) if jid is not None else {}
+                        return rc_e, rc_w, row, wbuf.getvalue()
+
+                    # Control phase: no --keep-runs, so pruning
+                    # stays disabled and every run dir is kept.
+                    rc_e, rc_w, row1, _wout1 = run_round([])
+                    run1 = row1.get("run_dir") or ""
+                    dirs1 = sorted(os.listdir(runs_root))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "job done", "job_status", "done",
+                        row1.get("status"))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "exactly three run dirs", "run_dir_count",
+                        3, len(dirs1))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "survivors are the seeded two plus the "
+                        "new run", "survivors",
+                        sorted(seeded + [os.path.basename(run1)]),
+                        dirs1)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 1 "
+                        "run dir is a directory", "run_dir_is_dir",
+                        True, os.path.isdir(run1))
+
+                    # Prune phase: --keep-runs 1, so only the
+                    # newest run dir - this phase's own - survives.
+                    rc_e, rc_w, row2, _wout2 = run_round(
+                        ["--keep-runs", "1"])
+                    run2 = row2.get("run_dir") or ""
+                    dirs2 = sorted(os.listdir(runs_root))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "job done", "job_status", "done",
+                        row2.get("status"))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "exactly one run dir remains",
+                        "run_dir_count", 1, len(dirs2))
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "survivor is the phase-2 run dir",
+                        "survivors", [os.path.basename(run2)], dirs2)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "seeded and phase-1 dirs pruned",
+                        "survivors", [],
+                        [d for d in seeded + [os.path.basename(run1)]
+                         if d in dirs2])
+                    with open(os.path.join(run2, "run.json"),
+                              encoding="utf-8") as f:
+                        run_data2 = json.load(f)
+                    phase_check(
+                        "471 worker keep-runs e2e: phase 2 "
+                        "surviving run.json status passed",
+                        "run_status", "passed",
+                        run_data2.get("status"))
+                    phase_check(
+                        "471 worker keep-runs e2e: exactly two "
+                        "scripted ledger rows passed then passed",
+                        "ledger_statuses", ["passed", "passed"],
+                        scripted_statuses())
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("471 worker keep-runs e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
