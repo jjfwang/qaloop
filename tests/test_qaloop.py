@@ -26802,6 +26802,288 @@ def test_issue_479_perform_upload_dir_guard_e2e():
           "after cleanup", no_proc("demo/fake_model_upload.py"))
 
 
+
+def test_issue_481_perform_max_cost_usd_e2e():
+    """Issue #481: pin the CLI perform --max-cost-usd
+    cost-ceiling composition end to end. test_perform_cost_ceiling
+    unit-tests Performer._ceiling_hit and parser parsing only,
+    issue #367 drives perform() directly with stubbed model and
+    browser seams, the issue-308 plumbing contract stubs
+    perform() outright, and the real CLI perform tests (#407,
+    #479) never pass --max-cost-usd, so the chain -
+    build_parser -> cmd_perform -> perform(max_cost_usd=...)
+    -> Performer ceiling enforcement over a real browser run
+    -> perform.json / PERFORM.md / ledger - could rot
+    unobserved. This test stubs NOTHING in that chain: it
+    boots the proof server once and a fresh fake_model per
+    phase (its script state is module-global), and drives
+    the real CLI perform of the signup task twice. The fake
+    model usage is 800 prompt / 60 completion tokens per
+    call, $0.000156 per call at the default prices, and
+    perform.json cost_usd_est is rounded to 4 decimals:
+    --max-cost-usd 0.0002 stops blocked after exactly one
+    action, and --max-cost-usd 1 completes all six."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    task = "Sign up as Maya using the greeting signup form"
+    target = "http://127.0.0.1:8933/demo/mock-demo.html"
+    ceiling_exp = {
+        "status": "blocked",
+        "summary": "cost ceiling reached (max-cost-usd 0.0002)",
+        "action_count": 1, "actions_len": 1,
+        "tokens_in": 800, "tokens_out": 60,
+        "cost_usd_est": 0.0002, "max_cost_usd": 0.0002,
+        "ceiling_hit": True,
+        "ledger_status": "blocked", "ledger_ceiling_reached": True,
+        "ledger_max_cost_usd": 0.0002}
+    control_exp = {
+        "status": "completed",
+        "summary": ("Loaded the mocked greeting, filled the signup "
+                    "form as Maya (maya@example.com), submitted, "
+                    "and confirmed 'Welcome, Maya!' is visible."),
+        "action_count": 6, "actions_len": 6,
+        "tokens_in": 4800, "tokens_out": 360,
+        "cost_usd_est": 0.0009, "max_cost_usd": 1.0,
+        "ceiling_hit": False,
+        "ledger_status": "completed", "ledger_ceiling_reached": False,
+        "ledger_max_cost_usd": 1.0}
+
+    def perform_ceiling_mismatch(outcome, exp):
+        for field in ("status", "summary", "action_count",
+                      "actions_len", "tokens_in", "tokens_out",
+                      "cost_usd_est", "max_cost_usd", "ceiling_hit",
+                      "ledger_status", "ledger_ceiling_reached",
+                      "ledger_max_cost_usd"):
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_greeting():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8933/api/greeting", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def no_proc(pattern):
+        return subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True).returncode != 0
+
+    def start_fake():
+        proc = subprocess.Popen(
+            [sys.executable, "demo/fake_model.py"], cwd=root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        ready = False
+        while not ready and time.time() < deadline:
+            ready = not port_free(8932)
+            time.sleep(0 if ready else 0.1)
+        return proc, ready
+
+    def stop_fake(proc):
+        proc.terminate()
+        proc.wait()
+
+    probe = perform_ceiling_mismatch(
+        dict(ceiling_exp, status="completed"), ceiling_exp)
+    check("481 perform max-cost e2e: corrupted status caught, "
+          "names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_ceiling_mismatch(
+        dict(ceiling_exp, summary="wrong summary"), ceiling_exp)
+    check("481 perform max-cost e2e: corrupted summary caught, "
+          "names field",
+          probe is not None and "summary" in probe, probe or "")
+    probe = perform_ceiling_mismatch(
+        dict(ceiling_exp, ledger_ceiling_reached=False), ceiling_exp)
+    check("481 perform max-cost e2e: corrupted ceiling_reached "
+          "caught, names field",
+          probe is not None and "ledger_ceiling_reached" in probe,
+          probe or "")
+    check("481 perform max-cost e2e: exact expectations return "
+          "no mismatch",
+          perform_ceiling_mismatch(dict(ceiling_exp),
+                                   ceiling_exp) is None)
+    if not os.path.exists(exe): check("481 perform max-cost e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_NAME", "QALOOP_MODEL_PRICE_IN",
+                "QALOOP_MODEL_PRICE_OUT", "QALOOP_RUNS",
+                "QALOOP_LEDGER", "QALOOP_UPLOAD_DIR")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    proof = None
+    fake = None
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            occupied_8933 = not port_free(8933)
+            occupied_8932 = not port_free(8932)
+            check("481 perform max-cost e2e: port 8933 not "
+                  "already in use", not occupied_8933,
+                  "stale server already on 8933")
+            check("481 perform max-cost e2e: port 8932 not "
+                  "already in use", not occupied_8932,
+                  "stale server already on 8932")
+            check("481 perform max-cost e2e: no stale proof "
+                  "server answering", not poll_greeting())
+            check("481 perform max-cost e2e: no stale proof "
+                  "server process", no_proc("demo/proof_server.py"))
+            check("481 perform max-cost e2e: no stale fake "
+                  "model process", no_proc("demo/fake_model.py"))
+
+            def run_phase(name, ceiling, exp, exp_rc):
+                phase_td = os.path.join(td, name)
+                os.makedirs(phase_td)
+                runs_root = os.path.join(phase_td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    phase_td, "ledger.jsonl")
+                os.environ["QALOOP_MODEL_BASE_URL"] = \
+                    "http://127.0.0.1:8932"
+                os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-481"
+                os.environ["QALOOP_MODEL_NAME"] = "fake-model"
+                os.environ.pop("QALOOP_MODEL_PRICE_IN", None)
+                os.environ.pop("QALOOP_MODEL_PRICE_OUT", None)
+                os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_perform(
+                        cli.build_parser().parse_args(
+                            ["perform", "--task", task,
+                             "--target", target,
+                             "--max-actions", "10",
+                             "--max-cost-usd", ceiling,
+                             "--executable-path", exe]))
+                out = buf.getvalue()
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                pdata = {}
+                if len(run_dirs) == 1:
+                    pjson = os.path.join(
+                        runs_root, run_dirs[0], "perform.json")
+                    if os.path.exists(pjson):
+                        with open(pjson, encoding="utf-8") as f:
+                            pdata = json.load(f)
+                rows = ledger.read_all()
+                row = rows[0] if len(rows) == 1 else {}
+                outcome = {
+                    "status": pdata.get("status"),
+                    "summary": pdata.get("summary"),
+                    "action_count": pdata.get("action_count"),
+                    "actions_len": len(pdata.get("actions") or []),
+                    "tokens_in": pdata.get("tokens_in"),
+                    "tokens_out": pdata.get("tokens_out"),
+                    "cost_usd_est": pdata.get("cost_usd_est"),
+                    "max_cost_usd": pdata.get("max_cost_usd"),
+                    "ceiling_hit": pdata.get("ceiling_hit"),
+                    "ledger_status": row.get("status"),
+                    "ledger_ceiling_reached":
+                        row.get("ceiling_reached"),
+                    "ledger_max_cost_usd": row.get("max_cost_usd")}
+                return rc, out, run_dirs, rows, outcome
+
+            if not occupied_8933 and not occupied_8932:
+                proof = subprocess.Popen(
+                    [sys.executable, "demo/proof_server.py"], cwd=root,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_greeting()
+                    time.sleep(0 if ready else 0.1)
+                check("481 perform max-cost e2e: proof server "
+                      "ready on 8933", ready)
+                if ready:
+                    fake, fake_ready = start_fake()
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, out, run_dirs, rows, outcome = run_phase(
+                        "ceiling", "0.0002", ceiling_exp, 1)
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase exits 1", rc == 1, str(rc))
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase stdout pins status blocked",
+                          "status: blocked" in out, out)
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase stdout pins ceiling summary",
+                          "summary: cost ceiling reached "
+                          "(max-cost-usd 0.0002)" in out, out)
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase stdout pins cost ceiling line",
+                          "cost ceiling: $0.0002" in out, out)
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase adds exactly one run dir",
+                          len(run_dirs) == 1, str(run_dirs))
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase writes exactly one ledger row",
+                          len(rows) == 1, str(rows))
+                    mismatch = perform_ceiling_mismatch(
+                        outcome, ceiling_exp)
+                    check("481 perform max-cost e2e: ceiling "
+                          "phase pins perform.json and ledger",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("481 perform max-cost e2e: port "
+                          "8932 free after ceiling fake stops",
+                          port_free(8932))
+                    fake, fake_ready = start_fake()
+                    check("481 perform max-cost e2e: control "
+                          "phase fake model ready on 8932", fake_ready)
+                    rc, out, run_dirs, rows, outcome = run_phase(
+                        "control", "1", control_exp, 0)
+                    check("481 perform max-cost e2e: control "
+                          "phase exits 0", rc == 0, str(rc))
+                    check("481 perform max-cost e2e: control "
+                          "phase stdout pins status completed",
+                          "status: completed" in out, out)
+                    check("481 perform max-cost e2e: control "
+                          "phase adds exactly one run dir",
+                          len(run_dirs) == 1, str(run_dirs))
+                    check("481 perform max-cost e2e: control "
+                          "phase writes exactly one ledger row",
+                          len(rows) == 1, str(rows))
+                    mismatch = perform_ceiling_mismatch(
+                        outcome, control_exp)
+                    check("481 perform max-cost e2e: control "
+                          "phase pins perform.json and ledger",
+                          mismatch is None, mismatch or "")
+                    stop_fake(fake)
+                    fake = None
+                    check("481 perform max-cost e2e: port "
+                          "8932 free after control fake stops",
+                          port_free(8932))
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            proof.terminate() if proof is not None else None
+            proof.wait() if proof is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("481 perform max-cost e2e: port 8933 free after "
+          "cleanup", port_free(8933))
+    check("481 perform max-cost e2e: port 8932 free after "
+          "cleanup", port_free(8932))
+    check("481 perform max-cost e2e: no proof server remains "
+          "after cleanup", no_proc("demo/proof_server.py"))
+    check("481 perform max-cost e2e: no fake model remains "
+          "after cleanup", no_proc("demo/fake_model.py"))
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
