@@ -128,7 +128,8 @@ def _notify_failure(job_id: int, kind: str, run_dir: str, summary: str) -> None:
 
 def _run_one_flow(flow_path: str, target: str, runs_root: str,
                   headless: bool, executable_path: str | None,
-                  do_investigate: bool, keep_runs: int = 0) -> tuple[str, str]:
+                  do_investigate: bool, keep_runs: int = 0,
+                  upload_dir: str | None = None) -> tuple[str, str]:
     """Run a single flow. Returns (status, run_dir)."""
     with _TARGET_URL_LOCK:
         # must precede load_spec: specs use ${TARGET_URL}; the lock keeps a
@@ -136,8 +137,11 @@ def _run_one_flow(flow_path: str, target: str, runs_root: str,
         os.environ["TARGET_URL"] = target
         spec = load_spec(flow_path)
     run_dir = new_run_dir(runs_root, spec.name)
+    # Pass upload_dir only when declared: run_flow defaults it to None
+    # (fail-closed), and existing run_flow stubs keep their signature.
+    flow_kwargs = {"upload_dir": upload_dir} if upload_dir is not None else {}
     result = run_flow(spec, run_dir=run_dir, target=target, headless=headless,
-                      executable_path=executable_path)
+                      executable_path=executable_path, **flow_kwargs)
     diagnosis = None
     if result.status != "passed" and do_investigate and spec.investigate_on_failure:
         from .investigate import investigate as run_investigation
@@ -176,13 +180,16 @@ def _resolve_job_timeout(payload: dict, job_timeout_s: float) -> float:
 
 def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
                      executable_path: str | None, repos_config: dict,
-                     keep_runs: int = 0) -> None:
+                     keep_runs: int = 0,
+                     upload_dir: str | None = None) -> None:
     payload = job["payload"]
     if isinstance(payload, str):
         import json as _json
         payload = _json.loads(payload)
     kind = job["kind"]
     do_investigate = bool(payload.get("investigate", True))
+    # Pass upload_dir only when declared (see _run_one_flow).
+    flow_kwargs = {"upload_dir": upload_dir} if upload_dir is not None else {}
     targets: list[ProcTarget] = []
     try:
         if kind == "verify-flow":
@@ -192,7 +199,7 @@ def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: boo
             target = payload["target"]
             status, run_dir = _run_one_flow(flow, target, runs_root, headless,
                                             executable_path, do_investigate,
-                                            keep_runs)
+                                            keep_runs, **flow_kwargs)
         elif kind == "verify-repo":
             repo = payload["repo"]
             preset = (repos_config.get("repos") or {}).get(repo)
@@ -215,7 +222,7 @@ def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: boo
                     target = payload.get("target") or primary_url
                     status, last_dir = _run_one_flow(flow, target, runs_root, headless,
                                                     executable_path, do_investigate,
-                                                    keep_runs)
+                                                    keep_runs, **flow_kwargs)
                 finally:
                     _stop_targets(flow_targets)
                     targets = [t for t in targets if t not in flow_targets]
@@ -249,7 +256,8 @@ def _handle_job_body(job: dict, *, flows_dir: str, runs_root: str, headless: boo
 def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
                executable_path: str | None, repos_config: dict,
                keep_runs: int = 0,
-               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S) -> None:
+               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+               upload_dir: str | None = None) -> None:
     """Handle one job with a timeout (issue #94): the job body runs in a
     daemon thread and is joined for timeout_s. On expiry the job is recorded
     failed via q.record_failure (so the retry budget applies exactly like any
@@ -269,7 +277,8 @@ def handle_job(job: dict, *, flows_dir: str, runs_root: str, headless: bool,
         target=_handle_job_body,
         kwargs=dict(job=job, flows_dir=flows_dir, runs_root=runs_root,
                     headless=headless, executable_path=executable_path,
-                    repos_config=repos_config, keep_runs=keep_runs),
+                    repos_config=repos_config, keep_runs=keep_runs,
+                    upload_dir=upload_dir),
         daemon=True)
     body.start()
     body.join(timeout_s)
@@ -292,7 +301,8 @@ def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
                executable_path: str | None = None,
                repos_config_path: str | None = None, keep_runs: int = 0,
                concurrency: int = 1,
-               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S) -> None:
+               job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+               upload_dir: str | None = None) -> None:
     """Claim jobs and handle them, one at a time (concurrency=1) or in
     parallel via a thread pool. Each job gets its own browser: handle_job ->
     run_flow launches and closes one per invocation (Playwright sync objects
@@ -312,7 +322,7 @@ def run_worker(*, flows_dir: str, runs_root: str, once: bool = False,
     handle_kwargs = dict(flows_dir=flows_dir, runs_root=runs_root,
                          headless=headless, executable_path=executable_path,
                          repos_config=repos_config, keep_runs=keep_runs,
-                         job_timeout_s=job_timeout_s)
+                         job_timeout_s=job_timeout_s, upload_dir=upload_dir)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         pending: set = set()
         while True:

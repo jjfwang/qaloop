@@ -26178,6 +26178,338 @@ def test_issue_471_worker_keep_runs_prune_e2e():
           "after cleanup", no_static_server(port),
           f"http.server still on {port}")
 
+
+def test_issue_477_worker_upload_dir_e2e():
+    """Issue #477: pin the worker upload-dir composition
+    end to end with a real browser. Verify and baselines
+    resolve --upload-dir / QALOOP_UPLOAD_DIR through
+    resolve_upload_dir and pass it to the runner guard,
+    but the worker path never resolved it at all: queued
+    flows with upload steps always failed closed. This
+    test stubs NOTHING in the chain - build_parser ->
+    cmd_enqueue -> cmd_worker resolving upload_dir ->
+    run_worker -> handle_job -> _handle_job_body ->
+    _run_one_flow -> run_flow(upload_dir=...) -> the
+    shared guard qaloop.upload.check_upload_path BEFORE
+    locator.set_input_files. It serves the repo root on
+    a free port, writes a temp flow whose single upload
+    step (no continue_on_fail) uploads the demo fixture
+    to the upload demo page with an inline #picked
+    expectation, and drives the real CLI enqueue plus
+    worker --once four times: env-declared passes,
+    flag-wins over a wrong env passes, flag naming the
+    wrong dir is rejected, and undeclared fails closed."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_upload_dir_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = worker_upload_dir_mismatch("rc", 0, 0)
+    check("477 worker upload-dir e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = worker_upload_dir_mismatch("job_status", "done", "failed")
+    check("477 worker upload-dir e2e: corrupted job-status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    probe = worker_upload_dir_mismatch("run_status", "passed", "failed")
+    check("477 worker upload-dir e2e: corrupted run-status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = worker_upload_dir_mismatch(
+        "upload_step_status", "passed", "failed")
+    check("477 worker upload-dir e2e: corrupted step-status "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("upload_step_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("477 worker upload-dir e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    live_target = f"http://127.0.0.1:{port}"
+    check("477 worker upload-dir e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("477 worker upload-dir e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_DB", "QALOOP_RUNS",
+                "QALOOP_LEDGER", "QALOOP_EXECUTABLE_PATH",
+                "QALOOP_MODEL_API_KEY", "QALOOP_UPLOAD_DIR",
+                "QALOOP_UPLOAD_FILE")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/upload-demo.html")
+            with temp_db():
+                with tempfile.TemporaryDirectory() as td:
+                    runs_root = os.path.join(td, "runs")
+                    os.makedirs(runs_root)
+                    flows_dir = os.path.join(td, "flows")
+                    os.makedirs(flows_dir)
+                    wrong_dir = os.path.join(td, "wrong")
+                    os.makedirs(wrong_dir)
+                    demo_dir = os.path.join(root, "demo")
+                    fixture = os.path.join(
+                        demo_dir, "upload-fixture.txt")
+                    os.environ["TARGET_URL"] = live_target
+                    os.environ["QALOOP_RUNS"] = runs_root
+                    os.environ["QALOOP_LEDGER"] = os.path.join(
+                        td, "ledger.jsonl")
+                    os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                    os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                    os.environ["QALOOP_UPLOAD_FILE"] = fixture
+                    flow_name = "issue-477-upload.yaml"
+                    with open(os.path.join(flows_dir, flow_name),
+                              "w", encoding="utf-8") as f:
+                        f.write(
+                            "name: issue-477-upload-guard\n"
+                            f"target: {live_target}\n"
+                            "setup:\n"
+                            "  - name: open the upload demo page\n"
+                            "    goto: /demo/upload-demo.html\n"
+                            "steps:\n"
+                            "  - name: upload a fixture file to "
+                            "the file input\n"
+                            "    upload: {target: \"#resume\", "
+                            "path: \"${QALOOP_UPLOAD_FILE}\"}\n"
+                            "    expect:\n"
+                            "      - text_contains: "
+                            "{selector: \"#picked\", "
+                            "text: \"upload-fixture.txt\"}\n"
+                            "teardown: []\n"
+                            "artifacts: {screenshot: on-failure, "
+                            "ax_snapshot: on-failure, trace: false}\n"
+                            "timeouts: {step_ms: 15000, "
+                            "run_ms: 120000}\n"
+                            "investigate_on_failure: false\n")
+
+                    def phase_check(label, field, expected, actual):
+                        mismatch = worker_upload_dir_mismatch(
+                            field, expected, actual)
+                        check(label, mismatch is None,
+                              mismatch or "")
+
+                    def run_dirs():
+                        return (sorted(os.listdir(runs_root))
+                                if os.path.isdir(runs_root) else [])
+
+                    def run_round(worker_extra):
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            rc_e = cli.cmd_enqueue(
+                                cli.build_parser().parse_args(
+                                    ["enqueue", "--kind",
+                                     "verify-flow", "--flow",
+                                     flow_name, "--target",
+                                     live_target]))
+                        jobs = queue.list_jobs()
+                        jid = jobs[0]["id"] if jobs else None
+                        wbuf = io.StringIO()
+                        with contextlib.redirect_stdout(wbuf):
+                            rc_w = cli.cmd_worker(
+                                cli.build_parser().parse_args(
+                                    ["worker", "--once", "--poll",
+                                     "0.01", "--flows", flows_dir,
+                                     "--executable-path", exe]
+                                    + worker_extra))
+                        row = (_job_row(jid)
+                               if jid is not None else {})
+                        return rc_e, rc_w, row
+
+                    def latest_run(before):
+                        new_dirs = [d for d in run_dirs()
+                                    if d not in before]
+                        data = {}
+                        if len(new_dirs) == 1:
+                            run_json = os.path.join(
+                                runs_root, new_dirs[0], "run.json")
+                            if os.path.exists(run_json):
+                                with open(run_json,
+                                          encoding="utf-8") as fh:
+                                    data = json.load(fh)
+                        return new_dirs, data
+
+                    def upload_step_of(run_data):
+                        steps = [s for s in run_data.get("steps", [])
+                                 if s.get("op") == "upload"]
+                        return steps, (steps[0] if steps else {})
+
+                    # Phase 1: QALOOP_UPLOAD_DIR names the demo
+                    # dir, no flag - the env declaration passes.
+                    os.environ["QALOOP_UPLOAD_DIR"] = demo_dir
+                    before = run_dirs()
+                    rc_e, rc_w, row = run_round([])
+                    new_dirs, run_data = latest_run(before)
+                    phase_check(
+                        "477 worker upload-dir e2e: env-declared "
+                        "phase enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "477 worker upload-dir e2e: env-declared "
+                        "phase worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "477 worker upload-dir e2e: env-declared "
+                        "phase job done", "job_status", "done",
+                        row.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: env-declared "
+                        "phase adds exactly one run dir",
+                        "new_run_dir_count", 1, len(new_dirs))
+                    phase_check(
+                        "477 worker upload-dir e2e: env-declared "
+                        "phase run.json status passed",
+                        "run_status", "passed",
+                        run_data.get("status"))
+
+                    # Phase 2: env names the wrong (empty) dir,
+                    # the flag names the demo dir - flag wins.
+                    os.environ["QALOOP_UPLOAD_DIR"] = wrong_dir
+                    before = run_dirs()
+                    rc_e, rc_w, row = run_round(
+                        ["--upload-dir", demo_dir])
+                    new_dirs, run_data = latest_run(before)
+                    phase_check(
+                        "477 worker upload-dir e2e: flag-wins "
+                        "phase enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "477 worker upload-dir e2e: flag-wins "
+                        "phase worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "477 worker upload-dir e2e: flag-wins "
+                        "phase job done", "job_status", "done",
+                        row.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: flag-wins "
+                        "phase adds exactly one run dir",
+                        "new_run_dir_count", 1, len(new_dirs))
+                    phase_check(
+                        "477 worker upload-dir e2e: flag-wins "
+                        "phase run.json status passed",
+                        "run_status", "passed",
+                        run_data.get("status"))
+
+                    # Phase 3: env still names the wrong dir and
+                    # the flag names it too - the guard rejects.
+                    before = run_dirs()
+                    rc_e, rc_w, row = run_round(
+                        ["--upload-dir", wrong_dir])
+                    new_dirs, run_data = latest_run(before)
+                    steps, step = upload_step_of(run_data)
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase job failed", "job_status", "failed",
+                        row.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase adds exactly one run dir",
+                        "new_run_dir_count", 1, len(new_dirs))
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase run.json status failed",
+                        "run_status", "failed",
+                        run_data.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase has exactly one upload step",
+                        "upload_step_count", 1, len(steps))
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase upload step failed",
+                        "upload_step_status", "failed",
+                        step.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: rejection "
+                        "phase error names the upload-dir guard",
+                        "upload_guard_error", True,
+                        "outside the upload dir"
+                        in (step.get("error") or ""))
+
+                    # Phase 4: no env, no flag - fail-closed.
+                    os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                    before = run_dirs()
+                    rc_e, rc_w, row = run_round([])
+                    new_dirs, run_data = latest_run(before)
+                    steps, step = upload_step_of(run_data)
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase enqueue exits 0", "rc", 0, rc_e)
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase worker exits 0", "rc", 0, rc_w)
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase job failed", "job_status", "failed",
+                        row.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase adds exactly one run dir",
+                        "new_run_dir_count", 1, len(new_dirs))
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase run.json status failed",
+                        "run_status", "failed",
+                        run_data.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase has exactly one upload step",
+                        "upload_step_count", 1, len(steps))
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase upload step failed",
+                        "upload_step_status", "failed",
+                        step.get("status"))
+                    phase_check(
+                        "477 worker upload-dir e2e: undeclared "
+                        "phase error names the missing declaration",
+                        "upload_guard_error", True,
+                        "upload needs a declared upload dir"
+                        in (step.get("error") or ""))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("477 worker upload-dir e2e: no http.server remains "
+          "after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

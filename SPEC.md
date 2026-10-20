@@ -975,6 +975,11 @@ Its flags:
   N newest run directories are kept, oldest deleted first (see
   Retention above). The default 0 keeps everything; negative values
   (and non-integer env values) are rejected with an error (exit 2).
+- `--upload-dir <dir>` (env `QALOOP_UPLOAD_DIR`): the allowlist file
+  uploads are restricted to. The flag wins when both are set; when
+  neither is declared, the runner is fail-closed (issue #76) — the same
+  shared guard (`qaloop.upload.check_upload_path`) referenced under
+  Perform's Upload-dir restriction.
 
 ### Failure notifications
 
