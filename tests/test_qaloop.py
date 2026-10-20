@@ -29007,6 +29007,280 @@ def test_issue_495_enqueue_max_retries_retry_recovery_e2e():
     check("495 enqueue retry e2e: flaky port free after "
           "cleanup", port_free(port))
 
+def test_issue_497_investigate_max_actions_e2e():
+    """Issue #497: pin the standalone investigate
+    --max-actions agent-mode composition end to end.
+    SPEC.md (qaloop investigate) documents --max-actions N
+    (default 20) as the investigator hard browser-action
+    budget: with model credentials configured the command
+    runs in agent mode against an existing run directory,
+    writes the transcript to INVESTIGATION.md in the run
+    dir, and prints the diagnosis as JSON (exit 0); when
+    the budget is exhausted without a conclusion the
+    diagnosis is the exhausted-budget text with
+    likely_cause unknown. The investigator loop runs
+    max_actions + 2 model turns when the model never calls
+    done (the opening snapshot consumes one action, then
+    budget-exhausted prompts fill the remaining turns), so
+    a scripted model that always replies ax_snapshot at
+    800/60 tokens per turn pins the composed cap exactly:
+    --max-actions 2 must ledger 4 turns (3200/240,
+    actions_taken 2, cost 0.0006), and no flag must fall
+    back to the default 20 and ledger 22 turns
+    (17600/1320, actions_taken 20). This test stubs
+    NOTHING: it first drives the real build_parser ->
+    cmd_verify of a temp failing flow (no model key) to
+    produce a genuine failed run dir, boots a temp
+    scripted fake model that never calls done, then
+    drives the real build_parser -> cmd_investigate twice
+    against that same run dir."""
+    import glob
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def diag_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    def no_fake_model():
+        return subprocess.run(
+            ["pgrep", "-f", "fake_inv_497"],
+            capture_output=True).returncode != 0
+
+    def start_fake(fake_path, port):
+        proc = subprocess.Popen(
+            [sys.executable, fake_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        ready = False
+        while not ready and time.time() < deadline:
+            ready = not port_free(port)
+            time.sleep(0 if ready else 0.1)
+        return proc, ready
+
+    exp_a = {"exit_code": 0, "mode": "agent",
+             "diagnosis": "Investigator exhausted its budget "
+             "without a conclusion.",
+             "likely_cause": "unknown", "tokens_in": 3200,
+             "tokens_out": 240, "actions_taken": 2,
+             "cost_usd_est": 0.0006, "turn_count": 4,
+             "loop_ended": True, "run_dir_count": 1}
+    exp_b = {"exit_code": 0, "mode": "agent",
+             "diagnosis": "Investigator exhausted its budget "
+             "without a conclusion.",
+             "likely_cause": "unknown", "tokens_in": 17600,
+             "tokens_out": 1320, "actions_taken": 20,
+             "cost_usd_est": 0.0034, "turn_count": 22,
+             "loop_ended": True, "run_dir_count": 1}
+    check("497 investigate cap e2e: exact expectations "
+          "return no mismatch",
+          diag_mismatch(dict(exp_a), exp_a) is None)
+    probe = diag_mismatch(dict(exp_a, tokens_in=999), exp_a)
+    check("497 investigate cap e2e: corrupted tokens_in "
+          "caught, names field",
+          probe is not None and probe.startswith("tokens_in:"),
+          probe or "")
+    probe = diag_mismatch(dict(exp_a, actions_taken=99),
+                          exp_a)
+    check("497 investigate cap e2e: corrupted actions_taken "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("actions_taken:"),
+          probe or "")
+    probe = diag_mismatch(dict(exp_a, diagnosis="wrong"),
+                          exp_a)
+    check("497 investigate cap e2e: corrupted diagnosis "
+          "caught, names field",
+          probe is not None and probe.startswith("diagnosis:"),
+          probe or "")
+    if not os.path.exists(exe): check("497 investigate cap e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    fake_port = find_free_port()
+    target = f"http://127.0.0.1:{port}/"
+    check("497 investigate cap e2e: static port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    check("497 investigate cap e2e: no http.server for the "
+          "port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    check("497 investigate cap e2e: fake model port not "
+          "already answering", port_free(fake_port),
+          f"port {fake_port} already in use")
+    check("497 investigate cap e2e: no stale fake model "
+          "process", no_fake_model(),
+          "stale fake_inv_497 process")
+    fake_src = "\n".join([
+        "import json",
+        "from http.server import BaseHTTPRequestHandler, HTTPServer",
+        "class H(BaseHTTPRequestHandler):",
+        "    def do_POST(self):",
+        '        ln = int(self.headers.get("Content-Length", 0))',
+        "        self.rfile.read(ln)",
+        '        content = json.dumps({"tool": "ax_snapshot",',
+        '                                "args": {},',
+        '                                "thought": "look again"})',
+        "        body = json.dumps({",
+        '            "choices": [{"message": {"role": "assistant",',
+        '                                     "content": content}}],',
+        '            "usage": {"prompt_tokens": 800,',
+        '                      "completion_tokens": 60}}).encode()',
+        "        self.send_response(200)",
+        '        self.send_header("Content-Type", "application/json")',
+        '        self.send_header("Content-Length", str(len(body)))',
+        "        self.end_headers()",
+        "        self.wfile.write(body)",
+        "    def log_message(self, *a):",
+        "        pass",
+        f'HTTPServer(("127.0.0.1", {fake_port}), H).serve_forever()',
+    ])
+    saved = dict(os.environ)
+    srv = None
+    fake = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            www = os.path.join(td, "www")
+            os.makedirs(www)
+            with open(os.path.join(www, "page.html"), "w") as f:
+                f.write("<html><body><h1>Cap page</h1>"
+                        "</body></html>")
+            fake_path = os.path.join(td, "fake_inv_497.py")
+            with open(fake_path, "w") as f:
+                f.write(fake_src)
+            flow_path = os.path.join(td, "fail-497.yaml")
+            with open(flow_path, "w") as f:
+                f.write(
+                    "version: 1\n"
+                    "name: investigate-cap-497\n"
+                    f"target: {target}\n"
+                    "steps:\n"
+                    "  - name: open\n"
+                    "    goto: /page.html\n"
+                    "    expect:\n"
+                    "      text_contains: {selector: \"h1\", "
+                    "text: \"Nope not there\"}\n")
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            ledger_file = os.path.join(td, "ledger.jsonl")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = ledger_file
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            srv = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port),
+                 "--bind", "127.0.0.1"],
+                cwd=www, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            wait_for_http(f"{target}page.html")
+            fake, fake_ready = start_fake(fake_path, fake_port)
+            check("497 investigate cap e2e: fake model ready",
+                  fake_ready, f"no fake model on {fake_port}")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_v = cli.cmd_verify(
+                    cli.build_parser().parse_args(
+                        ["verify", flow_path,
+                         "--executable-path", exe]))
+            check("497 investigate cap e2e: phase 0 verify "
+                  "exit 1", rc_v == 1, str(rc_v))
+            run_dirs = glob.glob(os.path.join(runs_root, "*"))
+            check("497 investigate cap e2e: phase 0 exactly "
+                  "one run dir", len(run_dirs) == 1,
+                  str(run_dirs))
+            run_dir = run_dirs[0]
+            with open(os.path.join(run_dir, "run.json"),
+                      encoding="utf-8") as f:
+                run_data = json.load(f)
+            check("497 investigate cap e2e: phase 0 run.json "
+                  "status failed",
+                  run_data.get("status") == "failed",
+                  str(run_data.get("status")))
+            os.environ["QALOOP_MODEL_API_KEY"] = "sk-fake-497"
+            os.environ["QALOOP_MODEL_BASE_URL"] = \
+                f"http://127.0.0.1:{fake_port}"
+            os.environ["QALOOP_MODEL_NAME"] = "fake-inv-497"
+
+            def run_inv(extra):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_investigate(
+                        cli.build_parser().parse_args(
+                            ["investigate", "--run", run_dir,
+                             "--flow", flow_path] + extra))
+                out = buf.getvalue()
+                diag = json.loads(out[out.index("{"):])
+                inv_path = os.path.join(run_dir,
+                                        "INVESTIGATION.md")
+                inv_md = (open(inv_path, encoding="utf-8").read()
+                          if os.path.exists(inv_path) else "")
+                run_count = len(glob.glob(
+                    os.path.join(runs_root, "*")))
+                return rc, diag, inv_md, run_count
+
+            phases = [("A", ["--max-actions", "2"], exp_a),
+                      ("B", [], exp_b)]
+            for label, extra, exp in phases:
+                rc, diag, inv_md, run_count = run_inv(extra)
+                outcome = {
+                    "exit_code": rc,
+                    "mode": diag.get("mode"),
+                    "diagnosis": diag.get("diagnosis"),
+                    "likely_cause": diag.get("likely_cause"),
+                    "tokens_in": diag.get("tokens_in"),
+                    "tokens_out": diag.get("tokens_out"),
+                    "actions_taken": diag.get("actions_taken"),
+                    "cost_usd_est": diag.get("cost_usd_est"),
+                    "turn_count": inv_md.count("## turn "),
+                    "loop_ended": "loop ended without done"
+                    in inv_md,
+                    "run_dir_count": run_count}
+                mismatch = diag_mismatch(outcome, exp)
+                check(f"497 investigate cap e2e: phase {label} "
+                      "pins exit code, diagnosis, tokens, "
+                      "actions, cost, transcript turns and "
+                      "no new run dir for the composed cap",
+                      mismatch is None, mismatch or "")
+    finally:
+        if srv is not None:
+            srv.terminate()
+            srv.wait()
+        if fake is not None:
+            fake.terminate()
+            fake.wait()
+        os.environ.clear()
+        os.environ.update(saved)
+    check("497 investigate cap e2e: static port free after "
+          "cleanup", port_free(port))
+    check("497 investigate cap e2e: fake model port free "
+          "after cleanup", port_free(fake_port))
+    check("497 investigate cap e2e: no http.server remains "
+          "after cleanup", no_static_server(port))
+    check("497 investigate cap e2e: no fake model remains "
+          "after cleanup", no_fake_model())
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
