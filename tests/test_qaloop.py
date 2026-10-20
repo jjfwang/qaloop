@@ -28760,6 +28760,253 @@ def test_issue_493_verify_max_investigation_actions_e2e():
           "cleanup", no_fake_model())
 
 
+def test_issue_495_enqueue_max_retries_retry_recovery_e2e():
+    """Issue #495: pin the CLI enqueue --max-retries
+    retry-recovery composition end to end. SPEC.md
+    (Enqueue section) documents --max-retries N (int,
+    default 0): retry the job up to N extra attempts
+    after the first failure through the queue normal
+    retry policy, printing enqueued job #<id> (<kind>,
+    max_retries=<N>). The enqueue plumbing contract
+    (issue 310) stubs queue.enqueue, the CLI
+    enqueue-to-worker e2e (issue 403) uses the default
+    max_retries 0 so the first failure would be
+    terminal, and the retry-recovery e2e (issue 435)
+    enqueues via the queue API and drives
+    worker.handle_job directly twice, never cmd_enqueue
+    or cmd_worker - so the real chain, build_parser ->
+    cmd_enqueue --max-retries -> queue row ->
+    cmd_worker --once claim loop -> handle_job ->
+    record_failure requeue -> re-claim within the same
+    worker run -> second real browser run -> complete,
+    could rot with every test green. This test stubs
+    NOTHING in that chain: a caller-owned in-process
+    threaded server serves a stateful flaky page (first
+    GET of /flaky.html says still down, every later GET
+    says recovered and ready), the flow is written into
+    a temp flows dir with investigate_on_failure false,
+    QALOOP_MODEL_API_KEY is removed, one real CLI
+    enqueue runs with --max-retries 1, and exactly one
+    real CLI worker --once run must re-claim the
+    requeued job itself and land it done."""
+    import contextlib
+    import io
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def enqueue_retry_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    exp_probe = {"job_count": 1, "job_status": "done",
+                 "job_attempts": 1,
+                 "job_note": "verify-flow -> passed",
+                 "run_count": 2,
+                 "run_statuses": ["failed", "passed"],
+                 "job_run_dir_is_passing": True,
+                 "job_run_dir_nonempty": True,
+                 "page_hits_ok": True}
+    check("495 enqueue retry e2e: exact expectations return "
+          "no mismatch",
+          enqueue_retry_mismatch(dict(exp_probe), exp_probe)
+          is None)
+    probe = enqueue_retry_mismatch(
+        dict(exp_probe, job_status="failed"), exp_probe)
+    check("495 enqueue retry e2e: corrupted job_status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    probe = enqueue_retry_mismatch(
+        dict(exp_probe, job_attempts=0), exp_probe)
+    check("495 enqueue retry e2e: corrupted attempts "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("job_attempts:"),
+          probe or "")
+    probe = enqueue_retry_mismatch(
+        dict(exp_probe, job_note="verify-flow -> failed"),
+        exp_probe)
+    check("495 enqueue retry e2e: corrupted note "
+          "caught, names field",
+          probe is not None and probe.startswith("job_note:"),
+          probe or "")
+    if not os.path.exists(exe): check("495 enqueue retry e2e execution skipped (no browser)", True); return
+
+    hits = {"count": 0}
+
+    class FlakyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/flaky.html":
+                hits["count"] += 1
+                text = ("still down" if hits["count"] == 1
+                        else "recovered and ready")
+                body = ("<html><body><div id=\"out\">"
+                        + text + "</div></body></html>"
+                        ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length",
+                                 str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/health":
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length",
+                                 str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    port = find_free_port()
+    check("495 enqueue retry e2e: flaky port not already "
+          "answering", port_free(port),
+          f"port {port} already in use")
+    base = f"http://127.0.0.1:{port}"
+    srv = HTTPServer(("127.0.0.1", port), FlakyHandler)
+    srv_t = threading.Thread(target=srv.serve_forever,
+                             daemon=True)
+    srv_t.start()
+    saved = dict(os.environ)
+    try:
+        wait_for_http(f"{base}/health")
+        hits["count"] = 0
+        not_found_code = None
+        try:
+            urllib.request.urlopen(f"{base}/no-such-page",
+                                   timeout=5)
+        except urllib.error.HTTPError as e:
+            not_found_code = e.code
+        check("495 enqueue retry e2e: unknown path returns "
+              "404 from the flaky handler",
+              not_found_code == 404, str(not_found_code))
+        with tempfile.TemporaryDirectory() as td:
+            flows_dir = os.path.join(td, "flows")
+            os.makedirs(flows_dir)
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            os.environ["TARGET_URL"] = base
+            flow_text = (
+                "version: 1\n"
+                "name: probe-cli-retry-recover\n"
+                "target: ${TARGET_URL}\n"
+                "\n"
+                "steps:\n"
+                "  - name: open the flaky page\n"
+                "    goto: /flaky.html\n"
+                "\n"
+                "  - name: page recovers and is ready\n"
+                "    timeout_ms: 3000\n"
+                "    expect:\n"
+                "      - text_contains: "
+                "{selector: \"#out\", "
+                "text: \"recovered and ready\"}\n"
+                "\n"
+                "artifacts: {screenshot: on-failure, "
+                "ax_snapshot: on-failure, trace: false}\n"
+                "timeouts: {step_ms: 15000, run_ms: 120000}\n"
+                "investigate_on_failure: false\n")
+            flow_path = os.path.join(flows_dir, "flaky.yaml")
+            with open(flow_path, "w", encoding="utf-8") as f:
+                f.write(flow_text)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_e = cli.cmd_enqueue(
+                    cli.build_parser().parse_args(
+                        ["enqueue", "--kind", "verify-flow",
+                         "--flow", flow_path,
+                         "--target", base,
+                         "--max-retries", "1"]))
+            out_e = buf.getvalue().strip()
+            check("495 enqueue retry e2e: enqueue exit 0",
+                  rc_e == 0, str(rc_e))
+            check("495 enqueue retry e2e: enqueue line names "
+                  "max_retries=1", "max_retries=1" in out_e,
+                  out_e)
+            rows = queue.list_jobs(limit=10)
+            check("495 enqueue retry e2e: one pending row "
+                  "carrying max_retries 1",
+                  len(rows) == 1
+                  and rows[0].get("status") == "pending"
+                  and rows[0].get("max_retries") == 1,
+                  str(rows))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_w = cli.cmd_worker(
+                    cli.build_parser().parse_args(
+                        ["worker", "--once", "--poll", "0.2",
+                         "--flows", flows_dir]))
+            check("495 enqueue retry e2e: worker exit 0",
+                  rc_w == 0, str(rc_w))
+            rows = queue.list_jobs(limit=10)
+            row = rows[0] if rows else {}
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            statuses = []
+            for d in run_dirs:
+                run_json = os.path.join(runs_root, d,
+                                        "run.json")
+                if os.path.exists(run_json):
+                    with open(run_json,
+                              encoding="utf-8") as f:
+                        statuses.append(
+                            json.load(f).get("status"))
+            outcome = {
+                "job_count": len(rows),
+                "job_status": row.get("status"),
+                "job_attempts": row.get("attempts"),
+                "job_note": row.get("note"),
+                "run_count": len(run_dirs),
+                "run_statuses": statuses,
+                "job_run_dir_is_passing": bool(
+                    row.get("run_dir") and run_dirs
+                    and os.path.basename(row["run_dir"])
+                    == run_dirs[-1]),
+                "job_run_dir_nonempty": bool(
+                    row.get("run_dir")),
+                "page_hits_ok": hits["count"] >= 2}
+            mismatch = enqueue_retry_mismatch(outcome, exp_probe)
+            check("495 enqueue retry e2e: one worker run "
+                  "re-claims the requeued job and lands it "
+                  "done with failed-then-passed runs",
+                  mismatch is None,
+                  mismatch or str(outcome))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        os.environ.clear()
+        os.environ.update(saved)
+    check("495 enqueue retry e2e: flaky port free after "
+          "cleanup", port_free(port))
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
