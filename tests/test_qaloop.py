@@ -17680,6 +17680,268 @@ def test_issue_405_investigate_e2e():
           f"http.server still on {port}")
 
 
+def test_issue_469_investigate_target_override_e2e():
+    """Issue #469: pin the standalone investigate --target
+    override composition end to end. Issue #405 pins the real
+    cmd_investigate composition with no --target (the recorded
+    target from run.json is used), and issue #316 pins
+    cmd_investigate plumbing with qaloop.investigate.investigate
+    stubbed outright, so the override arm of cli.py's
+    target=args.target or result.target resolution - a real
+    cmd_investigate whose --target replaces the recorded target
+    in the real manual brief's Flow line - is executed by no
+    test. This test stubs NOTHING in that chain: it serves the
+    repo root itself, drives the real CLI verify of the designed
+    steps-phase failure flow against the live server (so run.json
+    records the live target), runs the real CLI investigate with
+    no --target as a control (brief Flow line names the recorded
+    live target), then the real CLI investigate with --target set
+    to a dead URL (brief Flow line names the dead override and no
+    longer names the recorded target), pinning the manual
+    diagnosis shape both times."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def investigate_mismatch(mode, cost, brief_path, flow_line,
+                             exp_mode, exp_cost, exp_brief_path,
+                             exp_target):
+        if mode != exp_mode: return (
+            f"mode: expected {exp_mode}, got {mode}")
+        if cost != exp_cost: return (
+            f"cost_usd_est: expected {exp_cost}, got {cost}")
+        if brief_path != exp_brief_path: return (
+            f"brief path: expected {exp_brief_path}, "
+            f"got {brief_path}")
+        if f"target `{exp_target}`" not in flow_line: return (
+            f"brief target: expected target `{exp_target}`, "
+            f"got {flow_line}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    def parse_diag(text):
+        try:
+            diag, _ = json.JSONDecoder().raw_decode(
+                text[text.index("{"):])
+            return diag
+        except ValueError:
+            return {}
+
+    def flow_line_of(brief_text):
+        for line in brief_text.splitlines():
+            if line.startswith("Flow:"):
+                return line
+        return ""
+
+    def dead_port():
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    good_line = ("Flow: `demo-steps-fail` — target "
+                 "`http://127.0.0.1:9`")
+    check("469 investigate target override e2e: diagnosis parser "
+          "skips the manual-mode notice line",
+          parse_diag("no model configured\n{\"mode\": \"manual\"}\n")
+          == {"mode": "manual"})
+    check("469 investigate target override e2e: diagnosis parser "
+          "returns empty on non-JSON output",
+          parse_diag("no json here") == {})
+    check("469 investigate target override e2e: flow line "
+          "extractor returns the Flow line",
+          flow_line_of("header\n" + good_line + "\nrest") == good_line)
+    check("469 investigate target override e2e: flow line "
+          "extractor returns empty when no Flow line is present",
+          flow_line_of("nothing here") == "")
+    check("469 investigate target override e2e: exact "
+          "expectations return no mismatch",
+          investigate_mismatch("manual", 0.0,
+                               "/r/INVESTIGATION_BRIEF.md", good_line,
+                               "manual", 0.0,
+                               "/r/INVESTIGATION_BRIEF.md",
+                               "http://127.0.0.1:9") is None)
+    probe = investigate_mismatch("agent", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md", good_line,
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md",
+                                 "http://127.0.0.1:9")
+    check("469 investigate target override e2e: corrupted mode "
+          "caught, names field",
+          probe is not None and "mode:" in probe, probe or "")
+    probe = investigate_mismatch("manual", 1.5,
+                                 "/r/INVESTIGATION_BRIEF.md", good_line,
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md",
+                                 "http://127.0.0.1:9")
+    check("469 investigate target override e2e: corrupted cost "
+          "caught, names field",
+          probe is not None and "cost_usd_est:" in probe, probe or "")
+    probe = investigate_mismatch("manual", 0.0, "/r/WRONG.md",
+                                 good_line,
+                                 "manual", 0.0,
+                                 "/r/INVESTIGATION_BRIEF.md",
+                                 "http://127.0.0.1:9")
+    check("469 investigate target override e2e: corrupted brief "
+          "path caught, names field",
+          probe is not None and "brief path:" in probe, probe or "")
+    probe = investigate_mismatch(
+        "manual", 0.0, "/r/INVESTIGATION_BRIEF.md",
+        "Flow: `demo-steps-fail` — target `http://127.0.0.1:8`",
+        "manual", 0.0, "/r/INVESTIGATION_BRIEF.md",
+        "http://127.0.0.1:9")
+    check("469 investigate target override e2e: corrupted brief "
+          "target caught, names field",
+          probe is not None and "brief target:" in probe, probe or "")
+    if not os.path.exists(exe): check("469 investigate target override e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("469 investigate target override e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("469 investigate target override e2e: no http.server "
+          "for the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER", "QALOOP_MODEL_API_KEY",
+                "TARGET_URL", "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/teardown-demo.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                live = f"http://127.0.0.1:{port}"
+                os.environ["TARGET_URL"] = live
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_path = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_v = cli.cmd_verify(
+                        cli.build_parser().parse_args(
+                            ["verify", flow_path]))
+                check("469 investigate target override e2e: real "
+                      "verify of the steps-fail flow exits 1",
+                      rc_v == 1, str(rc_v))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("469 investigate target override e2e: "
+                      "exactly one run dir written",
+                      len(run_dirs) == 1, str(run_dirs))
+                if run_dirs:
+                    run_dir = os.path.join(runs_root, run_dirs[0])
+                    with open(os.path.join(run_dir, "run.json"),
+                              encoding="utf-8") as f:
+                        run_data = json.load(f)
+                    check("469 investigate target override e2e: "
+                          "run.json status failed",
+                          run_data.get("status") == "failed",
+                          str(run_data.get("status")))
+                    check("469 investigate target override e2e: "
+                          "run.json target is the live server",
+                          run_data.get("target") == live,
+                          str(run_data.get("target")))
+                    exp_brief = os.path.join(
+                        run_dir, "INVESTIGATION_BRIEF.md")
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_i = cli.cmd_investigate(
+                            cli.build_parser().parse_args(
+                                ["investigate", "--run", run_dir,
+                                 "--flow", flow_path]))
+                    check("469 investigate target override e2e: "
+                          "control investigate exits 0",
+                          rc_i == 0, str(rc_i))
+                    diag = parse_diag(buf.getvalue())
+                    check("469 investigate target override e2e: "
+                          "control brief file exists",
+                          os.path.exists(exp_brief), exp_brief)
+                    brief_text = ""
+                    if os.path.exists(exp_brief):
+                        with open(exp_brief, encoding="utf-8") as f:
+                            brief_text = f.read()
+                    mismatch = investigate_mismatch(
+                        diag.get("mode"), diag.get("cost_usd_est"),
+                        diag.get("brief"), flow_line_of(brief_text),
+                        "manual", 0.0, exp_brief, live)
+                    check("469 investigate target override e2e: "
+                          "control diagnosis is manual mode, zero "
+                          "cost, brief path in run dir, brief "
+                          "target is the recorded live target",
+                          mismatch is None, mismatch or "")
+                    dead = dead_port()
+                    dead_url = f"http://127.0.0.1:{dead}"
+                    check("469 investigate target override e2e: "
+                          "dead override target is distinct from "
+                          "the live target",
+                          dead != port and dead_url != live, dead_url)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_o = cli.cmd_investigate(
+                            cli.build_parser().parse_args(
+                                ["investigate", "--run", run_dir,
+                                 "--flow", flow_path,
+                                 "--target", dead_url]))
+                    check("469 investigate target override e2e: "
+                          "override investigate exits 0",
+                          rc_o == 0, str(rc_o))
+                    diag = parse_diag(buf.getvalue())
+                    brief_text = ""
+                    if os.path.exists(exp_brief):
+                        with open(exp_brief, encoding="utf-8") as f:
+                            brief_text = f.read()
+                    mismatch = investigate_mismatch(
+                        diag.get("mode"), diag.get("cost_usd_est"),
+                        diag.get("brief"), flow_line_of(brief_text),
+                        "manual", 0.0, exp_brief, dead_url)
+                    check("469 investigate target override e2e: "
+                          "override diagnosis is manual mode, zero "
+                          "cost, brief path in run dir, brief "
+                          "target is the dead override",
+                          mismatch is None, mismatch or "")
+                    check("469 investigate target override e2e: "
+                          "override brief Flow line does not name "
+                          "the recorded live target",
+                          f"target `{live}`"
+                          not in flow_line_of(brief_text),
+                          flow_line_of(brief_text))
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("469 investigate target override e2e: no http.server "
+          "remains after cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 def test_issue_407_perform_cli_e2e():
     """Issue #407: pin the CLI perform composition end to end.
     Issue #387 drives perform() directly against the fake model,
