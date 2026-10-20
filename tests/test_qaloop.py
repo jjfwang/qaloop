@@ -28281,6 +28281,237 @@ def test_issue_489_worker_job_timeout_e2e():
           "after cleanup", port_free(port))
     check("489 worker job-timeout e2e: no http.server "
           "remains after cleanup", no_static_server(port))
+
+
+def test_issue_491_worker_concurrency_e2e():
+    """Issue #491: pin the worker --concurrency parallel
+    composition end to end. SPEC.md (Worker section)
+    documents --concurrency N (default 1): with N > 1 the
+    worker claims jobs into a thread pool, each job gets
+    its own browser and its own run directory, claims are
+    atomic so no job is ever double-claimed, and --once
+    exits only when no claimable job remains and nothing
+    is in flight. The pre-existing concurrency tests drive
+    run_worker with the job handler stubbed, so the real
+    chain - build_parser -> cmd_enqueue -> queue ->
+    cmd_worker --once --concurrency 2 -> handle_job ->
+    run_flow - could rot with every test green. This test
+    stubs NOTHING in that chain: it serves a temp page
+    from a caller-owned static server, writes two distinct
+    flows that each wait 5s on the page, enqueues both
+    through the real CLI, and runs the worker once with
+    --concurrency 2. Both jobs must land done with
+    distinct ids and distinct non-empty run_dir values,
+    exactly two run directories must exist under
+    QALOOP_RUNS, each run.json must read passed, and the
+    claim/finish timestamps must overlap (the second job
+    is claimed before the first finishes), which only
+    genuine parallelism satisfies for two 5s flows."""
+    import contextlib
+    import glob
+    import io
+    import json
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_concurrency_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = worker_concurrency_mismatch("rc", 0, 0)
+    check("491 worker concurrency e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = worker_concurrency_mismatch(
+        "job_status", "done", "failed")
+    check("491 worker concurrency e2e: corrupted job-status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    probe = worker_concurrency_mismatch(
+        "run_status", "passed", "failed")
+    check("491 worker concurrency e2e: corrupted run-status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = worker_concurrency_mismatch(
+        "run_dir", "/runs/a", "/runs/b")
+    check("491 worker concurrency e2e: corrupted run-dir "
+          "caught, names field",
+          probe is not None and probe.startswith("run_dir:"),
+          probe or "")
+    if not os.path.exists(exe): check("491 worker concurrency e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    target = f"http://127.0.0.1:{port}/"
+    check("491 worker concurrency e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("491 worker concurrency e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    saved = dict(os.environ)
+    srv = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            www = os.path.join(td, "www")
+            os.makedirs(www)
+            with open(os.path.join(www, "page.html"), "w") as f:
+                f.write("<html><body><h1>Concurrency page</h1>"
+                        "</body></html>")
+            flows_dir = os.path.join(td, "flows")
+            os.makedirs(flows_dir)
+            for name in ("conc-a-491", "conc-b-491"):
+                flow_path = os.path.join(
+                    flows_dir, name + ".yaml")
+                with open(flow_path, "w") as f:
+                    f.write(
+                        "version: 1\n"
+                        f"name: {name}\n"
+                        f"target: {target}\n"
+                        "steps:\n"
+                        "  - name: open page\n"
+                        "    goto: /page.html\n"
+                        "  - name: wait and check heading\n"
+                        "    wait_ms: 5000\n"
+                        "    expect:\n"
+                        "      text_contains: "
+                        "{selector: \"h1\", text: "
+                        "\"Concurrency page\"}\n")
+            srv = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port),
+                 "--bind", "127.0.0.1"],
+                cwd=www, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            wait_for_http(f"{target}page.html")
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            with temp_db():
+                flow_a = os.path.join(
+                    flows_dir, "conc-a-491.yaml")
+                flow_b = os.path.join(
+                    flows_dir, "conc-b-491.yaml")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_a = cli.cmd_enqueue(
+                        cli.build_parser().parse_args(
+                            ["enqueue", "--kind", "verify-flow",
+                             "--flow", flow_a,
+                             "--target", target]))
+                    rc_b = cli.cmd_enqueue(
+                        cli.build_parser().parse_args(
+                            ["enqueue", "--kind", "verify-flow",
+                             "--flow", flow_b,
+                             "--target", target]))
+                m = worker_concurrency_mismatch(
+                    "enqueue_rc", 0, rc_a)
+                check("491 worker concurrency e2e: enqueue A "
+                      "exit 0", m is None, m or "")
+                m = worker_concurrency_mismatch(
+                    "enqueue_rc", 0, rc_b)
+                check("491 worker concurrency e2e: enqueue B "
+                      "exit 0", m is None, m or "")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_w = cli.cmd_worker(
+                        cli.build_parser().parse_args(
+                            ["worker", "--once", "--poll", "0.2",
+                             "--flows", flows_dir,
+                             "--concurrency", "2"]))
+                m = worker_concurrency_mismatch("rc", 0, rc_w)
+                check("491 worker concurrency e2e: worker "
+                      "exit 0", m is None, m or "")
+                rows = sorted(queue.list_jobs(limit=100),
+                              key=lambda r: r["id"])
+                m = worker_concurrency_mismatch(
+                    "job_count", 2, len(rows))
+                check("491 worker concurrency e2e: exactly "
+                      "two job rows", m is None, m or "")
+                statuses = [r.get("status") for r in rows]
+                m = worker_concurrency_mismatch(
+                    "job_status", ["done", "done"], statuses)
+                check("491 worker concurrency e2e: both jobs "
+                      "done", m is None, m or "")
+                ids = [r.get("id") for r in rows]
+                m = worker_concurrency_mismatch(
+                    "job_ids", 2, len(set(ids)))
+                check("491 worker concurrency e2e: distinct "
+                      "job ids", m is None, m or str(ids))
+                run_dirs = [r.get("run_dir") for r in rows]
+                m = worker_concurrency_mismatch(
+                    "run_dir", 2, len(set(run_dirs)))
+                check("491 worker concurrency e2e: distinct "
+                      "run_dir values", m is None,
+                      m or str(run_dirs))
+                m = worker_concurrency_mismatch(
+                    "run_dir", True,
+                    len(run_dirs) == 2 and all(run_dirs))
+                check("491 worker concurrency e2e: run_dir "
+                      "values non-empty", m is None, m or "")
+                run_entries = sorted(glob.glob(
+                    os.path.join(runs_root, "*")))
+                m = worker_concurrency_mismatch(
+                    "runs_count", 2, len(run_entries))
+                check("491 worker concurrency e2e: exactly "
+                      "two run directories under QALOOP_RUNS",
+                      m is None, m or str(run_entries))
+                for row in rows:
+                    status = None
+                    with open(os.path.join(
+                            row["run_dir"], "run.json")) as f:
+                        status = json.load(f).get("status")
+                    m = worker_concurrency_mismatch(
+                        "run_status", "passed", status)
+                    check("491 worker concurrency e2e: "
+                          "run.json passed for job "
+                          f"{row.get('id')}", m is None, m or "")
+                claimed = [r.get("claimed_at") for r in rows]
+                finished = [r.get("finished_at") for r in rows]
+                overlap = (len(rows) == 2
+                           and None not in claimed
+                           and None not in finished
+                           and max(claimed) < min(finished))
+                m = worker_concurrency_mismatch(
+                    "parallel_overlap", True, overlap)
+                check("491 worker concurrency e2e: second "
+                      "job claimed before the first finished "
+                      "(genuine parallelism)", m is None,
+                      f"claimed={claimed} finished={finished}")
+    finally:
+        if srv is not None:
+            srv.terminate()
+            srv.wait()
+        os.environ.clear()
+        os.environ.update(saved)
+    check("491 worker concurrency e2e: static port free "
+          "after cleanup", port_free(port))
+    check("491 worker concurrency e2e: no http.server "
+          "remains after cleanup", no_static_server(port))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
