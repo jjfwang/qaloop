@@ -28048,6 +28048,239 @@ def test_issue_487_perform_cdp_url_e2e():
     check("487 perform cdp-url e2e: no CDP browser remains "
           "after cleanup", no_proc("remote-debugging-port=9229"))
 
+
+def test_issue_489_worker_job_timeout_e2e():
+    """Issue #489: pin the worker --job-timeout composition
+    end to end against a genuinely slow real browser flow.
+    SPEC.md (Worker section) documents --job-timeout SECS
+    (default 1800): a job still running after SECS is
+    recorded failed through the normal retry policy with a
+    job timeout: exceeded Ns note, and a per-job payload
+    timeout_s overrides the CLI default when positive. The
+    pre-existing timeout tests call handle_job directly
+    with _run_one_flow stubbed to block on a threading
+    Event, so the real chain - build_parser -> cmd_enqueue
+    -> queue -> cmd_worker --once -> handle_job timeout
+    join -> record_failure - could rot with every test
+    green. This test stubs NOTHING in that chain: it serves
+    a temp page from a caller-owned static server, writes a
+    slow flow (goto, then wait_ms 20000) and a fast flow,
+    and drives three real enqueue + worker --once rounds:
+    CLI --job-timeout 1 fails the slow job in about 1s with
+    the exact timeout note, payload timeout_s 1 overrides
+    CLI --job-timeout 60 the same way, and a fast flow
+    under --job-timeout 60 completes with run.json passed.
+    Only queue state and stdout are pinned - the timed-out
+    jobs keep running on daemon threads per SPEC and their
+    run artifacts are never asserted."""
+    import contextlib
+    import glob
+    import io
+    import json
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def worker_job_timeout_mismatch(field, expected, actual):
+        if expected == actual:
+            return None
+        return (f"{field}: expected {expected!r}, "
+                f"got {actual!r}")
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    mismatch = worker_job_timeout_mismatch("rc", 0, 0)
+    check("489 worker job-timeout e2e: equal values return "
+          "no mismatch", mismatch is None, mismatch or "")
+    probe = worker_job_timeout_mismatch(
+        "job_status", "failed", "done")
+    check("489 worker job-timeout e2e: corrupted job-status "
+          "caught, names field",
+          probe is not None and probe.startswith("job_status:"),
+          probe or "")
+    probe = worker_job_timeout_mismatch(
+        "note", "job timeout: exceeded 1s", "boom")
+    check("489 worker job-timeout e2e: corrupted note "
+          "caught, names field",
+          probe is not None and probe.startswith("note:"),
+          probe or "")
+    probe = worker_job_timeout_mismatch("attempts", 1, 2)
+    check("489 worker job-timeout e2e: corrupted attempts "
+          "caught, names field",
+          probe is not None and probe.startswith("attempts:"),
+          probe or "")
+    if not os.path.exists(exe): check("489 worker job-timeout e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    target = f"http://127.0.0.1:{port}/"
+    check("489 worker job-timeout e2e: static port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("489 worker job-timeout e2e: no http.server for "
+          "the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    saved = dict(os.environ)
+    srv = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            www = os.path.join(td, "www")
+            os.makedirs(www)
+            with open(os.path.join(www, "page.html"), "w") as f:
+                f.write("<html><body><h1>Slow page</h1>"
+                        "</body></html>")
+            flows_dir = os.path.join(td, "flows")
+            os.makedirs(flows_dir)
+            slow = os.path.join(flows_dir, "slow.yaml")
+            with open(slow, "w") as f:
+                f.write("version: 1\nname: slow-489\n"
+                        f"target: {target}\n"
+                        "steps:\n"
+                        "  - name: open page\n"
+                        "    goto: /page.html\n"
+                        "  - name: sleep 20s\n"
+                        "    wait_ms: 20000\n")
+            fast = os.path.join(flows_dir, "fast.yaml")
+            with open(fast, "w") as f:
+                f.write("version: 1\nname: fast-489\n"
+                        f"target: {target}\n"
+                        "steps:\n"
+                        "  - name: open page\n"
+                        "    goto: /page.html\n"
+                        "    expect:\n"
+                        "      text_contains: "
+                        "{selector: \"h1\", text: \"Slow page\"}\n")
+            srv = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port),
+                 "--bind", "127.0.0.1"],
+                cwd=www, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            wait_for_http(f"{target}page.html")
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+
+            def phase(label, flow, job_timeout, payload=None):
+                runs_root = os.path.join(td, label, "runs")
+                os.makedirs(runs_root)
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, label, "ledger.jsonl")
+                before = len(queue.list_jobs(limit=100))
+                argv = ["enqueue", "--kind", "verify-flow",
+                        "--flow", flow, "--target", target]
+                if payload:
+                    argv += ["--payload", json.dumps(payload)]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_e = cli.cmd_enqueue(
+                        cli.build_parser().parse_args(argv))
+                buf = io.StringIO()
+                start = time.monotonic()
+                with contextlib.redirect_stdout(buf):
+                    cli.cmd_worker(cli.build_parser().parse_args(
+                        ["worker", "--once", "--poll", "0.2",
+                         "--flows", flows_dir,
+                         "--job-timeout", str(job_timeout)]))
+                elapsed = time.monotonic() - start
+                rows = sorted(queue.list_jobs(limit=100),
+                              key=lambda r: r["id"])
+                job = rows[before] if len(rows) > before else {}
+                return rc_e, elapsed, buf.getvalue(), job, runs_root
+
+            with temp_db():
+                rc_e, el, out, job, _ = phase("a", slow, 1)
+                m = worker_job_timeout_mismatch(
+                    "enqueue_rc", 0, rc_e)
+                check("489 worker job-timeout e2e: phase A "
+                      "enqueue exit 0", m is None, m or "")
+                check("489 worker job-timeout e2e: phase A "
+                      "worker returns well under the 20s step",
+                      el < 15, f"{el:.1f}s")
+                m = worker_job_timeout_mismatch(
+                    "job_status", "failed", job.get("status"))
+                check("489 worker job-timeout e2e: phase A "
+                      "job failed", m is None, m or "")
+                m = worker_job_timeout_mismatch(
+                    "note", "job timeout: exceeded 1s",
+                    job.get("note"))
+                check("489 worker job-timeout e2e: phase A "
+                      "note exactly names the 1s timeout",
+                      m is None, m or "")
+                m = worker_job_timeout_mismatch(
+                    "attempts", 1, job.get("attempts"))
+                check("489 worker job-timeout e2e: phase A "
+                      "attempts 1", m is None, m or "")
+                check("489 worker job-timeout e2e: phase A "
+                      "stdout names the timed out after 1s line",
+                      "timed out after 1s" in out,
+                      out.strip().splitlines()[-1] if out.strip()
+                      else "no stdout")
+
+                rc_e, el, out, job, _ = phase(
+                    "b", slow, 60, payload={"timeout_s": 1})
+                m = worker_job_timeout_mismatch(
+                    "enqueue_rc", 0, rc_e)
+                check("489 worker job-timeout e2e: phase B "
+                      "enqueue exit 0", m is None, m or "")
+                check("489 worker job-timeout e2e: phase B "
+                      "worker returns well under the 20s step",
+                      el < 15, f"{el:.1f}s")
+                m = worker_job_timeout_mismatch(
+                    "job_status", "failed", job.get("status"))
+                check("489 worker job-timeout e2e: phase B "
+                      "job failed", m is None, m or "")
+                m = worker_job_timeout_mismatch(
+                    "note", "job timeout: exceeded 1s",
+                    job.get("note"))
+                check("489 worker job-timeout e2e: phase B "
+                      "payload timeout_s overrides the CLI "
+                      "default, note exactly names 1s",
+                      m is None, m or "")
+
+                rc_e, el, out, job, runs_root = phase(
+                    "c", fast, 60)
+                m = worker_job_timeout_mismatch(
+                    "enqueue_rc", 0, rc_e)
+                check("489 worker job-timeout e2e: phase C "
+                      "enqueue exit 0", m is None, m or "")
+                m = worker_job_timeout_mismatch(
+                    "job_status", "done", job.get("status"))
+                check("489 worker job-timeout e2e: phase C "
+                      "job done", m is None, m or "")
+                run_jsons = glob.glob(os.path.join(
+                    runs_root, "*", "run.json"))
+                status = None
+                if run_jsons:
+                    with open(run_jsons[0]) as f:
+                        status = json.load(f).get("status")
+                m = worker_job_timeout_mismatch(
+                    "run_status", "passed", status)
+                check("489 worker job-timeout e2e: phase C "
+                      "run.json passed", m is None, m or "")
+    finally:
+        if srv is not None:
+            srv.terminate()
+            srv.wait()
+        os.environ.clear()
+        os.environ.update(saved)
+    check("489 worker job-timeout e2e: static port free "
+          "after cleanup", port_free(port))
+    check("489 worker job-timeout e2e: no http.server "
+          "remains after cleanup", no_static_server(port))
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
