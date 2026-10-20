@@ -556,7 +556,7 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    from qaloop.env import resolve_keep_runs
+    from qaloop.env import resolve_keep_runs, resolve_upload_dir
     from qaloop.worker import run_worker
     try:
         keep_runs = resolve_keep_runs(args.keep_runs)
@@ -569,10 +569,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if args.job_timeout <= 0:
         print(f"ERROR: --job-timeout must be > 0 (got {args.job_timeout})")
         return 2
+    upload_dir = resolve_upload_dir(getattr(args, "upload_dir", None))
     run_worker(flows_dir=args.flows, runs_root=default_runs_root(),
                once=args.once, poll_s=args.poll, headless=not args.headed,
                executable_path=args.executable_path, keep_runs=keep_runs,
-               concurrency=args.concurrency, job_timeout_s=args.job_timeout)
+               concurrency=args.concurrency, job_timeout_s=args.job_timeout,
+               upload_dir=upload_dir)
     return 0
 
 
@@ -786,6 +788,10 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--keep-runs", type=int, default=None,
                    help="keep at most N newest run dirs (env QALOOP_KEEP_RUNS; "
                         "default 0 = keep everything)")
+    w.add_argument("--upload-dir", default=None,
+                   help="directory file uploads are restricted to "
+                        "(env QALOOP_UPLOAD_DIR; fail-closed if neither "
+                        "is declared)")
     w.set_defaults(fn=cmd_worker)
 
     h = sub.add_parser("webhook", help="run the GitHub webhook receiver")
