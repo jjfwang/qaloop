@@ -27710,6 +27710,344 @@ def test_issue_485_perform_max_actions_e2e():
     check("485 perform max-actions e2e: no fake model remains "
           "after cleanup", no_proc("fake_max_actions_485"))
 
+def test_issue_487_perform_cdp_url_e2e():
+    """Issue #487: pin the CLI perform --cdp-url live-browser
+    takeover composition end to end. The parser and unit
+    tests pin --cdp-url parsing and the CDP attach path in
+    isolation, but no test drives the real chain -
+    build_parser -> cmd_perform -> perform(cdp_url=...) ->
+    connect_over_cdp -> Performer over an already-open
+    page in an externally launched browser ->
+    perform.json / ledger - so the attached: true record,
+    reuse of the existing page, and the leave-the-browser-
+    open takeover contract could rot unobserved. This test
+    stubs NOTHING in that chain: it serves a temp page
+    whose Refresh button is a real button element from a
+    caller-owned static server, boots a scripted fake
+    model, launches the headless shell itself as an
+    external process with a remote debugging port and the
+    page already open, and drives the real CLI perform
+    with --cdp-url only (no --target, no
+    --executable-path)."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    task = "Refresh the page once"
+    target = "http://127.0.0.1:8941/refresh.html"
+    cdp_url = "http://127.0.0.1:9229"
+    refresh_html = "\n".join([
+        "<!doctype html>",
+        "<html><body>",
+        '<button type="button">Refresh</button>',
+        '<p id="status"></p>',
+        "<script>",
+        "document.querySelector('button').addEventListener("
+        "'click', function () { document.getElementById('status')"
+        ".textContent = 'Refreshed!'; });",
+        "</script>",
+        "</body></html>",
+    ])
+    fake_src = "\n".join([
+        "import json",
+        "from http.server import BaseHTTPRequestHandler, HTTPServer",
+        "SCRIPT = [",
+        '    {"action": "click", "target": {"role": "button", "name": "Refresh"}},',
+        '    {"action": "done", "summary": "Refreshed once and finished."},',
+        "]",
+        'state = {"n": 0}',
+        "class H(BaseHTTPRequestHandler):",
+        "    def do_POST(self):",
+        '        ln = int(self.headers.get("Content-Length", 0))',
+        "        self.rfile.read(ln)",
+        '        i = min(state["n"], len(SCRIPT) - 1)',
+        '        state["n"] += 1',
+        "        body = json.dumps({",
+        '            "choices": [{"message": {"role": "assistant",',
+        "                                     \"content\": json.dumps(SCRIPT[i])}}],",
+        '            "usage": {"prompt_tokens": 800, "completion_tokens": 60},',
+        "        }).encode()",
+        "        self.send_response(200)",
+        '        self.send_header("Content-Type", "application/json")',
+        '        self.send_header("Content-Length", str(len(body)))',
+        "        self.end_headers()",
+        "        self.wfile.write(body)",
+        "    def log_message(self, *a):",
+        "        pass",
+        'HTTPServer(("127.0.0.1", 8932), H).serve_forever()',
+    ])
+    cdp_exp = {
+        "status": "completed", "attached": True,
+        "action_count": 2, "actions_len": 2,
+        "final_url": target,
+        "tokens_in": 1600, "tokens_out": 120,
+        "cost_usd_est": 0.0003, "ceiling_hit": False,
+        "rec1": ("clicked", "Refresh"),
+        "rec2": "done",
+        "ledger_status": "completed", "ledger_actions": 2}
+
+    def perform_cdp_url_mismatch(outcome, exp):
+        for field in ("status", "attached", "action_count",
+                      "actions_len", "final_url", "tokens_in",
+                      "tokens_out", "cost_usd_est", "ceiling_hit",
+                      "rec1", "rec2", "ledger_status",
+                      "ledger_actions"):
+            e, a = exp.get(field), outcome.get(field)
+            ok = (all(s in (a or "") for s in e)
+                  if isinstance(e, tuple) else a == e)
+            if not ok: return f"{field}: expected {e!r}, got {a!r}"
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def poll_refresh():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:8941/refresh.html", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def poll_cdp_version():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:9229/json/version", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def no_proc(pattern):
+        return subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True).returncode != 0
+
+    def start_fake(fake_path):
+        proc = subprocess.Popen(
+            [sys.executable, fake_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        ready = False
+        while not ready and time.time() < deadline:
+            ready = not port_free(8932)
+            time.sleep(0 if ready else 0.1)
+        return proc, ready
+
+    def stop_fake(proc):
+        proc.terminate()
+        proc.wait()
+
+    probe = perform_cdp_url_mismatch(
+        dict(cdp_exp, status="failed"), cdp_exp)
+    check("487 perform cdp-url e2e: corrupted status "
+          "caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = perform_cdp_url_mismatch(
+        dict(cdp_exp, attached=False), cdp_exp)
+    check("487 perform cdp-url e2e: corrupted attached "
+          "caught, names field",
+          probe is not None and "attached" in probe, probe or "")
+    probe = perform_cdp_url_mismatch(
+        dict(cdp_exp, action_count=99), cdp_exp)
+    check("487 perform cdp-url e2e: corrupted count "
+          "caught, names field",
+          probe is not None and "action_count" in probe,
+          probe or "")
+    check("487 perform cdp-url e2e: exact expectations "
+          "return no mismatch",
+          perform_cdp_url_mismatch(dict(cdp_exp),
+                                   cdp_exp) is None)
+    if not os.path.exists(exe): check("487 perform cdp-url e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_NAME", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_UPLOAD_DIR")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    site = None
+    fake = None
+    browser = None
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            site_dir = os.path.join(td, "site")
+            os.makedirs(site_dir)
+            with open(os.path.join(site_dir, "refresh.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(refresh_html)
+            fake_path = os.path.join(td, "fake_cdp_url_487.py")
+            with open(fake_path, "w", encoding="utf-8") as f:
+                f.write(fake_src)
+            occupied_8941 = not port_free(8941)
+            occupied_8932 = not port_free(8932)
+            occupied_9229 = not port_free(9229)
+            check("487 perform cdp-url e2e: port 8941 not "
+                  "already in use", not occupied_8941,
+                  "stale server already on 8941")
+            check("487 perform cdp-url e2e: port 8932 not "
+                  "already in use", not occupied_8932,
+                  "stale server already on 8932")
+            check("487 perform cdp-url e2e: port 9229 not "
+                  "already in use", not occupied_9229,
+                  "stale browser already on 9229")
+            check("487 perform cdp-url e2e: no stale site "
+                  "server answering", not poll_refresh())
+            check("487 perform cdp-url e2e: no stale fake "
+                  "model process", no_proc("fake_cdp_url_487"))
+            check("487 perform cdp-url e2e: no stale CDP "
+                  "browser answering", not poll_cdp_version())
+            check("487 perform cdp-url e2e: no stale CDP "
+                  "browser process",
+                  no_proc("remote-debugging-port=9229"))
+            if not occupied_8941 and not occupied_8932 \
+                    and not occupied_9229:
+                site = subprocess.Popen(
+                    [sys.executable, "-m", "http.server", "8941",
+                     "--bind", "127.0.0.1"], cwd=site_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                deadline = time.time() + 10
+                ready = False
+                while not ready and time.time() < deadline:
+                    ready = poll_refresh()
+                    time.sleep(0 if ready else 0.1)
+                check("487 perform cdp-url e2e: site server "
+                      "ready on 8941", ready)
+                if ready:
+                    fake, fake_ready = start_fake(fake_path)
+                    check("487 perform cdp-url e2e: fake model "
+                          "ready on 8932", fake_ready)
+                    browser = subprocess.Popen(
+                        [exe, "--no-sandbox",
+                         "--remote-debugging-port=9229",
+                         "--user-data-dir="
+                         + os.path.join(td, "profile"),
+                         target],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    deadline = time.time() + 10
+                    cdp_ready = False
+                    while not cdp_ready and time.time() < deadline:
+                        cdp_ready = poll_cdp_version()
+                        time.sleep(0 if cdp_ready else 0.1)
+                    check("487 perform cdp-url e2e: external "
+                          "browser CDP endpoint up on 9229",
+                          cdp_ready)
+                    if cdp_ready:
+                        time.sleep(1.0)
+                        runs_root = os.path.join(td, "runs")
+                        os.environ["QALOOP_RUNS"] = runs_root
+                        os.environ["QALOOP_LEDGER"] = os.path.join(
+                            td, "ledger.jsonl")
+                        os.environ["QALOOP_MODEL_BASE_URL"] = \
+                            "http://127.0.0.1:8932"
+                        os.environ["QALOOP_MODEL_API_KEY"] = \
+                            "sk-fake-487"
+                        os.environ["QALOOP_MODEL_NAME"] = \
+                            "fake-model"
+                        os.environ.pop("QALOOP_MODEL_PRICE_IN", None)
+                        os.environ.pop("QALOOP_MODEL_PRICE_OUT", None)
+                        os.environ.pop("QALOOP_UPLOAD_DIR", None)
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            rc = cli.cmd_perform(
+                                cli.build_parser().parse_args(
+                                    ["perform", "--task", task,
+                                     "--cdp-url", cdp_url,
+                                     "--max-actions", "10"]))
+                        out = buf.getvalue()
+                        check("487 perform cdp-url e2e: perform "
+                              "exits 0", rc == 0, str(rc))
+                        check("487 perform cdp-url e2e: stdout "
+                              "pins status completed",
+                              "status: completed" in out, out)
+                        run_dirs = (sorted(os.listdir(runs_root))
+                                    if os.path.isdir(runs_root)
+                                    else [])
+                        check("487 perform cdp-url e2e: exactly "
+                              "one run dir",
+                              len(run_dirs) == 1, str(run_dirs))
+                        pdata = {}
+                        if len(run_dirs) == 1:
+                            pjson = os.path.join(
+                                runs_root, run_dirs[0],
+                                "perform.json")
+                            if os.path.exists(pjson):
+                                with open(pjson,
+                                          encoding="utf-8") as f:
+                                    pdata = json.load(f)
+                        rows = ledger.read_all()
+                        check("487 perform cdp-url e2e: exactly "
+                              "one ledger row",
+                              len(rows) == 1, str(rows))
+                        row = rows[0] if len(rows) == 1 else {}
+                        acts = pdata.get("actions") or []
+                        outcome = {
+                            "status": pdata.get("status"),
+                            "attached": pdata.get("attached"),
+                            "action_count":
+                                pdata.get("action_count"),
+                            "actions_len": len(acts),
+                            "final_url": pdata.get("final_url"),
+                            "tokens_in": pdata.get("tokens_in"),
+                            "tokens_out": pdata.get("tokens_out"),
+                            "cost_usd_est":
+                                pdata.get("cost_usd_est"),
+                            "ceiling_hit":
+                                pdata.get("ceiling_hit"),
+                            "rec1": (acts[0].get("result")
+                                     if len(acts) > 0 else None),
+                            "rec2": (acts[1].get("result")
+                                     if len(acts) > 1 else None),
+                            "ledger_status": row.get("status"),
+                            "ledger_actions": row.get("actions")}
+                        mismatch = perform_cdp_url_mismatch(
+                            outcome, cdp_exp)
+                        check("487 perform cdp-url e2e: pins "
+                              "perform.json and ledger",
+                              mismatch is None, mismatch or "")
+                        check("487 perform cdp-url e2e: external "
+                              "browser left running after perform",
+                              browser.poll() is None)
+                        with urllib.request.urlopen(
+                                "http://127.0.0.1:9229/json/list",
+                                timeout=2) as r:
+                            pages = json.load(r)
+                        check("487 perform cdp-url e2e: page "
+                              "still listed over CDP after perform",
+                              any(target in (p.get("url") or "")
+                                  for p in pages),
+                              str([p.get("url") for p in pages]))
+                    stop_fake(fake)
+                    fake = None
+                    check("487 perform cdp-url e2e: port "
+                          "8932 free after fake stops",
+                          port_free(8932))
+        finally:
+            fake.terminate() if fake is not None else None
+            fake.wait() if fake is not None else None
+            site.terminate() if site is not None else None
+            site.wait() if site is not None else None
+            browser.terminate() if browser is not None else None
+            browser.wait() if browser is not None else None
+            for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("487 perform cdp-url e2e: port 8941 free after "
+          "cleanup", port_free(8941))
+    check("487 perform cdp-url e2e: port 8932 free after "
+          "cleanup", port_free(8932))
+    check("487 perform cdp-url e2e: port 9229 free after "
+          "cleanup", port_free(9229))
+    check("487 perform cdp-url e2e: no fake model remains "
+          "after cleanup", no_proc("fake_cdp_url_487"))
+    check("487 perform cdp-url e2e: no CDP browser remains "
+          "after cleanup", no_proc("remote-debugging-port=9229"))
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
