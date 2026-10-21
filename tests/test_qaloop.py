@@ -31379,6 +31379,190 @@ def test_issue_511_verify_boot_failed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_513_baselines_boot_failed_e2e():
+    """Issue #513: pin the CLI baselines SERVICE BOOT FAILED
+    composition end to end. The services coverage pins the
+    boot machinery and the baselines coverage pins dispatch,
+    but the single-flow boot-failure composition itself - the
+    real build_parser -> cmd_baselines entering the services
+    context on flows/demo-services-http-fail.yaml, whose
+    health path 404s forever so wait_for_http raises
+    TimeoutError at the 5s timeout, cli.py printing the exact
+    SERVICE BOOT FAILED line and returning exit 3, the
+    already-created run dir (named with the -baselines
+    suffix, cli.py new_run_dir(runs_root, flow_name +
+    "-baselines")) left holding no files (only the empty
+    steps/ scaffold that new_run_dir always creates), and no
+    ledger row appended - could rot unobserved.
+    This test stubs NOTHING in the baselines/services chain:
+    it drives the real CLI against a temp runs root and
+    ledger and pins the exit code, the printed line, the
+    -baselines run dir name, the empty run dir, the absent
+    ledger row, and port 8933 free before and (via bounded
+    polling) after the run."""
+    import socket
+    import time
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    health_url = "http://127.0.0.1:8933/api/no-such-health"
+
+    def baselines_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def port_free_settled(port, timeout_s=5.0):
+        deadline = time.time() + timeout_s
+        free = False
+        while not free and time.time() < deadline:
+            time.sleep(0.2)
+            free = port_free(port)
+        return free
+
+    exp = {"exit_code": 3, "line_count": 1, "line_ok": True,
+           "run_dir_count": 1, "run_dir_named": True,
+           "run_dir_entries": ["steps"],
+           "run_dir_files": 0, "ledger_rows": 0,
+           "port_free_after": True}
+    check("513 baselines-boot-failed e2e: exact expectations "
+          "return no mismatch",
+          baselines_boot_failed_mismatch(dict(exp), exp) is None)
+    probe = baselines_boot_failed_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("513 baselines-boot-failed e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = baselines_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("513 baselines-boot-failed e2e: corrupted printed line "
+          "caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = baselines_boot_failed_mismatch(
+        dict(exp, run_dir_count=0), exp)
+    check("513 baselines-boot-failed e2e: corrupted run-dir count "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_count:"), probe or "")
+    probe = baselines_boot_failed_mismatch(
+        dict(exp, run_dir_files=2), exp)
+    check("513 baselines-boot-failed e2e: corrupted run-dir "
+          "files caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_files:"), probe or "")
+    probe = baselines_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("513 baselines-boot-failed e2e: corrupted ledger_rows "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+    if not os.path.exists(exe): check("513 baselines-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("513 baselines-boot-failed e2e: port 8933 free before "
+          "the run", port_free(8933), "port 8933 already in use")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services-http-fail.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["baselines", flow_path, "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("513 baselines-boot-failed e2e: real "
+                  "cmd_baselines exits exactly 3", rc == 3,
+                  str(rc))
+            check("513 baselines-boot-failed e2e: stdout is "
+                  "exactly one line", len(lines) == 1, str(lines))
+            line = lines[0] if lines else ""
+            check("513 baselines-boot-failed e2e: line starts "
+                  "SERVICE BOOT FAILED: TimeoutError:",
+                  line.startswith(
+                      "SERVICE BOOT FAILED: TimeoutError:"), line)
+            check("513 baselines-boot-failed e2e: line names the "
+                  "health URL", health_url in line, line)
+            check("513 baselines-boot-failed e2e: line carries "
+                  "the 5.0s timeout fragment",
+                  "not ready after 5.0s" in line, line)
+            line_ok = (
+                line.startswith(
+                    "SERVICE BOOT FAILED: TimeoutError:")
+                and health_url in line
+                and "not ready after 5.0s" in line)
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("513 baselines-boot-failed e2e: exactly one "
+                  "new run dir created", len(run_dirs) == 1,
+                  str(run_dirs))
+            run_dir_named = bool(run_dirs) and (
+                "demo-services-http-fail-baselines"
+                in run_dirs[0])
+            check("513 baselines-boot-failed e2e: run dir name "
+                  "carries the -baselines suffix",
+                  run_dir_named, str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            entries = (sorted(os.listdir(only_dir))
+                       if only_dir else [])
+            check("513 baselines-boot-failed e2e: run dir holds "
+                  "only the empty steps scaffold",
+                  entries == ["steps"], str(entries))
+            file_count = (
+                sum(len(names) for _dp, _dn, names
+                    in os.walk(only_dir)) if only_dir else -1)
+            check("513 baselines-boot-failed e2e: run dir holds "
+                  "no files at all", file_count == 0,
+                  str(file_count))
+            rows = ledger.read_all()
+            check("513 baselines-boot-failed e2e: ledger has "
+                  "zero rows", len(rows) == 0, str(rows))
+            settled = port_free_settled(8933)
+            check("513 baselines-boot-failed e2e: port 8933 free "
+                  "after the run (bounded polling)", settled,
+                  "port 8933 still answering after settle")
+            outcome = {"exit_code": rc,
+                       "line_count": len(lines),
+                       "line_ok": line_ok,
+                       "run_dir_count": len(run_dirs),
+                       "run_dir_named": run_dir_named,
+                       "run_dir_entries": entries,
+                       "run_dir_files": file_count,
+                       "ledger_rows": len(rows),
+                       "port_free_after": settled}
+            mismatch = baselines_boot_failed_mismatch(outcome, exp)
+            check("513 baselines-boot-failed e2e: real composition "
+                  "pins the pinned fields exactly",
+                  mismatch is None, mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
