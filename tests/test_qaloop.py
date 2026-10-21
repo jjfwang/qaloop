@@ -29928,6 +29928,319 @@ def test_issue_501_enqueue_verify_repo_e2e():
           f"http.server still running on {port}")
 
 
+def test_issue_503_evaluate_git_range_repo_e2e():
+    """Issue #503: pin the CLI evaluate git-range --repo
+    composition end to end. The evaluate unit tests pin
+    _resolve_diff directly and the evaluate CLI e2e
+    (issue 411) drives the real cmd_evaluate only with a
+    diff FILE, never a git range and never --repo, so the
+    advertised shell path itself - build_parser ->
+    cmd_verify producing a real run record, then
+    build_parser -> cmd_evaluate resolving --diff
+    HEAD~1..HEAD through the git subprocess in --repo
+    (from a cwd outside the repo, so --repo is
+    load-bearing) with only the model network seam
+    (qaloop.evaluate._chat) scripted, writing
+    EVALUATION.md + evaluation.json into the run dir and
+    appending an evaluate ledger row - could rot
+    unobserved. This test serves the repo root on a free
+    port, drives the real verify, builds a temp git repo
+    with a committed marker line, then drives the real
+    evaluate twice: the range diff pins the marker in
+    the judge message plus the verdict artefacts and
+    ledger, and the empty range pins the exact
+    empty-diff exit with no further model calls."""
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop import evaluate as evaluate_mod
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def evaluate_outcome_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_outcome = {
+        "verdict_line": "verdict: MAKES_SENSE (confidence: high)",
+        "stdout_lines": 4,
+        "report_line": "report: <run_dir>/EVALUATION.md",
+        "diff_marker": "+# marker-503",
+        "chat_calls": 2,
+        "eval_verdict": "MAKES_SENSE",
+        "ledger_count": 1,
+        "ledger_verdict": "MAKES_SENSE",
+        "ledger_total": 2}
+    check("503 evaluate git-range repo e2e: exact "
+          "expectations return no mismatch",
+          evaluate_outcome_mismatch(dict(exp_outcome),
+                                    exp_outcome) is None)
+    probe = evaluate_outcome_mismatch(
+        dict(exp_outcome, verdict_line="verdict: BOGUS"),
+        exp_outcome)
+    check("503 evaluate git-range repo e2e: corrupted "
+          "verdict_line caught, names field",
+          probe is not None
+          and probe.startswith("verdict_line:"), probe or "")
+    probe = evaluate_outcome_mismatch(
+        dict(exp_outcome, diff_marker=""), exp_outcome)
+    check("503 evaluate git-range repo e2e: corrupted "
+          "diff_marker caught, names field",
+          probe is not None
+          and probe.startswith("diff_marker:"), probe or "")
+    probe = evaluate_outcome_mismatch(
+        dict(exp_outcome, ledger_count=9), exp_outcome)
+    check("503 evaluate git-range repo e2e: corrupted "
+          "ledger_count caught, names field",
+          probe is not None
+          and probe.startswith("ledger_count:"), probe or "")
+    if not os.path.exists(exe): check("503 evaluate git-range repo e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("503 evaluate git-range repo e2e: static port "
+          "not already answering", port_free(port),
+          f"port {port} already in use")
+    check("503 evaluate git-range repo e2e: no "
+          "http.server for the port yet",
+          no_static_server(port),
+          f"stale http.server on {port}")
+    saved = dict(os.environ)
+    real_chat = evaluate_mod._chat
+    old_cwd = os.getcwd()
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["QALOOP_MODEL_API_KEY"] = "probe-key-503"
+                for k in ("QALOOP_MODEL_NAME",
+                          "QALOOP_MODEL_BASE_URL",
+                          "QALOOP_MODEL_PRICE_IN",
+                          "QALOOP_MODEL_PRICE_OUT"):
+                    os.environ.pop(k, None)
+                flow = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_v = parsed.fn(parsed)
+                check("503 evaluate git-range repo e2e: "
+                      "real verify of demo-login-a exits 0",
+                      rc_v == 0, str(rc_v))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("503 evaluate git-range repo e2e: "
+                      "exactly one run dir written",
+                      len(run_dirs) == 1, str(run_dirs))
+                run_dir = os.path.join(
+                    runs_root, run_dirs[0]) if run_dirs else (
+                        os.path.join(runs_root, "missing"))
+                with open(os.path.join(run_dir, "run.json"),
+                          encoding="utf-8") as f:
+                    run_data = json.load(f)
+                check("503 evaluate git-range repo e2e: "
+                      "run record flow_name is demo-login-a",
+                      run_data.get("flow_name") == "demo-login-a",
+                      str(run_data.get("flow_name")))
+                check("503 evaluate git-range repo e2e: "
+                      "run record status is passed",
+                      run_data.get("status") == "passed",
+                      str(run_data.get("status")))
+                verdict = {"verdict": "MAKES_SENSE",
+                           "confidence": "high",
+                           "rationale": ("the run record shows "
+                                         "the login flow passing"),
+                           "evidence": ['"the login demo passes" persists',
+                                        '"the login demo passes" renders'],
+                           "risks": []}
+                calls = []
+
+                def fake_chat(cfg, messages, timeout_s=90):
+                    calls.append(messages)
+                    return json.dumps(verdict), {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 50}
+
+                evaluate_mod._chat = fake_chat
+
+                def git(repo, *args):
+                    r = subprocess.run(
+                        ["git", "-C", repo, *args],
+                        capture_output=True, text=True, timeout=30)
+                    assert r.returncode == 0, (
+                        f"git {' '.join(args)}: {r.stderr[:200]}")
+                    return r.stdout
+
+                repo = os.path.join(td, "repo-503")
+                os.makedirs(repo)
+                git0 = subprocess.run(
+                    ["git", "init", "-q", repo],
+                    capture_output=True, text=True, timeout=30)
+                assert git0.returncode == 0, git0.stderr[:200]
+                subprocess.run(
+                    ["git", "-C", repo, "config", "user.email",
+                     "probe@local"], check=True, timeout=30)
+                subprocess.run(
+                    ["git", "-C", repo, "config", "user.name",
+                     "probe"], check=True, timeout=30)
+                with open(os.path.join(repo, "change.py"),
+                          "w", encoding="utf-8") as f:
+                    f.write("v = 1\n")
+                git(repo, "add", ".")
+                git(repo, "commit", "-q", "-m", "base")
+                with open(os.path.join(repo, "change.py"),
+                          "a", encoding="utf-8") as f:
+                    f.write("# marker-503\n")
+                git(repo, "add", ".")
+                git(repo, "commit", "-q", "-m", "marker")
+                raw = git(repo, "diff", "HEAD~1..HEAD")
+                check("503 evaluate git-range repo e2e: "
+                      "range diff has the marker line",
+                      "+# marker-503" in raw, raw[:200])
+
+                def run_cli(argv):
+                    parsed = cli.build_parser().parse_args(argv)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = parsed.fn(parsed)
+                    return rc, buf.getvalue().splitlines()
+
+                # Phase A: run from the tempdir, NOT the
+                # git repo, so ignoring --repo would fail.
+                os.chdir(td)
+                rc_a, lines_a = run_cli(
+                    ["evaluate", "--claim",
+                     "the login demo passes",
+                     "--run", run_dir,
+                     "--diff", "HEAD~1..HEAD",
+                     "--repo", repo])
+                check("503 evaluate git-range repo e2e: "
+                      "phase A real evaluate exits 0",
+                      rc_a == 0, str(rc_a))
+                eval_json_path = os.path.join(
+                    run_dir, "evaluation.json")
+                eval_md_path = os.path.join(
+                    run_dir, "EVALUATION.md")
+                check("503 evaluate git-range repo e2e: "
+                      "evaluation.json exists",
+                      os.path.exists(eval_json_path),
+                      eval_json_path)
+                check("503 evaluate git-range repo e2e: "
+                      "EVALUATION.md exists",
+                      os.path.exists(eval_md_path), eval_md_path)
+                eval_data = {}
+                if os.path.exists(eval_json_path):
+                    with open(eval_json_path,
+                              encoding="utf-8") as f:
+                        eval_data = json.load(f)
+                rows = ledger.read_all()
+                eval_rows = [r for r in rows
+                             if r.get("kind") == "evaluate"]
+                eval_row = eval_rows[0] if eval_rows else {}
+                judge_msg = ""
+                if calls and len(calls[0]) > 1:
+                    judge_msg = calls[0][1].get("content", "")
+                outcome = {
+                    "verdict_line": (
+                        lines_a[0] if len(lines_a) > 0 else ""),
+                    "stdout_lines": len(lines_a),
+                    "report_line": (
+                        lines_a[3] if len(lines_a) > 3 else ""),
+                    "diff_marker": (
+                        "+# marker-503"
+                        if "+# marker-503" in judge_msg else ""),
+                    "chat_calls": len(calls),
+                    "eval_verdict": (
+                        (eval_data.get("verdict") or {}).get(
+                            "verdict")),
+                    "ledger_count": len(eval_rows),
+                    "ledger_verdict": eval_row.get("verdict"),
+                    "ledger_total": len(rows)}
+                exp_real = dict(
+                    exp_outcome,
+                    report_line=f"report: {run_dir}/EVALUATION.md")
+                mismatch = evaluate_outcome_mismatch(
+                    outcome, exp_real)
+                check("503 evaluate git-range repo e2e: "
+                      "phase A verdict line, report line, "
+                      "diff marker, chat calls, verdict and "
+                      "ledger pin exactly",
+                      mismatch is None, mismatch or "")
+
+                # Phase B: empty range diff -> exact
+                # empty-diff exit, no new ledger row or
+                # model calls.
+                rc_b, lines_b = run_cli(
+                    ["evaluate", "--claim",
+                     "the login demo passes",
+                     "--run", run_dir,
+                     "--diff", "HEAD..HEAD",
+                     "--repo", repo])
+                check("503 evaluate git-range repo e2e: "
+                      "phase B empty range exits 2",
+                      rc_b == 2, str(rc_b))
+                check("503 evaluate git-range repo e2e: "
+                      "phase B exact empty-diff ERROR line",
+                      lines_b == ["ERROR: empty diff \u2014 "
+                                  "nothing to evaluate"],
+                      str(lines_b))
+                rows_b = ledger.read_all()
+                eval_rows_b = [r for r in rows_b
+                               if r.get("kind") == "evaluate"]
+                check("503 evaluate git-range repo e2e: "
+                      "phase B evaluate ledger rows still 1",
+                      len(eval_rows_b) == 1,
+                      f"{len(eval_rows_b)} rows")
+                check("503 evaluate git-range repo e2e: "
+                      "phase B no additional model calls",
+                      len(calls) == 2, f"{len(calls)} calls")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        evaluate_mod._chat = real_chat
+        os.chdir(old_cwd)
+        os.environ.clear()
+        os.environ.update(saved)
+    check("503 evaluate git-range repo e2e: static port "
+          "free after cleanup", port_free(port),
+          f"port {port} still answering")
+    check("503 evaluate git-range repo e2e: no http.server "
+          "remains after cleanup", no_static_server(port),
+          f"http.server still running on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
