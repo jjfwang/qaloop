@@ -18776,6 +18776,284 @@ def test_issue_413_webhook_serve_cli_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_509_webhook_rejection_filter_e2e():
+    """Issue #509: fix webhook /health pending depth (exact count,
+    not a capped list) and pin the real-server rejection/filter
+    composition end to end. Mirrors the #413 harness: stubs
+    NOTHING in the webhook/queue chain, launches the real CLI
+    webhook server as a subprocess, and pins exact status AND
+    exact body for bad/missing signatures, ping, malformed JSON,
+    filtered pull_request actions, the needs-qa enqueue, ignored
+    events, /enqueue token rejection and success, unknown paths,
+    and the final exact pending count."""
+    import hashlib
+    import hmac
+    import socket
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import queue as q
+    from qaloop.env import find_free_port
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    secret = "509-webhook-secret"
+    token = "509-enqueue-token"
+
+    def webhook_rejection_mismatch(status, error, pending,
+                                   exp_status, exp_error, exp_pending):
+        if status != exp_status: return (
+            f"status: expected {exp_status}, got {status}")
+        if error != exp_error: return (
+            f"error: expected {exp_error}, got {error}")
+        if pending != exp_pending: return (
+            f"pending: expected {exp_pending}, got {pending}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    check("509 webhook e2e: exact expectations return no mismatch",
+          webhook_rejection_mismatch(200, None, 0, 200, None, 0) is None)
+    probe = webhook_rejection_mismatch(500, None, 0, 200, None, 0)
+    check("509 webhook e2e: corrupted status caught, names field",
+          probe is not None and "status" in probe, probe or "")
+    probe = webhook_rejection_mismatch(401, "bogus", None,
+                                       401, "bad signature", None)
+    check("509 webhook e2e: corrupted error caught, names field",
+          probe is not None and "error" in probe, probe or "")
+    probe = webhook_rejection_mismatch(200, None, 99, 200, None, 0)
+    check("509 webhook e2e: corrupted pending caught, names field",
+          probe is not None and "pending" in probe, probe or "")
+
+    port = find_free_port()
+    check("509 webhook e2e: port not already answering",
+          port_free(port), f"port {port} already in use")
+    env_keys = ("QALOOP_DB", "QALOOP_LEDGER", "QALOOP_WEBHOOK_SECRET", "QALOOP_ENQUEUE_TOKEN")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+            os.environ["QALOOP_LEDGER"] = os.path.join(td, "ledger.jsonl")
+            os.environ["QALOOP_WEBHOOK_SECRET"] = secret
+            os.environ["QALOOP_ENQUEUE_TOKEN"] = token
+            child_env = dict(os.environ)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "qaloop.cli", "webhook",
+                 "--port", str(port), "--host", "127.0.0.1"],
+                cwd=root, env=child_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                def do_request(method, path, body=None, headers=None):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=body, method=method,
+                        headers=headers or {})
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            return resp.status, json.loads(resp.read().decode())
+                    except urllib.error.HTTPError as e:
+                        return e.code, json.loads(e.read().decode())
+
+                def sign(body):
+                    return "sha256=" + hmac.new(
+                        secret.encode(), body, hashlib.sha256).hexdigest()
+
+                def post_github(body, event, sig=None, include_sig=True):
+                    headers = {"X-GitHub-Event": event,
+                               "Content-Type": "application/json"}
+                    if include_sig:
+                        headers["X-Hub-Signature-256"] = (
+                            sig if sig is not None else sign(body))
+                    return do_request("POST", "/webhook/github",
+                                      body=body, headers=headers)
+
+                health_status = None
+                health_body = None
+                for _ in range(75):
+                    try:
+                        health_status, health_body = do_request("GET", "/health")
+                        break
+                    except Exception:
+                        time.sleep(0.2)
+                check("509 webhook e2e: health status is 200",
+                      health_status == 200, str(health_status))
+                check("509 webhook e2e: health body exact at start",
+                      health_body == {"ok": True, "pending": 0},
+                      str(health_body))
+                mismatch = webhook_rejection_mismatch(
+                    health_status, (health_body or {}).get("error"),
+                    (health_body or {}).get("pending"), 200, None, 0)
+                check("509 webhook e2e: health pending 0 via mismatch helper",
+                      mismatch is None, mismatch or "")
+
+                # Bad signature
+                body = json.dumps({"action": "opened"}).encode()
+                status, resp = post_github(body, "pull_request", sig="sha256=" + "0" * 64)
+                check("509 webhook e2e: bad signature body exact",
+                      resp == {"ok": False, "error": "bad signature"}, str(resp))
+                mismatch = webhook_rejection_mismatch(
+                    status, resp.get("error"), resp.get("pending"),
+                    401, "bad signature", None)
+                check("509 webhook e2e: bad signature status/error via mismatch helper",
+                      mismatch is None, mismatch or "")
+                check("509 webhook e2e: bad signature enqueues zero jobs",
+                      len(q.list_jobs(limit=100)) == 0,
+                      str(len(q.list_jobs(limit=100))))
+
+                # Missing signature header
+                status, resp = post_github(body, "pull_request", include_sig=False)
+                check("509 webhook e2e: missing signature status/body exact",
+                      status == 401 and resp == {"ok": False, "error": "bad signature"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: missing signature enqueues zero jobs",
+                      len(q.list_jobs(limit=100)) == 0,
+                      str(len(q.list_jobs(limit=100))))
+
+                # Signed ping
+                status, resp = post_github(b"{}", "ping")
+                check("509 webhook e2e: signed ping exact",
+                      status == 200 and resp == {"ok": True, "msg": "pong"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: ping enqueues zero jobs",
+                      len(q.list_jobs(limit=100)) == 0,
+                      str(len(q.list_jobs(limit=100))))
+
+                # Signed malformed JSON
+                status, resp = post_github(b"{not json", "pull_request")
+                check("509 webhook e2e: malformed JSON exact",
+                      status == 400 and resp == {"ok": False, "error": "bad json"},
+                      f"{status} {resp}")
+
+                # Filtered: closed
+                body = json.dumps({"action": "closed"}).encode()
+                status, resp = post_github(body, "pull_request")
+                check("509 webhook e2e: closed action ignored exact",
+                      status == 200 and resp == {"ok": True, "msg": "ignored action closed"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: closed enqueues zero jobs",
+                      len(q.list_jobs(limit=100)) == 0,
+                      str(len(q.list_jobs(limit=100))))
+
+                # Filtered: labeled bug
+                body = json.dumps({"action": "labeled", "label": {"name": "bug"}}).encode()
+                status, resp = post_github(body, "pull_request")
+                check("509 webhook e2e: labeled bug ignored exact",
+                      status == 200 and resp == {"ok": True, "msg": "ignored action labeled"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: labeled bug enqueues zero jobs",
+                      len(q.list_jobs(limit=100)) == 0,
+                      str(len(q.list_jobs(limit=100))))
+
+                # Accepted: labeled needs-qa
+                body = json.dumps({
+                    "action": "labeled", "label": {"name": "needs-qa"},
+                    "repository": {"full_name": "jjfwang/qaloop"},
+                    "pull_request": {"number": 509, "head": {"sha": "509probe"}}}).encode()
+                status, resp = post_github(body, "pull_request")
+                check("509 webhook e2e: needs-qa delivery exact",
+                      status == 200 and resp == {"ok": True, "job_id": 1},
+                      f"{status} {resp}")
+                jobs = q.list_jobs(limit=100)
+                check("509 webhook e2e: needs-qa enqueues exactly one job",
+                      len(jobs) == 1, str(len(jobs)))
+                job = jobs[0] if jobs else {}
+                check("509 webhook e2e: needs-qa job id/kind/status exact",
+                      job.get("id") == 1 and job.get("kind") == "verify-repo" and job.get("status") == "pending",
+                      str(job))
+                check("509 webhook e2e: needs-qa job payload exact",
+                      job.get("payload") == {"repo": "qaloop", "repo_full": "jjfwang/qaloop", "pr": 509, "sha": "509probe", "source": "github-webhook"},
+                      str(job.get("payload")))
+
+                # Ignored event: push
+                status, resp = post_github(b"{}", "push")
+                check("509 webhook e2e: push event ignored exact",
+                      status == 200 and resp == {"ok": True, "msg": "ignored event push"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: push still exactly one job",
+                      len(q.list_jobs(limit=100)) == 1,
+                      str(len(q.list_jobs(limit=100))))
+
+                # /enqueue no token
+                enq_body = json.dumps({"kind": "verify-repo", "repo": "qaloop"}).encode()
+                status, resp = do_request("POST", "/enqueue", body=enq_body,
+                                          headers={"Content-Type": "application/json"})
+                check("509 webhook e2e: enqueue no token exact",
+                      status == 401 and resp == {"ok": False, "error": "bad token"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: enqueue no token adds no job",
+                      len(q.list_jobs(limit=100)) == 1,
+                      str(len(q.list_jobs(limit=100))))
+
+                # /enqueue wrong token
+                status, resp = do_request("POST", "/enqueue", body=enq_body,
+                                          headers={"Content-Type": "application/json", "X-QALoop-Token": "bogus"})
+                check("509 webhook e2e: enqueue wrong token exact",
+                      status == 401 and resp == {"ok": False, "error": "bad token"},
+                      f"{status} {resp}")
+                check("509 webhook e2e: enqueue wrong token adds no job",
+                      len(q.list_jobs(limit=100)) == 1,
+                      str(len(q.list_jobs(limit=100))))
+
+                # /enqueue correct token
+                status, resp = do_request("POST", "/enqueue", body=enq_body,
+                                          headers={"Content-Type": "application/json", "X-QALoop-Token": token})
+                check("509 webhook e2e: enqueue correct token exact",
+                      status == 200 and resp == {"ok": True, "job_id": 2},
+                      f"{status} {resp}")
+                jobs = q.list_jobs(limit=100)
+                check("509 webhook e2e: enqueue brings total to two jobs",
+                      len(jobs) == 2, str(len(jobs)))
+                job2 = next((j for j in jobs if j.get("id") == 2), {})
+                check("509 webhook e2e: enqueue job kind/status exact",
+                      job2.get("kind") == "verify-repo" and job2.get("status") == "pending",
+                      str(job2))
+                check("509 webhook e2e: enqueue job payload exact",
+                      job2.get("payload") == {"repo": "qaloop"},
+                      str(job2.get("payload")))
+
+                # /enqueue malformed JSON with token
+                status, resp = do_request("POST", "/enqueue", body=b"{not json",
+                                          headers={"Content-Type": "application/json", "X-QALoop-Token": token})
+                check("509 webhook e2e: enqueue malformed JSON exact",
+                      status == 400 and resp == {"ok": False, "error": "bad json"},
+                      f"{status} {resp}")
+
+                # Unknown paths
+                status, resp = do_request("GET", "/unknown-path")
+                check("509 webhook e2e: GET unknown path exact",
+                      status == 404 and resp == {"ok": False, "error": "not found"},
+                      f"{status} {resp}")
+                status, resp = do_request("POST", "/unknown-path", body=b"{}",
+                                          headers={"Content-Type": "application/json"})
+                check("509 webhook e2e: POST unknown path exact",
+                      status == 404 and resp == {"ok": False, "error": "not found"},
+                      f"{status} {resp}")
+
+                # Final health
+                status, resp = do_request("GET", "/health")
+                check("509 webhook e2e: final health body exact",
+                      resp == {"ok": True, "pending": 2}, str(resp))
+                mismatch = webhook_rejection_mismatch(
+                    status, resp.get("error"), resp.get("pending"),
+                    200, None, 2)
+                check("509 webhook e2e: final health pending 2 via mismatch helper",
+                      mismatch is None, mismatch or "")
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
+            check("509 webhook e2e: process exited",
+                  proc.poll() is not None, str(proc.poll()))
+            check("509 webhook e2e: port no longer answers",
+                  port_free(port), f"port {port} still answering")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 def test_issue_415_verify_compare_e2e():
     """Issue #415: pin the verify-to-compare composition end to
     end. The compare tests feed cmd_compare only hand-written
