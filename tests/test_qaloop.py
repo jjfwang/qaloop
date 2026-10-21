@@ -19013,6 +19013,290 @@ def test_issue_415_verify_compare_e2e():
 
 
 
+def test_issue_505_compare_run_id_prefix_e2e():
+    """Issue #505: pin the CLI compare run-id prefix composition
+    end to end. Issue #415 drives the real compare only by full
+    run-dir basename, so the documented prefix shorthand -
+    resolve_run matching a truncated basename prefix, the
+    ambiguous-prefix error, and the no-match error - could rot
+    unobserved on real runs. This test stubs NOTHING (in
+    particular not qaloop.compare.compare_runs,
+    qaloop.compare.resolve_run, or qaloop.compare.render_text,
+    and not the verify runner): it serves the repo root itself
+    on a free port, drives the real CLI verify of a passing and
+    a designed-failure flow, then the real CLI compare by
+    truncated prefix, by prefix self-compare, by the longest
+    common prefix of the two basenames, and by a missing ref,
+    pinning the rendered header, status, final, and error lines
+    against the real records."""
+    import socket
+    import subprocess
+
+    from qaloop import cli
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def prefix_mismatch(outcome, exp):
+        if outcome.get("header_diff") != exp.get("header_diff"): return (
+            f"header: expected {exp.get('header_diff')}, "
+            f"got {outcome.get('header_diff')}")
+        if outcome.get("header_same") != exp.get("header_same"): return (
+            f"header: expected {exp.get('header_same')}, "
+            f"got {outcome.get('header_same')}")
+        if outcome.get("status_line_diff") != exp.get("status_line_diff"): return (
+            f"status line: expected "
+            f"{exp.get('status_line_diff')}, "
+            f"got {outcome.get('status_line_diff')}")
+        if outcome.get("final_line_diff") != exp.get("final_line_diff"): return (
+            f"final line: expected "
+            f"{exp.get('final_line_diff')}, "
+            f"got {outcome.get('final_line_diff')}")
+        if outcome.get("final_line_same") != exp.get("final_line_same"): return (
+            f"final line: expected "
+            f"{exp.get('final_line_same')}, "
+            f"got {outcome.get('final_line_same')}")
+        if outcome.get("error_ambiguous") != exp.get("error_ambiguous"): return (
+            f"error line: expected "
+            f"{exp.get('error_ambiguous')}, "
+            f"got {outcome.get('error_ambiguous')}")
+        if outcome.get("error_no_match") != exp.get("error_no_match"): return (
+            f"error line: expected "
+            f"{exp.get('error_no_match')}, "
+            f"got {outcome.get('error_no_match')}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_outcome = {
+        "header_diff": "compare: AAAA -> BBBB",
+        "header_same": "compare: AAAA -> AAAA",
+        "status_line_diff": "status: passed -> failed (CHANGED)",
+        "final_line_diff": "differ",
+        "final_line_same": "identical",
+        "error_ambiguous": (
+            "ERROR: ambiguous run id 'AA': 2 matches "
+            "(first: AAAA)"),
+        "error_no_match": (
+            "ERROR: no run dir matching 'zzz-no-such-run' "
+            "in /runs")}
+    check("505 compare prefix e2e: exact expectations return "
+          "no mismatch",
+          prefix_mismatch(dict(exp_outcome), exp_outcome) is None)
+    probe = prefix_mismatch(
+        dict(exp_outcome, header_diff="compare: bogus"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted header caught, "
+          "names field",
+          probe is not None and "header" in probe, probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, header_same="compare: bogus"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted identical-case "
+          "header caught, names field",
+          probe is not None and "header" in probe, probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, status_line_diff="status: bogus"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted status line "
+          "caught, names field",
+          probe is not None and "status line" in probe,
+          probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, final_line_diff="identical"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted differ-case "
+          "final line caught, names field",
+          probe is not None and "final line" in probe,
+          probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, final_line_same="differ"), exp_outcome)
+    check("505 compare prefix e2e: corrupted identical-case "
+          "final line caught, names field",
+          probe is not None and "final line" in probe,
+          probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, error_ambiguous="ERROR: bogus"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted ambiguous "
+          "error line caught, names field",
+          probe is not None and "error line" in probe,
+          probe or "")
+    probe = prefix_mismatch(
+        dict(exp_outcome, error_no_match="ERROR: bogus"),
+        exp_outcome)
+    check("505 compare prefix e2e: corrupted no-match error "
+          "line caught, names field",
+          probe is not None and "error line" in probe,
+          probe or "")
+    if not os.path.exists(exe): check("505 compare prefix e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("505 compare prefix e2e: static port not already "
+          "answering", port_free(port), f"port {port} already in use")
+    check("505 compare prefix e2e: no http.server for the port "
+          "yet", no_static_server(port),
+          f"stale http.server on {port}")
+    env_keys = ("TARGET_URL", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        srv = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                f"http://127.0.0.1:{port}/demo/demo-login.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["TARGET_URL"] = f"http://127.0.0.1:{port}"
+                os.environ.pop("QALOOP_MODEL_API_KEY", None)
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                flow_a = os.path.join(
+                    root, "flows", "demo-login-a.yaml")
+                flow_b = os.path.join(
+                    root, "flows", "demo-steps-fail.yaml")
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_a, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_a = parsed.fn(parsed)
+                check("505 compare prefix e2e: real verify of "
+                      "demo-login-a exits 0", rc_a == 0, str(rc_a))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", flow_b, "--executable-path", exe])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_b = parsed.fn(parsed)
+                check("505 compare prefix e2e: real verify of "
+                      "demo-steps-fail exits 1", rc_b == 1, str(rc_b))
+                run_dirs = sorted(os.listdir(runs_root)) \
+                    if os.path.isdir(runs_root) else []
+                check("505 compare prefix e2e: exactly two run "
+                      "dirs written", len(run_dirs) == 2,
+                      str(run_dirs))
+                run_dir_by_flow = {}
+                run_status_by_flow = {}
+                for d in run_dirs:
+                    with open(os.path.join(runs_root, d, "run.json"),
+                              encoding="utf-8") as f:
+                        data = json.load(f)
+                    run_dir_by_flow[data.get("flow_name")] = d
+                    run_status_by_flow[data.get("flow_name")] = (
+                        data.get("status"))
+                check("505 compare prefix e2e: run records carry "
+                      "both real flow names",
+                      set(run_dir_by_flow) == {
+                          "demo-login-a", "demo-steps-fail"},
+                      str(sorted(run_dir_by_flow)))
+                check("505 compare prefix e2e: real run records "
+                      "pin passed and failed statuses",
+                      run_status_by_flow.get("demo-login-a") == "passed"
+                      and run_status_by_flow.get(
+                          "demo-steps-fail") == "failed",
+                      str(run_status_by_flow))
+                base_a = run_dir_by_flow.get("demo-login-a")
+                base_b = run_dir_by_flow.get("demo-steps-fail")
+
+                def run_compare(ref_a, ref_b):
+                    parsed_c = cli.build_parser().parse_args(
+                        ["compare", ref_a, ref_b])
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc_c = parsed_c.fn(parsed_c)
+                    return rc_c, buf.getvalue()
+
+                prefix_a = base_a[:-3]
+                prefix_b = base_b[:-3]
+                rc_diff, out_diff = run_compare(prefix_a, prefix_b)
+                lines_diff = out_diff.splitlines()
+                check("505 compare prefix e2e: prefix compare of "
+                      "passed vs failed exits 1", rc_diff == 1,
+                      str(rc_diff))
+                rc_same, out_same = run_compare(prefix_a, prefix_a)
+                lines_same = out_same.splitlines()
+                check("505 compare prefix e2e: prefix self-compare "
+                      "exits 0", rc_same == 0, str(rc_same))
+                lcp = os.path.commonprefix([base_a, base_b])
+                first_sorted = sorted([base_a, base_b])[0]
+                rc_amb, out_amb = run_compare(lcp, prefix_b)
+                lines_amb = out_amb.splitlines()
+                check("505 compare prefix e2e: longest-common-"
+                      "prefix compare exits 2", rc_amb == 2,
+                      str(rc_amb))
+                check("505 compare prefix e2e: ambiguous prefix "
+                      "renders a single line",
+                      len(lines_amb) == 1, out_amb)
+                rc_none, out_none = run_compare(
+                    "zzz-no-such-run", prefix_b)
+                lines_none = out_none.splitlines()
+                check("505 compare prefix e2e: missing-ref "
+                      "compare exits 2", rc_none == 2, str(rc_none))
+                check("505 compare prefix e2e: missing ref "
+                      "renders a single line",
+                      len(lines_none) == 1, out_none)
+                outcome = {
+                    "header_diff": (
+                        lines_diff[0] if lines_diff else None),
+                    "header_same": (
+                        lines_same[0] if lines_same else None),
+                    "status_line_diff": next(
+                        (l for l in lines_diff
+                         if l.startswith("status: ")), None),
+                    "final_line_diff": (
+                        lines_diff[-1] if lines_diff else None),
+                    "final_line_same": (
+                        lines_same[-1] if lines_same else None),
+                    "error_ambiguous": (
+                        lines_amb[0] if lines_amb else None),
+                    "error_no_match": (
+                        lines_none[0] if lines_none else None)}
+                exp_real = {
+                    "header_diff": f"compare: {base_a} -> {base_b}",
+                    "header_same": f"compare: {base_a} -> {base_a}",
+                    "status_line_diff": (
+                        "status: passed -> failed (CHANGED)"),
+                    "final_line_diff": "differ",
+                    "final_line_same": "identical",
+                    "error_ambiguous": (
+                        f"ERROR: ambiguous run id '{lcp}': "
+                        f"2 matches (first: {first_sorted})"),
+                    "error_no_match": (
+                        f"ERROR: no run dir matching "
+                        f"'zzz-no-such-run' in {runs_root}")}
+                mismatch = prefix_mismatch(outcome, exp_real)
+                check("505 compare prefix e2e: real prefix "
+                      "compares pin header, status, final and "
+                      "error lines exactly",
+                      mismatch is None, mismatch or "")
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+    check("505 compare prefix e2e: static port free after "
+          "cleanup", port_free(port),
+          f"port {port} still answering")
+    check("505 compare prefix e2e: no http.server remains after "
+          "cleanup", no_static_server(port),
+          f"http.server still on {port}")
+
+
 def test_issue_417_verify_ledger_e2e():
     """Issue #417: pin the verify-to-ledger composition end to
     end. test_issue_314 handwrites ledger rows as JSONL dicts and
