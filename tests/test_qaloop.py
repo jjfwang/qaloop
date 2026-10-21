@@ -30525,6 +30525,410 @@ def test_issue_503_evaluate_git_range_repo_e2e():
           f"http.server still running on {port}")
 
 
+def test_issue_507_baselines_matrix_e2e():
+    """Issue #507: pin the CLI baselines matrix composition end
+    to end. The matrix coverage pins verify dispatch or stubs
+    the per-combination path, and the baselines coverage pins
+    single-flow dispatch, so the advertised shell path itself -
+    build_parser -> cmd_baselines on a matrix flow, the real
+    _cmd_baselines_run dispatching to the real
+    _cmd_verify_matrix in baseline-update mode, each
+    combination saving the shared screenshot baseline, the
+    parent matrix REPORT.md, the per-combination run.json
+    records, and the real scripted-matrix ledger row - could
+    rot unobserved. This test stubs NOTHING: phase A copies
+    flows/demo-matrix-screenshot.yaml into a temp dir and
+    drives the real CLI baselines command against the real
+    proof server; phase B drives the same command on a temp
+    matrix flow over two caller-owned pages that share the
+    #card-a element but differ in later text, so one
+    combination passes and the other fails a later text
+    assertion after the shared baseline is saved."""
+    import shutil
+    import socket
+    import subprocess
+
+    from qaloop import cli, ledger
+    from qaloop.env import find_free_port, wait_for_http
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def baselines_matrix_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    exp_a = {"exit_code": 0,
+             "matrix_line": "matrix: 2/2 combinations passed",
+             "parent_count": 1,
+             "subdirs": ["00-user-ada-plan-pro",
+                         "01-user-bob-plan-free"],
+             "combo_statuses": ["passed", "passed"],
+             "report_exists": True, "png_exists": True,
+             "png_positive": True, "ledger_rows": 1,
+             "ledger_kind": "scripted-matrix",
+             "ledger_status": "passed", "ledger_combinations": 2,
+             "ledger_passed": 2}
+    check("507 baselines-matrix e2e: exact expectations return "
+          "no mismatch",
+          baselines_matrix_mismatch(dict(exp_a), exp_a) is None)
+    probe = baselines_matrix_mismatch(
+        dict(exp_a, exit_code=1), exp_a)
+    check("507 baselines-matrix e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = baselines_matrix_mismatch(
+        dict(exp_a, matrix_line="matrix: 1/2 combinations "
+                                "passed"), exp_a)
+    check("507 baselines-matrix e2e: corrupted matrix_line "
+          "caught, names field",
+          probe is not None and probe.startswith("matrix_line:"),
+          probe or "")
+    probe = baselines_matrix_mismatch(
+        dict(exp_a, combo_statuses=["passed", "failed"]), exp_a)
+    check("507 baselines-matrix e2e: corrupted combo_statuses "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("combo_statuses:"), probe or "")
+    if not os.path.exists(exe): check("507 baselines-matrix e2e execution skipped (no browser)", True); return
+
+    check("507 baselines-matrix e2e: proof port 8933 not "
+          "already answering", port_free(8933),
+          "port 8933 already in use")
+    port_b = find_free_port()
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        srv_a = subprocess.Popen(
+            [sys.executable, "demo/proof_server.py"],
+            cwd=root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wait_for_http(
+                "http://127.0.0.1:8933/demo/"
+                "screenshot-element.html")
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["TARGET_URL"] = "http://127.0.0.1:8933"
+                flow_copy = os.path.join(
+                    td, "demo-matrix-screenshot.yaml")
+                shutil.copyfile(
+                    os.path.join(root, "flows",
+                                 "demo-matrix-screenshot.yaml"),
+                    flow_copy)
+                baseline_png = os.path.join(
+                    td, "baselines", "matrix-card-a.png")
+                check("507 baselines-matrix e2e: phase A shared "
+                      "baseline PNG absent before the run",
+                      not os.path.exists(baseline_png),
+                      baseline_png)
+                parsed = cli.build_parser().parse_args(
+                    ["baselines", flow_copy,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_a = parsed.fn(parsed)
+                lines_a = buf.getvalue().splitlines()
+                check("507 baselines-matrix e2e: phase A real "
+                      "cmd_baselines exits 0", rc_a == 0, str(rc_a))
+                check("507 baselines-matrix e2e: phase A exact "
+                      "matrix line printed",
+                      "matrix: 2/2 combinations passed" in lines_a,
+                      str(lines_a[-6:]))
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                check("507 baselines-matrix e2e: phase A exactly "
+                      "one parent run dir", len(parents) == 1,
+                      str(parents))
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                matrix_dir = (os.path.join(parent, "matrix")
+                              if parent else "")
+                subdirs = (sorted(os.listdir(matrix_dir))
+                           if matrix_dir
+                           and os.path.isdir(matrix_dir) else [])
+                check("507 baselines-matrix e2e: phase A matrix "
+                      "subdirs are the literal combo slugs",
+                      subdirs == ["00-user-ada-plan-pro",
+                                  "01-user-bob-plan-free"],
+                      str(subdirs))
+                sub0_data = {}
+                sub0_json = (os.path.join(
+                    matrix_dir, "00-user-ada-plan-pro", "run.json")
+                    if matrix_dir else "")
+                if sub0_json and os.path.exists(sub0_json):
+                    with open(sub0_json, encoding="utf-8") as f:
+                        sub0_data = json.load(f)
+                sub1_data = {}
+                sub1_json = (os.path.join(
+                    matrix_dir, "01-user-bob-plan-free", "run.json")
+                    if matrix_dir else "")
+                if sub1_json and os.path.exists(sub1_json):
+                    with open(sub1_json, encoding="utf-8") as f:
+                        sub1_data = json.load(f)
+                check("507 baselines-matrix e2e: phase A combo "
+                      "00 run.json status passed",
+                      sub0_data.get("status") == "passed",
+                      str(sub0_data.get("status")))
+                check("507 baselines-matrix e2e: phase A combo "
+                      "01 run.json status passed",
+                      sub1_data.get("status") == "passed",
+                      str(sub1_data.get("status")))
+                report_exists = bool(parent) and os.path.exists(
+                    os.path.join(parent, "REPORT.md"))
+                check("507 baselines-matrix e2e: phase A parent "
+                      "REPORT.md exists", report_exists, parent)
+                png_exists = os.path.exists(baseline_png)
+                check("507 baselines-matrix e2e: phase A shared "
+                      "baseline PNG created by the run",
+                      png_exists
+                      and os.path.getsize(baseline_png) > 0,
+                      baseline_png)
+                rows_a = ledger.read_all()
+                check("507 baselines-matrix e2e: phase A ledger "
+                      "has exactly one row", len(rows_a) == 1,
+                      str(rows_a))
+                row_a = rows_a[0] if len(rows_a) > 0 else {}
+                outcome_a = {
+                    "exit_code": rc_a,
+                    "matrix_line": next(
+                        (l for l in lines_a
+                         if l.startswith("matrix: ")), None),
+                    "parent_count": len(parents),
+                    "subdirs": subdirs,
+                    "combo_statuses": [sub0_data.get("status"),
+                                       sub1_data.get("status")],
+                    "report_exists": report_exists,
+                    "png_exists": png_exists,
+                    "png_positive": png_exists and (
+                        os.path.getsize(baseline_png) > 0),
+                    "ledger_rows": len(rows_a),
+                    "ledger_kind": row_a.get("kind"),
+                    "ledger_status": row_a.get("status"),
+                    "ledger_combinations": row_a.get(
+                        "combinations"),
+                    "ledger_passed": row_a.get("passed")}
+                mismatch_a = baselines_matrix_mismatch(
+                    outcome_a, exp_a)
+                check("507 baselines-matrix e2e: phase A real "
+                      "composition pins the pinned fields exactly",
+                      mismatch_a is None, mismatch_a or "")
+        finally:
+            srv_a.terminate()
+            srv_a.wait()
+        check("507 baselines-matrix e2e: proof port 8933 free "
+              "after cleanup", port_free(8933),
+              "port 8933 still answering")
+        check("507 baselines-matrix e2e: phase B port not "
+              "already answering", port_free(port_b),
+              f"port {port_b} already in use")
+        exp_b = {"exit_code": 1,
+                 "matrix_line": "matrix: 1/2 combinations passed",
+                 "parent_count": 1,
+                 "subdirs": ["00-page-ada", "01-page-bob"],
+                 "combo_statuses": ["passed", "failed"],
+                 "report_exists": True, "png_exists": True,
+                 "png_positive": True, "ledger_rows": 1,
+                 "ledger_kind": "scripted-matrix",
+                 "ledger_status": "failed",
+                 "ledger_combinations": 2, "ledger_passed": 1}
+        with tempfile.TemporaryDirectory() as td_b:
+            www_dir = os.path.join(td_b, "www")
+            os.makedirs(www_dir)
+            page_head = (
+                "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                "<meta charset=\"utf-8\">\n"
+                "<title>507 phase B</title>\n<style>\n"
+                "  body { font-family: sans-serif; padding: 48px;"
+                " background: #ffffff; }\n"
+                "  .card { width: 240px; height: 120px;"
+                " border-radius: 8px; color: #ffffff;\n"
+                "          font-size: 28px; font-weight: bold;"
+                " line-height: 120px;\n"
+                "          text-align: center;"
+                " margin-bottom: 24px; }\n"
+                "  #card-a { background: #315fd6; }\n"
+                "</style>\n</head>\n<body>\n"
+                "  <div class=\"card\" id=\"card-a\">Alpha</div>\n"
+                "  <p id=\"later\">")
+            page_tail = "</p>\n</body>\n</html>\n"
+            with open(os.path.join(www_dir, "ada.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(page_head + "Phase B shared marker"
+                        + page_tail)
+            with open(os.path.join(www_dir, "bob.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(page_head + "Phase B different marker"
+                        + page_tail)
+            flow_b_text = (
+                "version: 1\n"
+                "name: issue-507-baselines-matrix\n"
+                "description: Temporary phase B flow for issue "
+                "507 - two caller-owned pages share the card-a "
+                "element but differ in later text.\n"
+                "target: ${TARGET_URL}\n"
+                "\n"
+                "matrix:\n"
+                "  - {page: ada}\n"
+                "  - {page: bob}\n"
+                "\n"
+                "setup:\n"
+                "  - name: open the page for this combination\n"
+                "    goto: /${page}.html\n"
+                "\n"
+                "steps:\n"
+                "  - name: card-a saves the shared baseline "
+                "first\n"
+                "    expect:\n"
+                "      - screenshot_matches: {baseline: "
+                "\"baselines/matrix-card-a.png\", selector: "
+                "\"#card-a\", max_diff: 0.02}\n"
+                "\n"
+                "  - name: later text carries the shared marker\n"
+                "    expect:\n"
+                "      - text_contains: {selector: \"#later\", "
+                "text: \"Phase B shared marker\"}\n"
+                "\n"
+                "teardown: []\n"
+                "\n"
+                "artifacts: {screenshot: on-failure, "
+                "ax_snapshot: on-failure, trace: false}\n"
+                "timeouts: {step_ms: 15000, run_ms: 120000}\n"
+                "investigate_on_failure: false\n")
+            flow_b = os.path.join(td_b, "issue-507-matrix.yaml")
+            with open(flow_b, "w", encoding="utf-8") as f:
+                f.write(flow_b_text)
+            baseline_b = os.path.join(
+                td_b, "baselines", "matrix-card-a.png")
+            check("507 baselines-matrix e2e: phase B shared "
+                  "baseline PNG absent before the run",
+                  not os.path.exists(baseline_b), baseline_b)
+            srv_b = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port_b),
+                 "--bind", "127.0.0.1"],
+                cwd=www_dir, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            try:
+                wait_for_http(
+                    f"http://127.0.0.1:{port_b}/ada.html")
+                runs_root_b = os.path.join(td_b, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root_b
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td_b, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port_b}")
+                parsed = cli.build_parser().parse_args(
+                    ["baselines", flow_b,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_b = parsed.fn(parsed)
+                lines_b = buf.getvalue().splitlines()
+                check("507 baselines-matrix e2e: phase B real "
+                      "cmd_baselines exits 1", rc_b == 1, str(rc_b))
+                check("507 baselines-matrix e2e: phase B exact "
+                      "matrix line printed",
+                      "matrix: 1/2 combinations passed" in lines_b,
+                      str(lines_b[-6:]))
+                parents_b = (sorted(os.listdir(runs_root_b))
+                             if os.path.isdir(runs_root_b) else [])
+                parent_b = (os.path.join(runs_root_b, parents_b[0])
+                            if len(parents_b) == 1 else "")
+                matrix_b = (os.path.join(parent_b, "matrix")
+                            if parent_b else "")
+                subdirs_b = (sorted(os.listdir(matrix_b))
+                             if matrix_b
+                             and os.path.isdir(matrix_b) else [])
+                sub0_b = {}
+                sub0_b_json = (os.path.join(
+                    matrix_b, "00-page-ada", "run.json")
+                    if matrix_b else "")
+                if sub0_b_json and os.path.exists(sub0_b_json):
+                    with open(sub0_b_json, encoding="utf-8") as f:
+                        sub0_b = json.load(f)
+                sub1_b = {}
+                sub1_b_json = (os.path.join(
+                    matrix_b, "01-page-bob", "run.json")
+                    if matrix_b else "")
+                if sub1_b_json and os.path.exists(sub1_b_json):
+                    with open(sub1_b_json, encoding="utf-8") as f:
+                        sub1_b = json.load(f)
+                check("507 baselines-matrix e2e: phase B passing "
+                      "combo run.json status passed",
+                      sub0_b.get("status") == "passed",
+                      str(sub0_b.get("status")))
+                check("507 baselines-matrix e2e: phase B failing "
+                      "combo run.json status failed",
+                      sub1_b.get("status") == "failed",
+                      str(sub1_b.get("status")))
+                png_b_exists = os.path.exists(baseline_b)
+                check("507 baselines-matrix e2e: phase B shared "
+                      "baseline PNG still created before the "
+                      "failing text step",
+                      png_b_exists
+                      and os.path.getsize(baseline_b) > 0,
+                      baseline_b)
+                rows_b = ledger.read_all()
+                check("507 baselines-matrix e2e: phase B ledger "
+                      "has exactly one row", len(rows_b) == 1,
+                      str(rows_b))
+                row_b = rows_b[0] if len(rows_b) > 0 else {}
+                outcome_b = {
+                    "exit_code": rc_b,
+                    "matrix_line": next(
+                        (l for l in lines_b
+                         if l.startswith("matrix: ")), None),
+                    "parent_count": len(parents_b),
+                    "subdirs": subdirs_b,
+                    "combo_statuses": [sub0_b.get("status"),
+                                       sub1_b.get("status")],
+                    "report_exists": bool(parent_b)
+                    and os.path.exists(
+                        os.path.join(parent_b, "REPORT.md")),
+                    "png_exists": png_b_exists,
+                    "png_positive": png_b_exists and (
+                        os.path.getsize(baseline_b) > 0),
+                    "ledger_rows": len(rows_b),
+                    "ledger_kind": row_b.get("kind"),
+                    "ledger_status": row_b.get("status"),
+                    "ledger_combinations": row_b.get(
+                        "combinations"),
+                    "ledger_passed": row_b.get("passed")}
+                mismatch_b = baselines_matrix_mismatch(
+                    outcome_b, exp_b)
+                check("507 baselines-matrix e2e: phase B real "
+                      "composition pins the pinned fields exactly",
+                      mismatch_b is None, mismatch_b or "")
+            finally:
+                srv_b.terminate()
+                srv_b.wait()
+        check("507 baselines-matrix e2e: phase B port free "
+              "after cleanup", port_free(port_b),
+              f"port {port_b} still answering")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
