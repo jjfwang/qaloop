@@ -29638,6 +29638,296 @@ def test_issue_499_worker_notify_terminal_e2e():
           "cleanup", port_free(notify_port))
 
 
+def test_issue_501_enqueue_verify_repo_e2e():
+    """Issue #501: pin the CLI enqueue verify-repo
+    composition end to end. SPEC.md (Enqueue section)
+    documents that for --kind verify-repo the --payload
+    JSON is the whole job payload (e.g. {"repo": "ac"});
+    --flow and --target are verify-flow only and are
+    never applied. SPEC.md (Worker section) documents
+    that a verify-repo job looks the payload repo up in
+    the repos.yaml presets: an unknown repo fails the
+    job, otherwise the preset env is booted, the preset
+    flows run in order against the booted target, and
+    the job completes done with run_dir naming the last
+    flow run when every flow passes. The enqueue
+    plumbing contract (issue 310) stubs queue.enqueue,
+    the worker verify-repo contract (issue 331)
+    enqueues via the queue API and drives
+    worker.handle_job with _verify_repo stubbed, and
+    the webhook-to-worker e2e (issue 401) creates the
+    row through the webhook Handler and drives
+    worker.run_worker via its API, never cmd_enqueue or
+    cmd_worker - so the real chain, build_parser ->
+    cmd_enqueue --kind verify-repo --payload -> real
+    queue row -> cmd_worker --once (unknown-repo phase)
+    / worker claim loop -> handle_job verify-repo
+    branch -> load_repos_config preset lookup ->
+    boot_repo_env -> a real browser flow run ->
+    complete / record_failure, could rot with every
+    test green. This test stubs NOTHING in that chain:
+    phase A drives one real CLI enqueue and exactly one
+    real CLI worker --once for an unknown repo; phase B
+    enqueues through the real CLI again and lets the
+    real worker.run_worker claim the row with a temp
+    repos.yaml preset (the documented repos_config_path
+    seam, the only seam, because cmd_worker always
+    loads the install-root repos.yaml) whose static env
+    boots on a guarded free port and runs one temp flow
+    by absolute path."""
+    import contextlib
+    import io
+    import socket
+    import subprocess
+
+    import yaml
+
+    from qaloop import cli, queue, worker
+    from qaloop.env import find_free_port
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def verify_repo_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def no_static_server(port):
+        return subprocess.run(
+            ["pgrep", "-f", f"http.server {port}"],
+            capture_output=True).returncode != 0
+
+    exp_probe = {"job_status": "failed", "job_attempts": 1,
+                 "job_note": "worker error: no repo preset "
+                             "for 'ghost-792' (see repos.yaml)",
+                 "run_count": 0, "run_status": "passed"}
+    check("501 enqueue verify-repo e2e: exact "
+          "expectations return no mismatch",
+          verify_repo_mismatch(dict(exp_probe), exp_probe)
+          is None)
+    probe = verify_repo_mismatch(
+        dict(exp_probe, job_status="done"), exp_probe)
+    check("501 enqueue verify-repo e2e: corrupted "
+          "job_status caught, names field",
+          probe is not None
+          and probe.startswith("job_status:"),
+          probe or "")
+    probe = verify_repo_mismatch(
+        dict(exp_probe, job_note="verify-repo -> passed"),
+        exp_probe)
+    check("501 enqueue verify-repo e2e: corrupted note "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("job_note:"),
+          probe or "")
+    probe = verify_repo_mismatch(
+        dict(exp_probe, run_status="failed"), exp_probe)
+    check("501 enqueue verify-repo e2e: corrupted "
+          "run_status caught, names field",
+          probe is not None
+          and probe.startswith("run_status:"),
+          probe or "")
+    if not os.path.exists(exe): check("501 enqueue verify-repo e2e execution skipped (no browser)", True); return
+
+    port = find_free_port()
+    check("501 enqueue verify-repo e2e: booted port not "
+          "already answering", port_free(port),
+          f"port {port} already in use")
+    check("501 enqueue verify-repo e2e: no http.server "
+          "for the port yet", no_static_server(port),
+          f"stale http.server on {port}")
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            os.environ.pop("TARGET_URL", None)
+
+            def enqueue(payload):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_enqueue(
+                        cli.build_parser().parse_args(
+                            ["enqueue", "--kind", "verify-repo",
+                             "--payload", payload]))
+                return rc, buf.getvalue()
+
+            def run_cmd_worker():
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_worker(
+                        cli.build_parser().parse_args(
+                            ["worker", "--once", "--poll", "0.2"]))
+                return rc
+
+            def run_dirs():
+                if not os.path.isdir(runs_root):
+                    return []
+                return sorted(os.listdir(runs_root))
+
+            def run_status(name):
+                with open(os.path.join(runs_root, name,
+                                       "run.json"),
+                          encoding="utf-8") as f:
+                    return json.load(f)["status"]
+
+            def job_row(jid):
+                rows = queue.list_jobs(limit=10)
+                match = [r for r in rows if r["id"] == jid]
+                return match[0] if match else {}
+
+            def payload_of(row):
+                payload = row.get("payload")
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                return payload
+
+            check("501 enqueue verify-repo e2e: payload_of "
+                  "parses a JSON string payload",
+                  payload_of({"payload": '{"repo": "x"}'})
+                  == {"repo": "x"})
+
+            # Phase A: unknown repo, pure CLI. The enqueue
+            # payload is the whole job payload, and the
+            # worker fails the job with the exact
+            # no-preset note and creates no run directory.
+            rc_e, out = enqueue('{"repo": "ghost-792"}')
+            check("501 enqueue verify-repo e2e: phase A "
+                  "enqueue exit 0", rc_e == 0, str(rc_e))
+            rows = queue.list_jobs(limit=10)
+            jid_a = rows[0]["id"] if rows else None
+            check("501 enqueue verify-repo e2e: phase A "
+                  "printed line exact",
+                  out.strip() == f"enqueued job #{jid_a} "
+                  "(verify-repo, max_retries=0)", out)
+            row_a = job_row(jid_a)
+            check("501 enqueue verify-repo e2e: phase A "
+                  "pending row kind and payload exact, no "
+                  "flow or target keys added",
+                  row_a.get("status") == "pending"
+                  and row_a.get("kind") == "verify-repo"
+                  and payload_of(row_a) == {"repo": "ghost-792"},
+                  str(row_a))
+            rc_w = run_cmd_worker()
+            check("501 enqueue verify-repo e2e: phase A "
+                  "worker exit 0", rc_w == 0, str(rc_w))
+            row_a = job_row(jid_a)
+            dirs_a = run_dirs()
+            outcome_a = {
+                "job_status": row_a.get("status"),
+                "job_attempts": row_a.get("attempts"),
+                "job_note": row_a.get("note"),
+                "run_count": len(dirs_a)}
+            exp_a = {
+                "job_status": "failed", "job_attempts": 1,
+                "job_note": "worker error: no repo preset "
+                            "for 'ghost-792' (see repos.yaml)",
+                "run_count": 0}
+            mismatch = verify_repo_mismatch(outcome_a, exp_a)
+            check("501 enqueue verify-repo e2e: phase A "
+                  "job failed with the exact no-preset "
+                  "note and zero run directories",
+                  mismatch is None,
+                  mismatch or str(outcome_a))
+
+            # Phase B: temp preset repo. The enqueue half
+            # goes through the real CLI; the worker half
+            # injects the temp preset through run_worker's
+            # documented repos_config_path seam.
+            with open(os.path.join(td, "page.html"), "w",
+                      encoding="utf-8") as f:
+                f.write("<html><body><div id=out>ready now"
+                        "</div></body></html>")
+            flow_path = os.path.join(td, "probe-flow.yaml")
+            with open(flow_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "name: probe-792\n"
+                    f"target: http://127.0.0.1:{port}/page.html\n"
+                    "steps:\n"
+                    "  - goto: /page.html\n"
+                    "    expect:\n"
+                    "      - text_contains: "
+                    "{selector: \"#out\", "
+                    "text: \"ready now\"}\n"
+                    "investigate_on_failure: false\n")
+            preset = {"workdir": td,
+                      "env": [{"static": {"dir": td,
+                                          "port": port}}],
+                      "flows": [flow_path]}
+            repos_path = os.path.join(td, "repos.yaml")
+            with open(repos_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"repos": {"probe-792": preset}}, f)
+            rc_e, out = enqueue('{"repo": "probe-792"}')
+            check("501 enqueue verify-repo e2e: phase B "
+                  "enqueue exit 0", rc_e == 0, str(rc_e))
+            rows = queue.list_jobs(status="pending", limit=10)
+            jid_b = rows[0]["id"] if rows else None
+            check("501 enqueue verify-repo e2e: phase B "
+                  "printed line exact",
+                  out.strip() == f"enqueued job #{jid_b} "
+                  "(verify-repo, max_retries=0)", out)
+            row_b = job_row(jid_b)
+            check("501 enqueue verify-repo e2e: phase B "
+                  "pending row kind and payload exact",
+                  row_b.get("status") == "pending"
+                  and row_b.get("kind") == "verify-repo"
+                  and payload_of(row_b) == {"repo": "probe-792"},
+                  str(row_b))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                worker.run_worker(
+                    flows_dir=os.path.join(td, "flows"),
+                    runs_root=runs_root, once=True, poll_s=0.2,
+                    executable_path=exe,
+                    repos_config_path=repos_path)
+            row_b = job_row(jid_b)
+            dirs_b = run_dirs()
+            outcome_b = {
+                "job_status": row_b.get("status"),
+                "job_note": row_b.get("note"),
+                "run_count": len(dirs_b),
+                "run_status": (run_status(dirs_b[0])
+                               if dirs_b else None),
+                "job_run_dir_base": os.path.basename(
+                    row_b.get("run_dir") or "")}
+            exp_b = {
+                "job_status": "done",
+                "job_note": "verify-repo -> passed",
+                "run_count": 1,
+                "run_status": "passed",
+                "job_run_dir_base": (dirs_b[0]
+                                     if dirs_b else None)}
+            mismatch = verify_repo_mismatch(outcome_b, exp_b)
+            check("501 enqueue verify-repo e2e: phase B "
+                  "job done, note exact, one passed run "
+                  "directory named by the job run_dir",
+                  mismatch is None,
+                  mismatch or str(outcome_b))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    check("501 enqueue verify-repo e2e: booted port free "
+          "after cleanup", port_free(port))
+    check("501 enqueue verify-repo e2e: no http.server "
+          "remains after cleanup", no_static_server(port),
+          f"http.server still running on {port}")
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
