@@ -165,6 +165,16 @@ def requeue_stale(stale_s: float = 3600) -> int:
         conn.close()
 
 
+def count_pending() -> int:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'pending'").fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
 def list_jobs(status: str | None = None, limit: int = 50) -> list[dict]:
     conn = connect()
     try:

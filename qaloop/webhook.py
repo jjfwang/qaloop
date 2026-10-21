@@ -51,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if urlparse(self.path).path == "/health":
-            self._send(200, {"ok": True, "pending": len(q.list_jobs("pending", 1))})
+            self._send(200, {"ok": True, "pending": q.count_pending()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
