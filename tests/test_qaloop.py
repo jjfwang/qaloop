@@ -32870,6 +32870,275 @@ def test_issue_523_verify_log_contains_boot_failed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_525_baselines_log_contains_boot_failed_e2e():
+    """Issue #525: pin the CLI baselines services LOG_CONTAINS
+    BOOT FAILURE composition end to end. Issue #523 pinned the
+    same composition for cmd_verify, but the baselines verb -
+    the real build_parser -> cmd_baselines entering the
+    services context on flows/demo-services-log-fail.yaml,
+    whose only service (logsvc, python3 demo/log_ready_server.py
+    on port 8941) never prints the waited-for needle
+    LOGREADY-NEVER a needle the fixture never prints, so
+    boot_command raises TimeoutError at the 5s timeout,
+    cli.py printing the exact SERVICE BOOT FAILED line and
+    returning exit 3, the single run dir (named
+    demo-services-log-fail-baselines) holding no files at all
+    (only the empty steps scaffold; no services log, no
+    run.json, no REPORT.md), no ledger row appended, the
+    service env exports removed, the service dead afterwards
+    and no log_ready_server process orphaned - could rot
+    unobserved for the baselines path.
+    This test stubs NOTHING in the baselines/services chain:
+    it drives the real CLI against a temp runs root and
+    ledger and pins the exit code, the printed line by
+    full-string equality, the run dir name and its complete
+    file inventory, the absent ledger row, the removed env
+    export, and teardown as service LIVENESS for the port (an
+    HTTP request must fail afterwards within a bounded poll; a
+    naive bind check fails for about 60s on TIME_WAIT sockets
+    even though the service is gone) plus the absence of an
+    orphaned fixture process."""
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    logsvc_url = "http://127.0.0.1:8941/"
+    expected_line = (
+        "SERVICE BOOT FAILED: TimeoutError: log never contained "
+        "'LOGREADY-NEVER a needle the fixture never prints' "
+        "after 5.0s")
+
+    def baselines_log_contains_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 3, "line_count": 1, "line_ok": True,
+           "run_dir_count": 1, "run_dir_named": True,
+           "run_dir_files": [], "ledger_rows": 0,
+           "env_logsvc_url_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("525 baselines-log-contains-boot-failed e2e: exact "
+          "expectations return no mismatch",
+          baselines_log_contains_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = baselines_log_contains_boot_failed_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("525 baselines-log-contains-boot-failed e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = baselines_log_contains_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("525 baselines-log-contains-boot-failed e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = baselines_log_contains_boot_failed_mismatch(
+        dict(exp, run_dir_files=["services/logsvc.log"]), exp)
+    check("525 baselines-log-contains-boot-failed e2e: corrupted "
+          "run_dir_files caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_files:"), probe or "")
+    probe = baselines_log_contains_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("525 baselines-log-contains-boot-failed e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("525 baselines-log-contains-boot-failed e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("525 baselines-log-contains-boot-failed e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("525 baselines-log-contains-boot-failed e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("525 baselines-log-contains-boot-failed e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("525 baselines-log-contains-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("525 baselines-log-contains-boot-failed e2e: logsvc "
+          "service not live on port 8941 before the run",
+          not service_live(logsvc_url),
+          "port 8941 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_LOGSVC_URL",
+                "QALOOP_SERVICE_LOGSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services-log-fail.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["baselines", flow_path,
+                 "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "real cmd_baselines exits exactly 3",
+                  rc == 3, str(rc))
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "stdout is exactly one line",
+                  len(lines) == 1, str(lines))
+            line = lines[0] if lines else ""
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "line equals the exact SERVICE BOOT FAILED "
+                  "line", line == expected_line, line)
+            line_ok = (line == expected_line)
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "exactly one new run dir created",
+                  len(run_dirs) == 1, str(run_dirs))
+            run_dir_named = bool(run_dirs) and (
+                "demo-services-log-fail-baselines"
+                in run_dirs[0])
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "run dir name carries the -baselines suffix",
+                  run_dir_named, str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            run_dir_files = sorted(
+                os.path.relpath(
+                    os.path.join(dirpath, name),
+                    only_dir).replace(os.sep, "/")
+                for dirpath, _dirnames, filenames in os.walk(
+                    only_dir)
+                for name in filenames) if only_dir else []
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "run dir file inventory is exactly empty",
+                  run_dir_files == [], str(run_dir_files))
+            rows = ledger.read_all()
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "ledger has zero rows", len(rows) == 0,
+                  str(rows))
+            env_logsvc_url_absent = (
+                "QALOOP_SERVICE_LOGSVC_URL" not in os.environ)
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "QALOOP_SERVICE_LOGSVC_URL absent after the "
+                  "run", env_logsvc_url_absent,
+                  str(os.environ.get("QALOOP_SERVICE_LOGSVC_URL")))
+            service_dead = service_dead_settled(logsvc_url)
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "logsvc service dead after the run (bounded "
+                  "liveness poll)", service_dead,
+                  "port 8941 still answering after settle")
+            orphans = None
+            for _ in range(30):
+                time.sleep(0.1)
+                orphans = subprocess.run(
+                    ["pgrep", "-f", "log_ready_server"],
+                    capture_output=True, text=True)
+                if orphans.returncode != 0:
+                    break
+            no_orphan = (orphans is not None
+                         and orphans.returncode == 1
+                         and not orphans.stdout.strip())
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "no orphaned log_ready_server process after "
+                  "the run", no_orphan,
+                  orphans.stdout if orphans else "no pgrep result")
+            outcome = {"exit_code": rc,
+                       "line_count": len(lines),
+                       "line_ok": line_ok,
+                       "run_dir_count": len(run_dirs),
+                       "run_dir_named": run_dir_named,
+                       "run_dir_files": run_dir_files,
+                       "ledger_rows": len(rows),
+                       "env_logsvc_url_absent":
+                           env_logsvc_url_absent,
+                       "service_dead_after": service_dead,
+                       "no_orphan": no_orphan}
+            mismatch = baselines_log_contains_boot_failed_mismatch(
+                outcome, exp)
+            check("525 baselines-log-contains-boot-failed e2e: "
+                  "real composition pins the pinned fields "
+                  "exactly", mismatch is None, mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
