@@ -29797,6 +29797,11 @@ def test_issue_501_enqueue_verify_repo_e2e():
                     payload = json.loads(payload)
                 return payload
 
+            check("501 enqueue verify-repo e2e: payload_of "
+                  "parses a JSON string payload",
+                  payload_of({"payload": '{"repo": "x"}'})
+                  == {"repo": "x"})
+
             # Phase A: unknown repo, pure CLI. The enqueue
             # payload is the whole job payload, and the
             # worker fails the job with the exact
