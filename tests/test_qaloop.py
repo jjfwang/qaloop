@@ -31563,6 +31563,243 @@ def test_issue_513_baselines_boot_failed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_515_verify_services_success_e2e():
+    """Issue #515: pin the CLI verify services SUCCESS
+    composition end to end. Issue #511 pinned the boot-FAILURE
+    twin of this composition for cmd_verify and #513 pinned it
+    for cmd_baselines, but the SUCCESS path - the real
+    build_parser -> cmd_verify booting the real
+    demo/proof_server.py declared by flows/demo-services.yaml,
+    waiting for its health URL, exporting
+    QALOOP_SERVICE_API_URL so the flow target resolves, running
+    the flow against the live service, copying the service log
+    to <run_dir>/services/api.log, writing run.json and
+    REPORT.md, appending exactly one scripted/passed ledger
+    row, and tearing the service down afterwards - was executed
+    only by the #389 untagged corpus, which calls cmd_verify
+    with hand-built SimpleNamespace args, classifies solely
+    from the return code, and discards stdout and every
+    artifact, so the whole chain could rot unobserved.
+    This test stubs NOTHING in the verify/services chain: it
+    drives the real CLI against a temp runs root and ledger and
+    pins the exit code, the single passed run dir, the service
+    log's existence (existence only - the proof server is
+    silent, so the file is legitimately empty), REPORT.md, the
+    ledger row, and teardown as service LIVENESS (an HTTP
+    request to the health URL must fail afterwards within a
+    bounded poll; a naive bind check fails for about 60s on
+    TIME_WAIT sockets even though the service is gone)."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    health_url = "http://127.0.0.1:8933/api/greeting"
+
+    def verify_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live():
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live()
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live()
+        return dead
+
+    exp = {"exit_code": 0, "run_dir_count": 1,
+           "run_status": "passed", "steps_all_passed": True,
+           "service_log": True, "report_md": True,
+           "ledger_rows": 1, "ledger_kind": "scripted",
+           "ledger_status": "passed", "service_dead_after": True}
+    check("515 verify-services-success e2e: exact expectations "
+          "return no mismatch",
+          verify_services_success_mismatch(dict(exp), exp) is None)
+    probe = verify_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("515 verify-services-success e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_services_success_mismatch(
+        dict(exp, run_status="failed"), exp)
+    check("515 verify-services-success e2e: corrupted run_status "
+          "caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = verify_services_success_mismatch(
+        dict(exp, service_log=False), exp)
+    check("515 verify-services-success e2e: corrupted "
+          "service_log caught, names field",
+          probe is not None and probe.startswith("service_log:"),
+          probe or "")
+    probe = verify_services_success_mismatch(
+        dict(exp, ledger_rows=0), exp)
+    check("515 verify-services-success e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    saved_health_url = health_url
+    try:
+        health_url = f"http://127.0.0.1:{probe_port}/ok"
+        check("515 verify-services-success e2e: liveness "
+              "helper sees a 200 server as live",
+              service_live() is True)
+        health_url = f"http://127.0.0.1:{probe_port}/missing"
+        check("515 verify-services-success e2e: liveness "
+              "helper sees a 404 server as live (HTTPError "
+              "still means a server answered)",
+              service_live() is True)
+        health_url = f"http://127.0.0.1:{probe_port}/ok"
+        check("515 verify-services-success e2e: dead-poll "
+              "against a live service returns False",
+              service_dead_settled(timeout_s=0.6) is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("515 verify-services-success e2e: dead-poll "
+              "notices a service dying mid-poll",
+              service_dead_settled(timeout_s=5.0) is True)
+    finally:
+        health_url = saved_health_url
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("515 verify-services-success e2e execution skipped (no browser)", True); return
+
+    check("515 verify-services-success e2e: service not live "
+          "on port 8933 before the run", not service_live(),
+          "port 8933 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_API_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        os.environ.pop("QALOOP_SERVICE_API_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["verify", flow_path, "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            check("515 verify-services-success e2e: real "
+                  "cmd_verify exits exactly 0", rc == 0, str(rc))
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("515 verify-services-success e2e: exactly one "
+                  "new run dir created", len(run_dirs) == 1,
+                  str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            run_json = {}
+            if only_dir:
+                rj_path = os.path.join(only_dir, "run.json")
+                if os.path.isfile(rj_path):
+                    with open(rj_path) as fh:
+                        run_json = json.load(fh)
+            check("515 verify-services-success e2e: run.json "
+                  "status passed",
+                  run_json.get("status") == "passed",
+                  str(run_json.get("status")))
+            steps = run_json.get("steps") or []
+            steps_all_passed = bool(steps) and all(
+                s.get("status") == "passed" for s in steps)
+            check("515 verify-services-success e2e: every step "
+                  "in run.json passed", steps_all_passed,
+                  f"{len(steps)} steps")
+            service_log = bool(only_dir) and os.path.isfile(
+                os.path.join(only_dir, "services", "api.log"))
+            check("515 verify-services-success e2e: "
+                  "services/api.log exists in the run dir",
+                  service_log, only_dir)
+            report_md = bool(only_dir) and os.path.isfile(
+                os.path.join(only_dir, "REPORT.md"))
+            check("515 verify-services-success e2e: REPORT.md "
+                  "present in the run dir", report_md, only_dir)
+            rows = ledger.read_all()
+            check("515 verify-services-success e2e: ledger has "
+                  "exactly one row", len(rows) == 1, str(rows))
+            row = rows[0] if len(rows) == 1 else {}
+            check("515 verify-services-success e2e: ledger row "
+                  "is kind scripted status passed",
+                  row.get("kind") == "scripted"
+                  and row.get("status") == "passed", str(row))
+            dead = service_dead_settled()
+            check("515 verify-services-success e2e: service "
+                  "dead after the run (bounded liveness poll)",
+                  dead, "health URL still answering after settle")
+            outcome = {"exit_code": rc,
+                       "run_dir_count": len(run_dirs),
+                       "run_status": run_json.get("status"),
+                       "steps_all_passed": steps_all_passed,
+                       "service_log": service_log,
+                       "report_md": report_md,
+                       "ledger_rows": len(rows),
+                       "ledger_kind": row.get("kind"),
+                       "ledger_status": row.get("status"),
+                       "service_dead_after": dead}
+            mismatch = verify_services_success_mismatch(
+                outcome, exp)
+            check("515 verify-services-success e2e: real "
+                  "composition pins the pinned fields exactly",
+                  mismatch is None, mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
