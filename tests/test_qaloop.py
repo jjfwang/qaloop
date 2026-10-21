@@ -29280,6 +29280,363 @@ def test_issue_497_investigate_max_actions_e2e():
     check("497 investigate cap e2e: no fake model remains "
           "after cleanup", no_fake_model())
 
+def test_issue_499_worker_notify_terminal_e2e():
+    """Issue #499: pin the worker failure-notification
+    composition end to end. SPEC.md (Failure
+    notifications) documents that when a worker job
+    reaches a terminal failure - the retry budget is
+    exhausted, or the job had max_retries=0 (the enqueue
+    default) so the first failure is terminal - the
+    worker POSTs exactly one failure notification to
+    the URL in QALOOP_NOTIFY_URL, with a JSON body
+    carrying the keys job_id, kind, run_dir and summary,
+    sent as application/json with a 5-second timeout;
+    delivery is best-effort and never raises, and
+    attempts that are requeued stay silent. The existing
+    notify tests (test_worker_failure_notify_webhook,
+    test_worker_exception_notify_webhook and
+    test_worker_notify_failure_is_fail_closed) stub
+    worker._run_one_flow and drive worker.handle_job
+    directly, never cmd_enqueue or cmd_worker - so the
+    real chain, build_parser -> cmd_enqueue ->
+    queue row -> cmd_worker --once claim loop ->
+    handle_job -> record_failure requeue (silent) ->
+    re-claim within the same worker run -> second real
+    browser run -> terminal record_failure ->
+    _notify_failure POST, could rot with every test
+    green. This test stubs NOTHING in that chain: a
+    caller-owned in-process threaded page server serves
+    an always-down page, a second caller-owned threaded
+    server records every notification POST, the flow is
+    written into a temp flows dir with
+    investigate_on_failure false, QALOOP_MODEL_API_KEY
+    is removed, and two real CLI enqueues (one with
+    --max-retries 1, one with the default) are each
+    driven by exactly one real CLI worker --once run."""
+    import contextlib
+    import io
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from qaloop import cli, queue
+    from qaloop.env import find_free_port, wait_for_http
+
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def notify_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    exp_probe = {"enqueue_rc": 0, "worker_rc": 0,
+                 "job_status": "failed", "job_attempts": 2,
+                 "job_note": "verify-flow -> failed",
+                 "job_run_dir_is_none": True,
+                 "run_count": 2,
+                 "run_statuses": ["failed", "failed"],
+                 "notify_count": 1,
+                 "payload_path": "/notify",
+                 "payload_ctype": "application/json",
+                 "payload_job_id": 7,
+                 "payload_kind": "verify-flow",
+                 "payload_run_dir_base": "run-second",
+                 "payload_summary":
+                     "verify-flow -> failed (attempt 2)"}
+    check("499 worker notify e2e: exact expectations "
+          "return no mismatch",
+          notify_mismatch(dict(exp_probe), exp_probe)
+          is None)
+    probe = notify_mismatch(
+        dict(exp_probe, payload_job_id=99), exp_probe)
+    check("499 worker notify e2e: corrupted payload_job_id "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("payload_job_id:"),
+          probe or "")
+    probe = notify_mismatch(
+        dict(exp_probe, payload_run_dir_base="run-first"),
+        exp_probe)
+    check("499 worker notify e2e: corrupted "
+          "payload_run_dir_base caught, names field",
+          probe is not None
+          and probe.startswith("payload_run_dir_base:"),
+          probe or "")
+    probe = notify_mismatch(
+        dict(exp_probe,
+             payload_summary="verify-flow -> failed "
+                             "(attempt 1)"),
+        exp_probe)
+    check("499 worker notify e2e: corrupted payload_summary "
+          "caught, names field",
+          probe is not None
+          and probe.startswith("payload_summary:"),
+          probe or "")
+    if not os.path.exists(exe): check("499 worker notify e2e execution skipped (no browser)", True); return
+
+    received = []
+
+    class PageHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                body = b"ok"
+            elif self.path == "/page.html":
+                body = (b"<html><body><div id=out>still down"
+                        b"</div></body></html>")
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length",
+                             str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class NotifyHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append(
+                (self.path, self.headers.get("Content-Type"),
+                 json.loads(self.rfile.read(n))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    page_port = find_free_port()
+    notify_port = find_free_port()
+    check("499 worker notify e2e: page port not already "
+          "answering", port_free(page_port),
+          f"port {page_port} already in use")
+    check("499 worker notify e2e: notify port not already "
+          "answering", port_free(notify_port),
+          f"port {notify_port} already in use")
+    base = f"http://127.0.0.1:{page_port}"
+    notify_url = f"http://127.0.0.1:{notify_port}/notify"
+    page_srv = ThreadingHTTPServer(("127.0.0.1", page_port),
+                                   PageHandler)
+    notify_srv = ThreadingHTTPServer(
+        ("127.0.0.1", notify_port), NotifyHandler)
+    for srv in (page_srv, notify_srv):
+        threading.Thread(target=srv.serve_forever,
+                         daemon=True).start()
+    saved = dict(os.environ)
+    try:
+        wait_for_http(f"{base}/health")
+        not_found_code = None
+        try:
+            urllib.request.urlopen(f"{base}/no-such-page",
+                                   timeout=5)
+        except urllib.error.HTTPError as e:
+            not_found_code = e.code
+        check("499 worker notify e2e: unknown path returns "
+              "404 from the page handler",
+              not_found_code == 404, str(not_found_code))
+        with tempfile.TemporaryDirectory() as td:
+            flows_dir = os.path.join(td, "flows")
+            os.makedirs(flows_dir)
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            os.environ["QALOOP_NOTIFY_URL"] = notify_url
+            os.environ["TARGET_URL"] = base
+            flow_text = (
+                "version: 1\n"
+                "name: probe-notify-fail\n"
+                "target: ${TARGET_URL}\n"
+                "\n"
+                "steps:\n"
+                "  - name: open the down page\n"
+                "    goto: /page.html\n"
+                "\n"
+                "  - name: page recovered\n"
+                "    timeout_ms: 3000\n"
+                "    expect:\n"
+                "      - text_contains: "
+                "{selector: \"#out\", "
+                "text: \"recovered and ready\"}\n"
+                "\n"
+                "artifacts: {screenshot: on-failure, "
+                "ax_snapshot: on-failure, trace: false}\n"
+                "timeouts: {step_ms: 15000, run_ms: 120000}\n"
+                "investigate_on_failure: false\n")
+            flow_path = os.path.join(flows_dir, "fail.yaml")
+            with open(flow_path, "w", encoding="utf-8") as f:
+                f.write(flow_text)
+
+            def enqueue(extra):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_enqueue(
+                        cli.build_parser().parse_args(
+                            ["enqueue", "--kind", "verify-flow",
+                             "--flow", flow_path,
+                             "--target", base] + extra))
+                return rc
+
+            def run_worker():
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_worker(
+                        cli.build_parser().parse_args(
+                            ["worker", "--once", "--poll", "0.2",
+                             "--flows", flows_dir]))
+                return rc
+
+            def run_dirs():
+                if not os.path.isdir(runs_root):
+                    return []
+                return sorted(os.listdir(runs_root))
+
+            def run_status(name):
+                with open(os.path.join(runs_root, name,
+                                       "run.json"),
+                          encoding="utf-8") as f:
+                    return json.load(f)["status"]
+
+            def job_row(jid):
+                rows = queue.list_jobs(limit=10)
+                match = [r for r in rows if r["id"] == jid]
+                return match[0] if match else {}
+
+            check("499 worker notify e2e: no run dirs "
+                  "before phase A", run_dirs() == [])
+
+            # Phase A: --max-retries 1; the requeued first
+            # attempt stays silent, the terminal second
+            # failure notifies exactly once.
+            rc_e = enqueue(["--max-retries", "1"])
+            check("499 worker notify e2e: phase A enqueue "
+                  "exit 0", rc_e == 0, str(rc_e))
+            rows = queue.list_jobs(limit=10)
+            jid_a = rows[0]["id"] if rows else None
+            rc_w = run_worker()
+            check("499 worker notify e2e: phase A worker "
+                  "exit 0", rc_w == 0, str(rc_w))
+            job_a = job_row(jid_a)
+            dirs_a = run_dirs()
+            payload_a = received[0][2] if received else {}
+            outcome_a = {
+                "enqueue_rc": rc_e,
+                "worker_rc": rc_w,
+                "job_status": job_a.get("status"),
+                "job_attempts": job_a.get("attempts"),
+                "job_note": job_a.get("note"),
+                "job_run_dir_is_none":
+                    job_a.get("run_dir") is None,
+                "run_count": len(dirs_a),
+                "run_statuses": [run_status(d) for d in dirs_a],
+                "notify_count": len(received),
+                "payload_path": (received[0][0]
+                                 if received else None),
+                "payload_ctype": (received[0][1]
+                                  if received else None),
+                "payload_job_id": payload_a.get("job_id"),
+                "payload_kind": payload_a.get("kind"),
+                "payload_run_dir_base": os.path.basename(
+                    payload_a.get("run_dir") or ""),
+                "payload_summary": payload_a.get("summary")}
+            exp_a = {
+                "enqueue_rc": 0, "worker_rc": 0,
+                "job_status": "failed", "job_attempts": 2,
+                "job_note": "verify-flow -> failed",
+                "job_run_dir_is_none": True,
+                "run_count": 2,
+                "run_statuses": ["failed", "failed"],
+                "notify_count": 1,
+                "payload_path": "/notify",
+                "payload_ctype": "application/json",
+                "payload_job_id": jid_a,
+                "payload_kind": "verify-flow",
+                "payload_run_dir_base": (dirs_a[-1]
+                                         if dirs_a else None),
+                "payload_summary":
+                    "verify-flow -> failed (attempt 2)"}
+            mismatch = notify_mismatch(outcome_a, exp_a)
+            check("499 worker notify e2e: phase A requeue "
+                  "silent, terminal failure notifies "
+                  "exactly once with the SPEC payload",
+                  mismatch is None,
+                  mismatch or str(outcome_a))
+
+            # Phase B: default max_retries 0; the first
+            # failure is terminal and notifies once more.
+            rc_e = enqueue([])
+            check("499 worker notify e2e: phase B enqueue "
+                  "exit 0", rc_e == 0, str(rc_e))
+            rows = queue.list_jobs(limit=10)
+            jid_b = max(r["id"] for r in rows) if rows else None
+            before = run_dirs()
+            rc_w = run_worker()
+            check("499 worker notify e2e: phase B worker "
+                  "exit 0", rc_w == 0, str(rc_w))
+            job_b = job_row(jid_b)
+            after = run_dirs()
+            new_dirs = [d for d in after if d not in before]
+            payload_b = received[1][2] if len(received) > 1 \
+                else {}
+            outcome_b = {
+                "enqueue_rc": rc_e,
+                "worker_rc": rc_w,
+                "job_status": job_b.get("status"),
+                "job_attempts": job_b.get("attempts"),
+                "job_note": job_b.get("note"),
+                "new_run_count": len(new_dirs),
+                "new_run_status": (run_status(new_dirs[0])
+                                   if new_dirs else None),
+                "notify_count": len(received),
+                "payload_job_id": payload_b.get("job_id"),
+                "payload_kind": payload_b.get("kind"),
+                "payload_summary": payload_b.get("summary")}
+            exp_b = {
+                "enqueue_rc": 0, "worker_rc": 0,
+                "job_status": "failed", "job_attempts": 1,
+                "job_note": "verify-flow -> failed",
+                "new_run_count": 1,
+                "new_run_status": "failed",
+                "notify_count": 2,
+                "payload_job_id": jid_b,
+                "payload_kind": "verify-flow",
+                "payload_summary":
+                    "verify-flow -> failed (attempt 1)"}
+            mismatch = notify_mismatch(outcome_b, exp_b)
+            check("499 worker notify e2e: phase B first "
+                  "failure is terminal and notifies exactly "
+                  "once more",
+                  mismatch is None,
+                  mismatch or str(outcome_b))
+    finally:
+        for srv in (page_srv, notify_srv):
+            srv.shutdown()
+            srv.server_close()
+        os.environ.clear()
+        os.environ.update(saved)
+    check("499 worker notify e2e: page port free after "
+          "cleanup", port_free(page_port))
+    check("499 worker notify e2e: notify port free after "
+          "cleanup", port_free(notify_port))
+
 
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
