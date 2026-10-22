@@ -35587,6 +35587,404 @@ def test_issue_537_batch_services_success_e2e():
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
+
+def test_issue_539_verify_env_services_success_e2e():
+    """Issue #539: pin the CLI verify services ENV
+    SUCCESS composition end to end. Issue #533 pinned the
+    port SUCCESS form and #529 pinned the log_contains
+    SUCCESS twin, but the env SUCCESS path - the real
+    build_parser -> cmd_verify booting the real
+    demo/env_echo_server.py declared by
+    flows/demo-services-env.yaml, whose content is driven
+    entirely by QALOOP_DEMO_ENV_TOKEN (the parent shell
+    never sets it; the only source is the flow env: block
+    merged by qaloop/env.py boot_command), waiting on the
+    http check http://127.0.0.1:8943/api/env-status,
+    exporting QALOOP_SERVICE_ENVSVC_URL so the flow target
+    resolves to http://127.0.0.1:8943/, running the flow
+    against the live service (3/4 steps, the fourth being
+    the continue_on_fail negative control that must FAIL
+    naming the observed content while the run still
+    passes), copying the service log to
+    <run_dir>/services/envsvc.log, writing run.json and
+    REPORT.md, appending exactly one scripted/passed ledger
+    row for demo-services-env, removing the service env
+    exports, and tearing the service down afterwards - was
+    not pinned at CLI level, so the whole chain could rot
+    unobserved.
+    This test stubs NOTHING in the verify/services chain: it
+    drives the real CLI against a temp runs root and ledger
+    and pins the exit code, the stdout PASS, target and
+    report lines, the single passed run dir's complete file
+    inventory, run.json's four step entries, the service
+    log's exact ready line, the ledger row, the removed env
+    exports, and teardown as service LIVENESS (an HTTP
+    request to the service URL must fail afterwards within a
+    bounded poll; a naive bind check fails for about 60s on
+    TIME_WAIT sockets even though the service is gone) plus
+    the absence of an orphaned fixture process."""
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    envsvc_url = "http://127.0.0.1:8943/"
+    expected_files = ["REPORT.md", "junit.xml", "network.jsonl",
+                      "run.json", "services/envsvc.log",
+                      "steps/steps-02-ax.txt", "steps/steps-02.png"]
+    expected_error = (
+        "text_contains: want 'ENVSVC-WRONG never rendered' in "
+        "'env-declared token is envsvc-declared-7f3a'")
+    expected_log_line = "envsvc: port 8943 open, token is envsvc-declared-7f3a"
+
+    def verify_env_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "pass_line_ok": True,
+           "target_line_ok": True,
+           "report_line_ok": True, "run_dir_count": 1,
+           "run_dir_files": expected_files,
+           "run_status": "passed", "step_count": 4,
+           "step_phases": ["setup", "steps", "steps", "steps"],
+           "step_indexes": [0, 0, 1, 2],
+           "step_statuses": ["passed", "passed", "passed",
+                             "failed"],
+           "step3_error": expected_error,
+           "service_log": True, "ledger_rows": 1,
+           "ledger_kind": "scripted",
+           "ledger_flow": "demo-services-env",
+           "ledger_status": "passed",
+           "env_envsvc_url_absent": True,
+           "env_envsvc_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("539 verify-env-services-success e2e: exact "
+          "expectations return no mismatch",
+          verify_env_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_env_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("539 verify-env-services-success e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_env_services_success_mismatch(
+        dict(exp, run_status="failed"), exp)
+    check("539 verify-env-services-success e2e: "
+          "corrupted run_status caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = verify_env_services_success_mismatch(
+        dict(exp, service_log=False), exp)
+    check("539 verify-env-services-success e2e: "
+          "corrupted service_log caught, names field",
+          probe is not None and probe.startswith("service_log:"),
+          probe or "")
+    probe = verify_env_services_success_mismatch(
+        dict(exp, ledger_rows=0), exp)
+    check("539 verify-env-services-success e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("539 verify-env-services-success e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("539 verify-env-services-success e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("539 verify-env-services-success e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("539 verify-env-services-success e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("539 verify-env-services-success e2e execution skipped (no browser)", True); return
+
+    check("539 verify-env-services-success e2e: "
+          "QALOOP_DEMO_ENV_TOKEN absent from the parent "
+          "environment before the run (only source is the "
+          "flow env: block)",
+          "QALOOP_DEMO_ENV_TOKEN" not in os.environ,
+          str(os.environ.get("QALOOP_DEMO_ENV_TOKEN")))
+    check("539 verify-env-services-success e2e: "
+          "envsvc service not live on port 8943 before the run",
+          not service_live(envsvc_url),
+          "port 8943 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_DEMO_ENV_TOKEN",
+                "QALOOP_SERVICE_ENVSVC_URL",
+                "QALOOP_SERVICE_ENVSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        os.environ.pop("QALOOP_DEMO_ENV_TOKEN", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services-env.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["verify", flow_path, "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("539 verify-env-services-success "
+                  "e2e: real cmd_verify exits exactly 0",
+                  rc == 0, str(rc))
+            pass_lines = [l for l in lines
+                          if l.startswith(
+                              "[PASS] demo-services-env")]
+            pass_line_ok = (len(pass_lines) == 1
+                            and "3/4 steps" in pass_lines[0])
+            check("539 verify-env-services-success "
+                  "e2e: stdout holds the [PASS] "
+                  "demo-services-env line with 3/4 steps",
+                  pass_line_ok, str(lines))
+            target_line_ok = (
+                "target:  http://127.0.0.1:8943/" in lines)
+            check("539 verify-env-services-success "
+                  "e2e: stdout holds the exact target line "
+                  "for the env service URL", target_line_ok,
+                  str(lines))
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("539 verify-env-services-success "
+                  "e2e: exactly one new run dir created",
+                  len(run_dirs) == 1, str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            expected_report_line = (
+                "report: " + os.path.join(only_dir, "REPORT.md")
+                if only_dir else "")
+            report_line_ok = (bool(expected_report_line)
+                              and expected_report_line in lines)
+            check("539 verify-env-services-success "
+                  "e2e: stdout report line names the single "
+                  "run dir's REPORT.md", report_line_ok,
+                  str(lines))
+            run_dir_files = sorted(
+                os.path.relpath(
+                    os.path.join(dirpath, name),
+                    only_dir).replace(os.sep, "/")
+                for dirpath, _dirnames, filenames in os.walk(
+                    only_dir)
+                for name in filenames) if only_dir else []
+            check("539 verify-env-services-success "
+                  "e2e: run dir file inventory is exactly "
+                  "REPORT.md, junit.xml, network.jsonl, "
+                  "run.json, services/envsvc.log and the "
+                  "negative control's step artifacts",
+                  run_dir_files == expected_files,
+                  str(run_dir_files))
+            rj_path = (os.path.join(only_dir, "run.json")
+                       if only_dir else "")
+            run_json = (json.load(open(
+                rj_path, encoding="utf-8"))
+                if rj_path and os.path.isfile(rj_path) else {})
+            check("539 verify-env-services-success "
+                  "e2e: run.json status passed",
+                  run_json.get("status") == "passed",
+                  str(run_json.get("status")))
+            steps = run_json.get("steps") or []
+            check("539 verify-env-services-success "
+                  "e2e: run.json holds exactly 4 step entries",
+                  len(steps) == 4, str(len(steps)))
+            step0 = steps[0] if len(steps) > 0 else {}
+            check("539 verify-env-services-success "
+                  "e2e: entry 0 is the setup goto step, passed",
+                  step0.get("phase") == "setup"
+                  and step0.get("index") == 0
+                  and step0.get("op") == "goto"
+                  and step0.get("status") == "passed",
+                  str(step0))
+            step1 = steps[1] if len(steps) > 1 else {}
+            check("539 verify-env-services-success "
+                  "e2e: entry 1 is steps index 0, passed",
+                  step1.get("phase") == "steps"
+                  and step1.get("index") == 0
+                  and step1.get("status") == "passed",
+                  str(step1))
+            step2 = steps[2] if len(steps) > 2 else {}
+            check("539 verify-env-services-success "
+                  "e2e: entry 2 is steps index 1, passed",
+                  step2.get("phase") == "steps"
+                  and step2.get("index") == 1
+                  and step2.get("status") == "passed",
+                  str(step2))
+            step3 = steps[3] if len(steps) > 3 else {}
+            check("539 verify-env-services-success "
+                  "e2e: entry 3 is steps index 2, the negative "
+                  "control, failed with the exact error",
+                  step3.get("phase") == "steps"
+                  and step3.get("index") == 2
+                  and step3.get("status") == "failed"
+                  and step3.get("error") == expected_error,
+                  str(step3))
+            log_path = (os.path.join(
+                only_dir, "services", "envsvc.log")
+                if only_dir else "")
+            log_content = (open(
+                log_path, encoding="utf-8").read()
+                if log_path and os.path.isfile(log_path) else "")
+            service_log = (expected_log_line
+                           in log_content.splitlines())
+            check("539 verify-env-services-success "
+                  "e2e: services/envsvc.log contains the exact "
+                  "ready line", service_log, log_content[:200])
+            rows = ledger.read_all()
+            check("539 verify-env-services-success "
+                  "e2e: ledger has exactly one row",
+                  len(rows) == 1, str(rows))
+            row = rows[0] if len(rows) == 1 else {}
+            check("539 verify-env-services-success "
+                  "e2e: ledger row is kind scripted, flow "
+                  "demo-services-env, status passed",
+                  row.get("kind") == "scripted"
+                  and row.get("flow") == "demo-services-env"
+                  and row.get("status") == "passed", str(row))
+            env_envsvc_url_absent = (
+                "QALOOP_SERVICE_ENVSVC_URL" not in os.environ)
+            check("539 verify-env-services-success "
+                  "e2e: QALOOP_SERVICE_ENVSVC_URL absent after "
+                  "the run", env_envsvc_url_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_ENVSVC_URL")))
+            env_envsvc_port_absent = (
+                "QALOOP_SERVICE_ENVSVC_PORT" not in os.environ)
+            check("539 verify-env-services-success "
+                  "e2e: QALOOP_SERVICE_ENVSVC_PORT absent "
+                  "after the run", env_envsvc_port_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_ENVSVC_PORT")))
+            service_dead = service_dead_settled(envsvc_url)
+            check("539 verify-env-services-success "
+                  "e2e: envsvc service dead after the run "
+                  "(bounded liveness poll)", service_dead,
+                  "port 8943 still answering after settle")
+            orphans = None
+            for _ in range(30):
+                time.sleep(0.1)
+                orphans = subprocess.run(
+                    ["pgrep", "-f", "env_echo_server"],
+                    capture_output=True, text=True)
+            no_orphan = (orphans is not None
+                         and orphans.returncode == 1
+                         and not orphans.stdout.strip())
+            check("539 verify-env-services-success "
+                  "e2e: no orphaned env_echo_server process "
+                  "after the run", no_orphan,
+                  orphans.stdout if orphans else "no pgrep result")
+            outcome = {"exit_code": rc,
+                       "pass_line_ok": pass_line_ok,
+                       "target_line_ok": target_line_ok,
+                       "report_line_ok": report_line_ok,
+                       "run_dir_count": len(run_dirs),
+                       "run_dir_files": run_dir_files,
+                       "run_status": run_json.get("status"),
+                       "step_count": len(steps),
+                       "step_phases": [s.get("phase")
+                                       for s in steps],
+                       "step_indexes": [s.get("index")
+                                        for s in steps],
+                       "step_statuses": [s.get("status")
+                                         for s in steps],
+                       "step3_error": step3.get("error"),
+                       "service_log": service_log,
+                       "ledger_rows": len(rows),
+                       "ledger_kind": row.get("kind"),
+                       "ledger_flow": row.get("flow"),
+                       "ledger_status": row.get("status"),
+                       "env_envsvc_url_absent":
+                           env_envsvc_url_absent,
+                       "env_envsvc_port_absent":
+                           env_envsvc_port_absent,
+                       "service_dead_after": service_dead,
+                       "no_orphan": no_orphan}
+            mismatch = (
+                verify_env_services_success_mismatch(
+                    outcome, exp))
+            check("539 verify-env-services-success "
+                  "e2e: real composition pins the pinned "
+                  "fields exactly", mismatch is None,
+                  mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
