@@ -34703,6 +34703,383 @@ def test_issue_533_verify_port_services_success_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_535_baselines_port_services_success_e2e():
+    """Issue #535: pin the CLI baselines services PORT
+    SUCCESS composition end to end. Issue #533 pinned the
+    port SUCCESS form for cmd_verify and explicitly left
+    the cmd_baselines twin out of scope, #531 pinned the
+    baselines log_contains SUCCESS composition and #517
+    pinned the http-form baselines SUCCESS, but the
+    baselines port SUCCESS path - the real
+    build_parser -> cmd_baselines ->
+    _flow_services_info -> _service_ctx -> flow_services ->
+    env.boot_command wait_for_port finding TCP port 8942
+    after the fixture's ~1.5s bind delay -> the derived
+    URL http://127.0.0.1:8942/ resolving the flow target
+    with QALOOP_SERVICE_PORTSVC_URL/_PORT exports ->
+    run_flow in baseline-update mode against the live
+    port-gated service (3/4 steps, the fourth being the
+    continue_on_fail negative control that must FAIL
+    naming the observed content while the run still
+    passes) -> services/portsvc.log copied -> run.json
+    written (and, per the baselines contract, NO
+    REPORT.md, NO junit.xml, NO network.jsonl and NO
+    ledger row) -> teardown with no orphan - was not
+    pinned at CLI level: the #385 smoke corpus calls only
+    cmd_verify with hand-built SimpleNamespace args,
+    classifies solely from the outcome status, and discards
+    stdout and every artifact, so the whole chain could rot
+    unobserved.
+    This test stubs NOTHING in the baselines/services chain:
+    it drives the real CLI against a temp runs root and
+    ledger and pins the exit code, the baseline update mode
+    line, the stdout PASS line, the single passed run dir
+    (named with the -baselines infix) and its complete file
+    inventory, run.json's four step entries, the service
+    log's exact open line, the empty ledger, the removed
+    env exports, and teardown as service LIVENESS (an HTTP
+    request to the service URL must fail afterwards within
+    a bounded poll; a naive bind check fails for about 60s
+    on TIME_WAIT sockets even though the service is gone)
+    plus the absence of an orphaned fixture process."""
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    portsvc_url = "http://127.0.0.1:8942/"
+    expected_files = ["run.json", "services/portsvc.log",
+                      "steps/steps-02-ax.txt", "steps/steps-02.png"]
+    expected_error = (
+        "text_contains: want 'PORTSVC-WRONG never rendered' in "
+        "'port-gated service answered'")
+    expected_log_line = "portsvc: port 8942 open"
+
+    def baselines_port_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "update_mode_line": True,
+           "pass_line_ok": True, "run_dir_count": 1,
+           "run_dir_named": True,
+           "run_dir_files": expected_files,
+           "run_status": "passed", "step_count": 4,
+           "step_phases": ["setup", "steps", "steps", "steps"],
+           "step_indexes": [0, 0, 1, 2],
+           "step_statuses": ["passed", "passed", "passed",
+                             "failed"],
+           "step3_error": expected_error,
+           "service_log": True, "ledger_rows": 0,
+           "env_portsvc_url_absent": True,
+           "env_portsvc_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("535 baselines-port-services-success e2e: exact "
+          "expectations return no mismatch",
+          baselines_port_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = baselines_port_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("535 baselines-port-services-success e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = baselines_port_services_success_mismatch(
+        dict(exp, run_status="failed"), exp)
+    check("535 baselines-port-services-success e2e: "
+          "corrupted run_status caught, names field",
+          probe is not None and probe.startswith("run_status:"),
+          probe or "")
+    probe = baselines_port_services_success_mismatch(
+        dict(exp, service_log=False), exp)
+    check("535 baselines-port-services-success e2e: "
+          "corrupted service_log caught, names field",
+          probe is not None and probe.startswith("service_log:"),
+          probe or "")
+    probe = baselines_port_services_success_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("535 baselines-port-services-success e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("535 baselines-port-services-success e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("535 baselines-port-services-success e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("535 baselines-port-services-success e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("535 baselines-port-services-success e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("535 baselines-port-services-success e2e execution skipped (no browser)", True); return
+
+    check("535 baselines-port-services-success e2e: "
+          "portsvc service not live on port 8942 before the run",
+          not service_live(portsvc_url),
+          "port 8942 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_PORTSVC_URL",
+                "QALOOP_SERVICE_PORTSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services-port.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["baselines", flow_path, "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("535 baselines-port-services-success "
+                  "e2e: real cmd_baselines exits exactly 0",
+                  rc == 0, str(rc))
+            pass_lines = [l for l in lines
+                          if l.startswith(
+                              "[PASS] demo-services-port")]
+            pass_line_ok = (len(pass_lines) == 1
+                            and "3/4 steps" in pass_lines[0])
+            check("535 baselines-port-services-success "
+                  "e2e: stdout holds the [PASS] "
+                  "demo-services-port line with 3/4 steps",
+                  pass_line_ok, str(lines))
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("535 baselines-port-services-success "
+                  "e2e: exactly one new run dir created",
+                  len(run_dirs) == 1, str(run_dirs))
+            run_dir_named = bool(run_dirs) and (
+                "-baselines" in run_dirs[0])
+            check("535 baselines-port-services-success "
+                  "e2e: run dir name carries the -baselines "
+                  "infix", run_dir_named, str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            update_mode_line = (
+                "baseline update mode" in buf.getvalue())
+            check("535 baselines-port-services-success "
+                  "e2e: stdout carries the baseline update "
+                  "mode line", update_mode_line,
+                  buf.getvalue())
+            run_dir_files = sorted(
+                os.path.relpath(
+                    os.path.join(dirpath, name),
+                    only_dir).replace(os.sep, "/")
+                for dirpath, _dirnames, filenames in os.walk(
+                    only_dir)
+                for name in filenames) if only_dir else []
+            check("535 baselines-port-services-success "
+                  "e2e: run dir file inventory is exactly "
+                  "run.json, services/portsvc.log and the "
+                  "negative control's step artifacts (no "
+                  "REPORT.md, junit.xml or network.jsonl - "
+                  "baselines writes none of them)",
+                  run_dir_files == expected_files,
+                  str(run_dir_files))
+            rj_path = (os.path.join(only_dir, "run.json")
+                       if only_dir else "")
+            run_json = (json.load(open(
+                rj_path, encoding="utf-8"))
+                if rj_path and os.path.isfile(rj_path) else {})
+            check("535 baselines-port-services-success "
+                  "e2e: run.json status passed",
+                  run_json.get("status") == "passed",
+                  str(run_json.get("status")))
+            steps = run_json.get("steps") or []
+            check("535 baselines-port-services-success "
+                  "e2e: run.json holds exactly 4 step entries",
+                  len(steps) == 4, str(len(steps)))
+            step0 = steps[0] if len(steps) > 0 else {}
+            check("535 baselines-port-services-success "
+                  "e2e: entry 0 is the setup goto step, passed",
+                  step0.get("phase") == "setup"
+                  and step0.get("index") == 0
+                  and step0.get("op") == "goto"
+                  and step0.get("status") == "passed",
+                  str(step0))
+            step1 = steps[1] if len(steps) > 1 else {}
+            check("535 baselines-port-services-success "
+                  "e2e: entry 1 is steps index 0, passed",
+                  step1.get("phase") == "steps"
+                  and step1.get("index") == 0
+                  and step1.get("status") == "passed",
+                  str(step1))
+            step2 = steps[2] if len(steps) > 2 else {}
+            check("535 baselines-port-services-success "
+                  "e2e: entry 2 is steps index 1, passed",
+                  step2.get("phase") == "steps"
+                  and step2.get("index") == 1
+                  and step2.get("status") == "passed",
+                  str(step2))
+            step3 = steps[3] if len(steps) > 3 else {}
+            check("535 baselines-port-services-success "
+                  "e2e: entry 3 is steps index 2, the negative "
+                  "control, failed with the exact error",
+                  step3.get("phase") == "steps"
+                  and step3.get("index") == 2
+                  and step3.get("status") == "failed"
+                  and step3.get("error") == expected_error,
+                  str(step3))
+            log_path = (os.path.join(
+                only_dir, "services", "portsvc.log")
+                if only_dir else "")
+            log_content = (open(
+                log_path, encoding="utf-8").read()
+                if log_path and os.path.isfile(log_path) else "")
+            service_log = (expected_log_line
+                           in log_content.splitlines())
+            check("535 baselines-port-services-success "
+                  "e2e: services/portsvc.log contains the exact "
+                  "ready line", service_log, log_content[:200])
+            rows = ledger.read_all()
+            check("535 baselines-port-services-success "
+                  "e2e: ledger has zero rows (baselines "
+                  "appends no ledger row)", len(rows) == 0,
+                  str(rows))
+            env_portsvc_url_absent = (
+                "QALOOP_SERVICE_PORTSVC_URL" not in os.environ)
+            check("535 baselines-port-services-success "
+                  "e2e: QALOOP_SERVICE_PORTSVC_URL absent after "
+                  "the run", env_portsvc_url_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_PORTSVC_URL")))
+            env_portsvc_port_absent = (
+                "QALOOP_SERVICE_PORTSVC_PORT" not in os.environ)
+            check("535 baselines-port-services-success "
+                  "e2e: QALOOP_SERVICE_PORTSVC_PORT absent "
+                  "after the run", env_portsvc_port_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_PORTSVC_PORT")))
+            service_dead = service_dead_settled(portsvc_url)
+            check("535 baselines-port-services-success "
+                  "e2e: portsvc service dead after the run "
+                  "(bounded liveness poll)", service_dead,
+                  "port 8942 still answering after settle")
+            orphans = None
+            for _ in range(30):
+                time.sleep(0.1)
+                orphans = subprocess.run(
+                    ["pgrep", "-f", "port_ready_server"],
+                    capture_output=True, text=True)
+            no_orphan = (orphans is not None
+                         and orphans.returncode == 1
+                         and not orphans.stdout.strip())
+            check("535 baselines-port-services-success "
+                  "e2e: no orphaned port_ready_server process "
+                  "after the run", no_orphan,
+                  orphans.stdout if orphans else "no pgrep result")
+            outcome = {"exit_code": rc,
+                       "update_mode_line": update_mode_line,
+                       "pass_line_ok": pass_line_ok,
+                       "run_dir_count": len(run_dirs),
+                       "run_dir_named": run_dir_named,
+                       "run_dir_files": run_dir_files,
+                       "run_status": run_json.get("status"),
+                       "step_count": len(steps),
+                       "step_phases": [s.get("phase")
+                                       for s in steps],
+                       "step_indexes": [s.get("index")
+                                        for s in steps],
+                       "step_statuses": [s.get("status")
+                                         for s in steps],
+                       "step3_error": step3.get("error"),
+                       "service_log": service_log,
+                       "ledger_rows": len(rows),
+                       "env_portsvc_url_absent":
+                           env_portsvc_url_absent,
+                       "env_portsvc_port_absent":
+                           env_portsvc_port_absent,
+                       "service_dead_after": service_dead,
+                       "no_orphan": no_orphan}
+            mismatch = (
+                baselines_port_services_success_mismatch(
+                    outcome, exp))
+            check("535 baselines-port-services-success "
+                  "e2e: real composition pins the pinned "
+                  "fields exactly", mismatch is None,
+                  mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
