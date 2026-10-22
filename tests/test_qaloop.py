@@ -35080,6 +35080,513 @@ def test_issue_535_baselines_port_services_success_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+
+def test_issue_537_batch_services_success_e2e():
+    """Issue #537: pin the CLI batch verify services SUCCESS
+    composition end to end. The batch coverage pins the
+    directory dispatch and the services coverage pins
+    single-flow success, and #527 pinned the batch boot
+    FAILURE resilience twin, but the batch all-pass
+    composition itself - the real build_parser ->
+    cmd_verify on a directory -> _cmd_verify_batch ->
+    _batch_run_one entering the services context on copies
+    of flows/demo-services-log.yaml and
+    flows/demo-services.yaml in filename order (log first),
+    booting the real demo/log_ready_server.py gated on its
+    LOGREADY-186 log line and the real
+    demo/proof_server.py gated on its http health check,
+    both flows passing (3/4 with the continue_on_fail
+    negative control failed inside the log flow, 5/5 for the
+    api flow), each appending exactly one ledger row, the
+    parent batch REPORT.md and batch.json written by the
+    real write_batch_summary showing 2/2 PASS, both per-flow
+    subdirs holding exactly their REPORT.md, junit.xml,
+    network.jsonl, run.json and service logs (plus the log
+    flow's negative-control step artifacts), the service env
+    exports removed, and both services dead afterwards with
+    no orphaned fixture process - could rot unobserved.
+    This test stubs NOTHING in the batch/services chain: it
+    drives the real CLI against a temp runs root and ledger
+    and pins the exit code, the printed flows and batch
+    lines, the parent report and batch.json by exact fields,
+    both per-flow file inventories, both run.json statuses,
+    the logsvc service log's ready needle, the two ledger
+    rows, the removed env exports, and teardown as service
+    LIVENESS for both ports (an HTTP request must fail
+    afterwards within a bounded poll; a naive bind check
+    fails for about 60s on TIME_WAIT sockets even though the
+    service is gone). The batch dir is staged one level below
+    the repo root so the copied flows' service cwd ".."
+    resolves to the repo root, exactly as in flows/."""
+    import shutil
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    greeting_url = "http://127.0.0.1:8933/api/greeting"
+    logsvc_url = "http://127.0.0.1:8941/"
+    expected_log_files = ["REPORT.md", "junit.xml",
+                          "network.jsonl", "run.json",
+                          "services/logsvc.log",
+                          "steps/steps-02-ax.txt",
+                          "steps/steps-02.png"]
+    expected_api_files = ["REPORT.md", "junit.xml",
+                          "network.jsonl", "run.json",
+                          "services/api.log"]
+
+    def batch_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "flows_line_ok": True,
+           "batch_line_ok": True, "parent_count": 1,
+           "parent_named_batch": True,
+           "report_first_line": "# qaloop batch report [2/2 PASS]",
+           "table_row_0": "| 0 | "
+           "`demo-services-log.yaml` | PASS | 3/4 | "
+           "[demo-services-log](flows/demo-services-log/REPORT.md) |",
+           "table_row_1": "| 1 | `demo-services.yaml` | PASS | "
+           "5/5 | [demo-services](flows/demo-services/REPORT.md) |",
+           "batch_len": 2,
+           "batch0_file": "demo-services-log.yaml",
+           "batch0_status": "passed", "batch0_steps_passed": 3,
+           "batch0_steps_total": 4,
+           "batch0_report": "flows/demo-services-log/REPORT.md",
+           "batch0_error": None,
+           "batch1_file": "demo-services.yaml",
+           "batch1_status": "passed", "batch1_steps_passed": 5,
+           "batch1_steps_total": 5,
+           "batch1_report": "flows/demo-services/REPORT.md",
+           "batch1_error": None,
+           "log_files": expected_log_files,
+           "api_files": expected_api_files,
+           "log_status": "passed", "api_status": "passed",
+           "logsvc_log_ok": True, "ledger_rows": 2,
+           "ledger_kinds": ["scripted", "scripted"],
+           "ledger_flows_sorted": ["demo-services",
+                                   "demo-services-log"],
+           "ledger_statuses": ["passed", "passed"],
+           "env_api_url_absent": True,
+           "env_logsvc_url_absent": True,
+           "api_dead_after": True, "logsvc_dead_after": True,
+           "no_orphan_proof": True, "no_orphan_log": True}
+    check("537 batch-services-success e2e: exact "
+          "expectations return no mismatch",
+          batch_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = batch_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("537 batch-services-success e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = batch_services_success_mismatch(
+        dict(exp, batch0_status="failed"), exp)
+    check("537 batch-services-success e2e: corrupted "
+          "batch0_status caught, names field",
+          probe is not None
+          and probe.startswith("batch0_status:"), probe or "")
+    probe = batch_services_success_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("537 batch-services-success e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("537 batch-services-success e2e: liveness "
+              "helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("537 batch-services-success e2e: liveness "
+              "helper sees a 404 server as live (HTTPError "
+              "still means a server answered)",
+              service_live(probe_missing) is True)
+        check("537 batch-services-success e2e: dead-poll "
+              "against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("537 batch-services-success e2e: dead-poll "
+              "notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("537 batch-services-success e2e execution skipped (no browser)", True); return
+
+    check("537 batch-services-success e2e: api service not "
+          "live on port 8933 before the run",
+          not service_live(greeting_url),
+          "port 8933 already serving")
+    check("537 batch-services-success e2e: logsvc service "
+          "not live on port 8941 before the run",
+          not service_live(logsvc_url),
+          "port 8941 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_API_URL",
+                "QALOOP_SERVICE_API_PORT",
+                "QALOOP_SERVICE_LOGSVC_URL",
+                "QALOOP_SERVICE_LOGSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        batch_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                for name in ("demo-services.yaml",
+                             "demo-services-log.yaml"):
+                    shutil.copyfile(
+                        os.path.join(root, "flows", name),
+                        os.path.join(batch_dir, name))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", batch_dir,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("537 batch-services-success e2e: "
+                      "real cmd_verify on a directory exits "
+                      "exactly 0", rc == 0, str(rc))
+                flows_line_ok = "flows: 2" in lines
+                check("537 batch-services-success e2e: "
+                      "stdout carries the flows: 2 line",
+                      flows_line_ok, str(lines))
+                batch_line_ok = (
+                    "batch: 2/2 flows passed" in lines)
+                check("537 batch-services-success e2e: "
+                      "stdout carries the batch: 2/2 flows "
+                      "passed line", batch_line_ok, str(lines))
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                check("537 batch-services-success e2e: "
+                      "exactly one parent run dir created",
+                      len(parents) == 1, str(parents))
+                parent_named_batch = bool(parents) and (
+                    "-batch" in parents[0])
+                check("537 batch-services-success e2e: "
+                      "parent run dir name carries the -batch "
+                      "infix", parent_named_batch, str(parents))
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                report_lines = (
+                    open(report_path, encoding="utf-8").read(
+                        ).splitlines() if report_path else [])
+                check("537 batch-services-success e2e: "
+                      "parent REPORT.md first line is the "
+                      "2/2 PASS batch header",
+                      bool(report_lines) and report_lines[0]
+                      == "# qaloop batch report [2/2 PASS]",
+                      str(report_lines[:1]))
+                table_row_0 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 0 |")), None)
+                check("537 batch-services-success e2e: "
+                      "parent REPORT.md row 0 is the exact "
+                      "passed log-flow row",
+                      table_row_0 == exp["table_row_0"],
+                      str(table_row_0))
+                table_row_1 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 1 |")), None)
+                check("537 batch-services-success e2e: "
+                      "parent REPORT.md row 1 is the exact "
+                      "passed api-flow row",
+                      table_row_1 == exp["table_row_1"],
+                      str(table_row_1))
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                batch = (json.load(open(
+                    batch_path, encoding="utf-8"))
+                    if batch_path else [])
+                check("537 batch-services-success e2e: "
+                      "batch.json holds exactly two entries",
+                      len(batch) == 2, str(batch))
+                batch0 = batch[0] if len(batch) > 0 else {}
+                batch1 = batch[1] if len(batch) > 1 else {}
+                check("537 batch-services-success e2e: "
+                      "batch entry 0 is the passed log flow "
+                      "with its report link and no error",
+                      batch0.get("file")
+                      == "demo-services-log.yaml"
+                      and batch0.get("status") == "passed"
+                      and batch0.get("steps_passed") == 3
+                      and batch0.get("steps_total") == 4
+                      and batch0.get("report")
+                      == "flows/demo-services-log/REPORT.md"
+                      and batch0.get("error") is None,
+                      str(batch0))
+                check("537 batch-services-success e2e: "
+                      "batch entry 1 is the passed api flow "
+                      "with its report link and no error",
+                      batch1.get("file") == "demo-services.yaml"
+                      and batch1.get("status") == "passed"
+                      and batch1.get("steps_passed") == 5
+                      and batch1.get("steps_total") == 5
+                      and batch1.get("report")
+                      == "flows/demo-services/REPORT.md"
+                      and batch1.get("error") is None,
+                      str(batch1))
+                log_dir = (os.path.join(
+                    parent, "flows", "demo-services-log")
+                    if parent else "")
+                log_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        log_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        log_dir)
+                    for name in filenames) if log_dir else []
+                check("537 batch-services-success e2e: "
+                      "log-flow subdir holds exactly REPORT.md, "
+                      "junit.xml, network.jsonl, run.json, "
+                      "services/logsvc.log and the negative "
+                      "control's step artifacts",
+                      log_files == expected_log_files,
+                      str(log_files))
+                api_dir = (os.path.join(
+                    parent, "flows", "demo-services")
+                    if parent else "")
+                api_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        api_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        api_dir)
+                    for name in filenames) if api_dir else []
+                check("537 batch-services-success e2e: "
+                      "api-flow subdir holds exactly REPORT.md, "
+                      "junit.xml, network.jsonl, run.json and "
+                      "services/api.log",
+                      api_files == expected_api_files,
+                      str(api_files))
+                log_json = (os.path.join(log_dir, "run.json")
+                            if log_dir else "")
+                log_data = (json.load(open(
+                    log_json, encoding="utf-8"))
+                    if log_json else {})
+                check("537 batch-services-success e2e: "
+                      "log-flow subdir run.json status passed",
+                      log_data.get("status") == "passed",
+                      str(log_data.get("status")))
+                api_json = (os.path.join(api_dir, "run.json")
+                            if api_dir else "")
+                api_data = (json.load(open(
+                    api_json, encoding="utf-8"))
+                    if api_json else {})
+                check("537 batch-services-success e2e: "
+                      "api-flow subdir run.json status passed",
+                      api_data.get("status") == "passed",
+                      str(api_data.get("status")))
+                logsvc_log_path = (os.path.join(
+                    log_dir, "services", "logsvc.log")
+                    if log_dir else "")
+                logsvc_log = (open(
+                    logsvc_log_path, encoding="utf-8").read()
+                    if logsvc_log_path
+                    and os.path.isfile(logsvc_log_path) else "")
+                logsvc_log_ok = "LOGREADY-186" in logsvc_log
+                check("537 batch-services-success e2e: "
+                      "services/logsvc.log contains the "
+                      "LOGREADY-186 ready needle",
+                      logsvc_log_ok, logsvc_log[:200])
+                rows = ledger.read_all()
+                check("537 batch-services-success e2e: "
+                      "ledger has exactly two rows",
+                      len(rows) == 2, str(rows))
+                check("537 batch-services-success e2e: "
+                      "ledger rows are both scripted passed "
+                      "runs for demo-services-log and "
+                      "demo-services",
+                      [r.get("kind") for r in rows]
+                      == ["scripted", "scripted"]
+                      and sorted(r.get("flow") for r in rows)
+                      == ["demo-services", "demo-services-log"]
+                      and [r.get("status") for r in rows]
+                      == ["passed", "passed"],
+                      str(rows))
+                env_api_url_absent = (
+                    "QALOOP_SERVICE_API_URL" not in os.environ)
+                check("537 batch-services-success e2e: "
+                      "QALOOP_SERVICE_API_URL absent after "
+                      "the run", env_api_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_API_URL")))
+                env_logsvc_url_absent = (
+                    "QALOOP_SERVICE_LOGSVC_URL"
+                    not in os.environ)
+                check("537 batch-services-success e2e: "
+                      "QALOOP_SERVICE_LOGSVC_URL absent after "
+                      "the run", env_logsvc_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_LOGSVC_URL")))
+                api_dead = service_dead_settled(greeting_url)
+                check("537 batch-services-success e2e: "
+                      "api service dead after the run (bounded "
+                      "liveness poll)", api_dead,
+                      "port 8933 still answering after settle")
+                logsvc_dead = service_dead_settled(logsvc_url)
+                check("537 batch-services-success e2e: "
+                      "logsvc service dead after the run "
+                      "(bounded liveness poll)", logsvc_dead,
+                      "port 8941 still answering after settle")
+                orphans = None
+                for _ in range(30):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "proof_server"],
+                        capture_output=True, text=True)
+                no_orphan_proof = (orphans is not None
+                                   and orphans.returncode == 1
+                                   and not orphans.stdout.strip())
+                check("537 batch-services-success e2e: "
+                      "no orphaned proof_server process after "
+                      "the run", no_orphan_proof,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                orphans = None
+                for _ in range(30):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "log_ready_server"],
+                        capture_output=True, text=True)
+                no_orphan_log = (orphans is not None
+                                 and orphans.returncode == 1
+                                 and not orphans.stdout.strip())
+                check("537 batch-services-success e2e: "
+                      "no orphaned log_ready_server process "
+                      "after the run", no_orphan_log,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "flows_line_ok": flows_line_ok,
+                           "batch_line_ok": batch_line_ok,
+                           "parent_count": len(parents),
+                           "parent_named_batch":
+                               parent_named_batch,
+                           "report_first_line": (
+                               report_lines[0]
+                               if report_lines else None),
+                           "table_row_0": table_row_0,
+                           "table_row_1": table_row_1,
+                           "batch_len": len(batch),
+                           "batch0_file": batch0.get("file"),
+                           "batch0_status": batch0.get("status"),
+                           "batch0_steps_passed": batch0.get(
+                               "steps_passed"),
+                           "batch0_steps_total": batch0.get(
+                               "steps_total"),
+                           "batch0_report": batch0.get("report"),
+                           "batch0_error": batch0.get("error"),
+                           "batch1_file": batch1.get("file"),
+                           "batch1_status": batch1.get("status"),
+                           "batch1_steps_passed": batch1.get(
+                               "steps_passed"),
+                           "batch1_steps_total": batch1.get(
+                               "steps_total"),
+                           "batch1_report": batch1.get("report"),
+                           "batch1_error": batch1.get("error"),
+                           "log_files": log_files,
+                           "api_files": api_files,
+                           "log_status": log_data.get("status"),
+                           "api_status": api_data.get("status"),
+                           "logsvc_log_ok": logsvc_log_ok,
+                           "ledger_rows": len(rows),
+                           "ledger_kinds":
+                               [r.get("kind") for r in rows],
+                           "ledger_flows_sorted": sorted(
+                               r.get("flow") for r in rows),
+                           "ledger_statuses":
+                               [r.get("status") for r in rows],
+                           "env_api_url_absent":
+                               env_api_url_absent,
+                           "env_logsvc_url_absent":
+                               env_logsvc_url_absent,
+                           "api_dead_after": api_dead,
+                           "logsvc_dead_after": logsvc_dead,
+                           "no_orphan_proof": no_orphan_proof,
+                           "no_orphan_log": no_orphan_log}
+                mismatch = batch_services_success_mismatch(
+                    outcome, exp)
+                check("537 batch-services-success e2e: "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
