@@ -37751,6 +37751,443 @@ investigate_on_failure: false
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
+
+def test_issue_549_baselines_matrix_services_success_e2e():
+    """Issue #549: pin the CLI baselines matrix + services
+    SUCCESS composition end to end (the baselines twin of
+    #547). The baselines pins so far use non-matrix flows
+    or matrix flows with no services block, so the
+    composition of the two - SPEC lists both the matrix:
+    and services: keys with no prohibition on combining
+    them, and cmd_baselines boots services in the parent
+    run dir (named with the -baselines infix) before its
+    matrix branch prints the baseline update mode line
+    and dispatches to _cmd_verify_matrix with
+    baseline_update=True - was not pinned at CLI level:
+    the real build_parser -> cmd_baselines booting the
+    real demo/proof_server.py declared by the staged
+    flow, waiting for its health URL, exporting
+    QALOOP_SERVICE_API_URL so the flow target resolves
+    to http://127.0.0.1:8933/, dispatching the real
+    _cmd_verify_matrix over the two user combinations
+    ada and bob (each running the flow against the live
+    service, in baseline-update mode), the parent
+    REPORT.md written by the real write_matrix_summary,
+    the per-combination run.json records, services/api.log
+    copied into the parent run dir, exactly one
+    scripted-matrix/passed ledger row with combinations
+    2 and passed 2, the service env exports removed, and
+    the service torn down afterwards could rot unobserved.
+    This test stubs NOTHING in the baselines, matrix or
+    services chain: it stages the flow one level below
+    the repo root (so the service cwd ".." resolves to
+    the repo root, exactly as in flows/), drives the
+    real CLI against a temp runs root and ledger and
+    pins the exit code, the printed baseline update mode
+    and matrix lines, the single parent run dir's name
+    and complete file inventory, the combination subdirs
+    and their run.json statuses, the service log's
+    presence, the ledger row, the removed env exports,
+    and teardown as service LIVENESS (an HTTP request to
+    the health URL must fail afterwards within a bounded
+    poll; a naive bind check fails for about 60s on
+    TIME_WAIT sockets even though the service is gone)
+    plus the absence of an orphaned fixture process."""
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    health_url = "http://127.0.0.1:8933/api/greeting"
+    flow_text = """version: 1
+name: probe-baselines-matrix-services
+description: probe combining matrix and services
+services:
+  - name: api
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/greeting"}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_API_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+  - name: fill the signup name as the matrix user
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email
+    fill: {target: "#email", text: "${user}@example.com"}
+
+  - name: submit and see the real confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+    expected_files = ["REPORT.md",
+                      "matrix/00-user-ada/REPORT.md",
+                      "matrix/00-user-ada/junit.xml",
+                      "matrix/00-user-ada/network.jsonl",
+                      "matrix/00-user-ada/run.json",
+                      "matrix/01-user-bob/REPORT.md",
+                      "matrix/01-user-bob/junit.xml",
+                      "matrix/01-user-bob/network.jsonl",
+                      "matrix/01-user-bob/run.json",
+                      "services/api.log"]
+
+    def baselines_matrix_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "baseline_line": True,
+           "matrix_line": True,
+           "run_dir_count": 1, "run_dir_named": True,
+           "parent_files": expected_files,
+           "combo_dirs": ["00-user-ada", "01-user-bob"],
+           "combo0_status": "passed",
+           "combo1_status": "passed", "service_log": True,
+           "ledger_rows": 1, "ledger_kind": "scripted-matrix",
+           "ledger_flow": "probe-baselines-matrix-services",
+           "ledger_status": "passed", "ledger_combinations": 2,
+           "ledger_passed": 2, "ledger_cost": 0.0,
+           "env_api_url_absent": True,
+           "env_api_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("549 baselines-matrix-services-success e2e: exact "
+          "expectations return no mismatch",
+          baselines_matrix_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = baselines_matrix_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("549 baselines-matrix-services-success e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = baselines_matrix_services_success_mismatch(
+        dict(exp, ledger_kind="scripted"), exp)
+    check("549 baselines-matrix-services-success e2e: "
+          "corrupted ledger_kind caught, names field",
+          probe is not None
+          and probe.startswith("ledger_kind:"), probe or "")
+    probe = baselines_matrix_services_success_mismatch(
+        dict(exp, ledger_passed=1), exp)
+    check("549 baselines-matrix-services-success e2e: "
+          "corrupted ledger_passed caught, names field",
+          probe is not None
+          and probe.startswith("ledger_passed:"), probe or "")
+    probe = baselines_matrix_services_success_mismatch(
+        dict(exp, combo0_status="failed"), exp)
+    check("549 baselines-matrix-services-success e2e: "
+          "corrupted combo0_status caught, names field",
+          probe is not None
+          and probe.startswith("combo0_status:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("549 baselines-matrix-services-success e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("549 baselines-matrix-services-success e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("549 baselines-matrix-services-success e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("549 baselines-matrix-services-success e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("549 baselines-matrix-services-success e2e execution skipped (no browser)", True); return
+
+    check("549 baselines-matrix-services-success e2e: "
+          "service not live on port 8933 before the run",
+          not service_live(health_url),
+          "port 8933 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_API_URL",
+                "QALOOP_SERVICE_API_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        os.environ.pop("QALOOP_SERVICE_API_URL", None)
+        os.environ.pop("QALOOP_SERVICE_API_PORT", None)
+        stage_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                staged_flow = os.path.join(
+                    stage_dir, "probe-baselines-matrix-services.yaml")
+                with open(staged_flow, "w",
+                          encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["baselines", staged_flow,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                out = buf.getvalue()
+                check("549 baselines-matrix-services-success "
+                      "e2e: real cmd_baselines exits exactly 0",
+                      rc == 0, str(rc))
+                baseline_line = (
+                    "baseline update mode \u2014 screenshots "
+                    "saved, not compared" in out)
+                check("549 baselines-matrix-services-success "
+                      "e2e: stdout carries the baseline update "
+                      "mode line", baseline_line,
+                      out[-500:])
+                matrix_line = (
+                    "matrix: 2/2 combinations passed" in out)
+                check("549 baselines-matrix-services-success "
+                      "e2e: stdout carries the matrix: 2/2 "
+                      "combinations passed line", matrix_line,
+                      out[-500:])
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                check("549 baselines-matrix-services-success "
+                      "e2e: exactly one parent run dir created",
+                      len(run_dirs) == 1, str(run_dirs))
+                run_dir_named = bool(run_dirs) and (
+                    "-baselines" in run_dirs[0])
+                check("549 baselines-matrix-services-success "
+                      "e2e: run dir name carries the "
+                      "-baselines infix",
+                      run_dir_named, str(run_dirs))
+                parent = (os.path.join(runs_root, run_dirs[0])
+                          if len(run_dirs) == 1 else "")
+                parent_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        parent).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        parent)
+                    for name in filenames) if parent else []
+                check("549 baselines-matrix-services-success "
+                      "e2e: parent run dir file inventory is "
+                      "exactly the parent REPORT.md, both "
+                      "combinations' REPORT.md, junit.xml, "
+                      "network.jsonl and run.json, and "
+                      "services/api.log",
+                      parent_files == expected_files,
+                      str(parent_files))
+                matrix_dir = (os.path.join(parent, "matrix")
+                              if parent else "")
+                combo_dirs = (sorted(os.listdir(matrix_dir))
+                              if os.path.isdir(matrix_dir)
+                              else [])
+                check("549 baselines-matrix-services-success "
+                      "e2e: matrix subdir holds exactly the "
+                      "ada and bob combination dirs",
+                      combo_dirs == ["00-user-ada",
+                                     "01-user-bob"],
+                      str(combo_dirs))
+                combo0_json = {}
+                combo0_path = (os.path.join(
+                    matrix_dir, "00-user-ada", "run.json")
+                    if matrix_dir else "")
+                if combo0_path and os.path.isfile(combo0_path):
+                    with open(combo0_path,
+                              encoding="utf-8") as fh:
+                        combo0_json = json.load(fh)
+                check("549 baselines-matrix-services-success "
+                      "e2e: combination 00-user-ada run.json "
+                      "status passed",
+                      combo0_json.get("status") == "passed",
+                      str(combo0_json.get("status")))
+                combo1_json = {}
+                combo1_path = (os.path.join(
+                    matrix_dir, "01-user-bob", "run.json")
+                    if matrix_dir else "")
+                if combo1_path and os.path.isfile(combo1_path):
+                    with open(combo1_path,
+                              encoding="utf-8") as fh:
+                        combo1_json = json.load(fh)
+                check("549 baselines-matrix-services-success "
+                      "e2e: combination 01-user-bob run.json "
+                      "status passed",
+                      combo1_json.get("status") == "passed",
+                      str(combo1_json.get("status")))
+                service_log = "services/api.log" in parent_files
+                check("549 baselines-matrix-services-success "
+                      "e2e: services/api.log present in the "
+                      "parent run dir", service_log,
+                      str(parent_files))
+                rows = ledger.read_all()
+                check("549 baselines-matrix-services-success "
+                      "e2e: ledger has exactly one row",
+                      len(rows) == 1, str(rows))
+                row = rows[0] if len(rows) == 1 else {}
+                check("549 baselines-matrix-services-success "
+                      "e2e: ledger row is kind "
+                      "scripted-matrix, flow "
+                      "probe-baselines-matrix-services, status passed, "
+                      "combinations 2, passed 2, cost 0.0",
+                      row.get("kind") == "scripted-matrix"
+                      and row.get("flow")
+                      == "probe-baselines-matrix-services"
+                      and row.get("status") == "passed"
+                      and row.get("combinations") == 2
+                      and row.get("passed") == 2
+                      and row.get("cost_usd_est") == 0.0,
+                      str(row))
+                env_api_url_absent = (
+                    "QALOOP_SERVICE_API_URL" not in os.environ)
+                check("549 baselines-matrix-services-success "
+                      "e2e: QALOOP_SERVICE_API_URL absent "
+                      "after the run", env_api_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_API_URL")))
+                env_api_port_absent = (
+                    "QALOOP_SERVICE_API_PORT" not in os.environ)
+                check("549 baselines-matrix-services-success "
+                      "e2e: QALOOP_SERVICE_API_PORT absent "
+                      "after the run", env_api_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_API_PORT")))
+                service_dead = service_dead_settled(health_url)
+                check("549 baselines-matrix-services-success "
+                      "e2e: service dead after the run "
+                      "(bounded liveness poll)", service_dead,
+                      "health URL still answering after settle")
+                orphans = None
+                for _ in range(30):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "proof_server"],
+                        capture_output=True, text=True)
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("549 baselines-matrix-services-success "
+                      "e2e: no orphaned fixture process after "
+                      "the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "baseline_line": baseline_line,
+                           "matrix_line": matrix_line,
+                           "run_dir_count": len(run_dirs),
+                           "run_dir_named": run_dir_named,
+                           "parent_files": parent_files,
+                           "combo_dirs": combo_dirs,
+                           "combo0_status":
+                               combo0_json.get("status"),
+                           "combo1_status":
+                               combo1_json.get("status"),
+                           "service_log": service_log,
+                           "ledger_rows": len(rows),
+                           "ledger_kind": row.get("kind"),
+                           "ledger_flow": row.get("flow"),
+                           "ledger_status": row.get("status"),
+                           "ledger_combinations":
+                               row.get("combinations"),
+                           "ledger_passed": row.get("passed"),
+                           "ledger_cost": row.get("cost_usd_est"),
+                           "env_api_url_absent":
+                               env_api_url_absent,
+                           "env_api_port_absent":
+                               env_api_port_absent,
+                           "service_dead_after": service_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    baselines_matrix_services_success_mismatch(
+                        outcome, exp))
+                check("549 baselines-matrix-services-success "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
