@@ -41353,6 +41353,591 @@ investigate_on_failure: false
 
 
 
+
+def test_issue_565_batch_matrix_services_partial_boot_failed_e2e():
+    """Issue #565: pin the CLI batch verify MATRIX + SERVICES
+    PARTIAL BOOT FAILED composition end to end (the last
+    unpinned matrix+partial cell). The matrix+partial
+    composition is pinned for verify (#561) and baselines
+    (#563), the batch partial-boot pin (#559) uses
+    non-matrix flows, and the batch matrix+services BOOT
+    FAILED pin (#557) uses a single-service flow that never
+    boots anything - but no dedicated test drove the real
+    build_parser -> cmd_verify in batch mode on a batch dir
+    holding exactly one flow carrying BOTH matrix: and the
+    demo-services-partial-fail services block. In code,
+    cmd_verify on a directory dispatches to
+    _cmd_verify_batch, whose _batch_run_one boots the
+    flow's services context inside the per-flow subdir; the
+    first service (a plain http.server on port 8946) boots
+    fine while the second waits on a health path the proof
+    server answers 404 forever, so wait_for_http raises
+    TimeoutError at the 5s timeout; the partial boot
+    failure is recorded as that flow's error, the batch
+    completes with exit 1, the already-booted first service
+    is stopped yet its log is still copied into the
+    per-flow subdir as services/first.log - with no matrix
+    dispatch ever occurring. This test stubs NOTHING in
+    the batch, matrix or services chain: it stages a batch
+    dir via mkdtemp at the repo root (so the service cwd
+    ".." resolves to the repo root, exactly as in flows/)
+    holding exactly one flow combining the
+    demo-services-partial-fail services block verbatim
+    with a two-combination user matrix (ada/bob) and the
+    #557 setup+steps body, drives the real build_parser ->
+    cmd_verify in batch mode against a temp runs root and
+    ledger, and pins exit exactly 1, the batch run dir
+    line, flows: 1, exactly one bracketed SERVICE BOOT
+    FAILED line by full-string equality naming the health
+    URL, batch: 0/1 flows passed, the report line, the
+    parent run dir name carrying the -batch- infix with
+    entries exactly [REPORT.md, batch.json, flows, steps],
+    the parent REPORT.md first line and failed row,
+    batch.json as a bare list with the one failed entry
+    (file, status, steps 0/0, report None, error exactly
+    the SERVICE BOOT FAILED string), the per-flow subdir
+    entries exactly [services, steps] with files exactly
+    [services/first.log] (the deliberate contrast with
+    #557, whose never-booted flow per-flow subdir holds
+    only the empty steps scaffold and no files), zero
+    ledger rows, the four service env exports removed,
+    ports 8946 and 8933 free before the run and HTTP-dead
+    afterwards via bounded polls, and no orphaned fixture
+    process."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    health_url = "http://127.0.0.1:8933/api/no-such-health"
+    first_url = "http://127.0.0.1:8946/"
+    second_url = "http://127.0.0.1:8933/"
+    flow_name = "probe-batch-matrix-services-partial-bootfail"
+    expected_error = (
+        "SERVICE BOOT FAILED: TimeoutError: "
+        "http://127.0.0.1:8933/api/no-such-health not ready "
+        "after 5.0s (last: HTTP Error 404: File not found)")
+    expected_boot_line = (
+        f"[{flow_name}] " + expected_error)
+    flow_text = """version: 1
+name: probe-batch-matrix-services-partial-bootfail
+description: probe combining batch, matrix and partial-boot-failing services
+services:
+  - name: first
+    command: "python3 -m http.server 8946 --bind 127.0.0.1"
+    cwd: ".."
+    wait: {port: 8946}
+    timeout_s: 15
+  - name: second
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/no-such-health"}
+    timeout_s: 5
+    url: "http://127.0.0.1:8933/"
+target: ${QALOOP_SERVICE_FIRST_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+  - name: fill the signup name as the matrix user
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email
+    fill: {target: "#email", text: "${user}@example.com"}
+
+  - name: submit and see the real confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+
+    def batch_matrix_services_partial_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_free(port):
+        sock = socket.socket()
+        free = sock.connect_ex(("127.0.0.1", port)) != 0
+        sock.close()
+        return free
+
+    def port_free_settled(port, timeout_s=5.0):
+        deadline = time.time() + timeout_s
+        free = False
+        while not free and time.time() < deadline:
+            time.sleep(0.2)
+            free = port_free(port)
+        return free
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 1, "batch_line_ok": True,
+           "flows_line_ok": True,
+           "boot_line_count": 1, "line_ok": True,
+           "report_line_ok": True,
+           "parent_count": 1, "parent_named_batch": True,
+           "parent_entries": ["REPORT.md", "batch.json",
+                              "flows", "steps"],
+           "report_first_line":
+               "# qaloop batch report [0/1 PASS]",
+           "table_row_0":
+               "| 0 | `probe-batch-matrix-services-partial-bootfail.yaml` "
+               "| FAIL | 0/0 | \u2014 |",
+           "batch_len": 1,
+           "batch_file":
+               "probe-batch-matrix-services-partial-bootfail.yaml",
+           "batch_status": "failed",
+           "batch_steps_passed": 0, "batch_steps_total": 0,
+           "batch_report": None,
+           "batch_error": expected_error,
+           "flow_entries": ["services", "steps"],
+           "flow_files": ["services/first.log"],
+           "no_matrix_subdir": True,
+           "ledger_rows": 0,
+           "env_first_url_absent": True,
+           "env_first_port_absent": True,
+           "env_second_url_absent": True,
+           "env_second_port_absent": True,
+           "first_dead_after": True,
+           "second_dead_after": True, "no_orphan": True}
+    check("565 batch-matrix-services-partial-boot-failed e2e: exact "
+          "expectations return no mismatch",
+          batch_matrix_services_partial_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, exit_code=3), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted boot line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, parent_entries=["REPORT.md"]), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted parent entries caught, names field",
+          probe is not None
+          and probe.startswith("parent_entries:"),
+          probe or "")
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, flow_files=[]), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted per-flow files caught, names field",
+          probe is not None
+          and probe.startswith("flow_files:"), probe or "")
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, batch_status="passed"), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted batch_status caught, names field",
+          probe is not None
+          and probe.startswith("batch_status:"), probe or "")
+    probe = batch_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("565 batch-matrix-services-partial-boot-failed e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("565 batch-matrix-services-partial-boot-failed e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("565 batch-matrix-services-partial-boot-failed e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("565 batch-matrix-services-partial-boot-failed e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("565 batch-matrix-services-partial-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "first service not live on port 8946 before the run",
+          not service_live(first_url),
+          "port 8946 already serving")
+    check("565 batch-matrix-services-partial-boot-failed e2e: "
+          "second service not live on port 8933 before the run",
+          not service_live(second_url),
+          "port 8933 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_FIRST_URL",
+                "QALOOP_SERVICE_FIRST_PORT",
+                "QALOOP_SERVICE_SECOND_URL",
+                "QALOOP_SERVICE_SECOND_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        batch_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                with open(os.path.join(
+                        batch_dir, flow_name + ".yaml"),
+                        "w", encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", batch_dir,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: real cmd_verify on a directory "
+                      "exits exactly 1", rc == 1, str(rc))
+                batch_line_ok = bool(
+                    [l for l in lines
+                     if l.startswith("batch run dir: ")])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: stdout carries the batch run dir "
+                      "line", batch_line_ok, str(lines))
+                flows_line_ok = "flows: 1" in lines
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: stdout carries the flows: 1 line",
+                      flows_line_ok, str(lines))
+                boot_lines = [l for l in lines
+                              if "SERVICE BOOT FAILED" in l]
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: stdout holds exactly one SERVICE "
+                      "BOOT FAILED line",
+                      len(boot_lines) == 1, str(boot_lines))
+                boot_line = boot_lines[0] if boot_lines else ""
+                line_ok = boot_line == expected_boot_line
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: boot line equals the exact "
+                      "prefixed SERVICE BOOT FAILED line",
+                      line_ok, boot_line)
+                batch_report_ok = (
+                    "batch: 0/1 flows passed" in lines)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: stdout carries the batch: 0/1 "
+                      "flows passed line", batch_report_ok,
+                      str(lines))
+                report_line_ok = bool(
+                    [l for l in lines
+                     if l.startswith("report: ")
+                     and l.rstrip().endswith("REPORT.md")])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: stdout carries the report line",
+                      report_line_ok, str(lines))
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: exactly one parent run dir created",
+                      len(parents) == 1, str(parents))
+                parent_named_batch = bool(parents) and (
+                    "-batch" in parents[0])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: parent run dir name carries the "
+                      "-batch infix", parent_named_batch,
+                      str(parents))
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                parent_entries = (sorted(os.listdir(parent))
+                                  if parent else [])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: parent entries are exactly "
+                      "REPORT.md, batch.json, flows, steps",
+                      parent_entries
+                      == ["REPORT.md", "batch.json",
+                          "flows", "steps"],
+                      str(parent_entries))
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                report_lines = (
+                    open(report_path, encoding="utf-8").read(
+                        ).splitlines()
+                    if report_path
+                    and os.path.isfile(report_path) else [])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: parent REPORT.md first line is "
+                      "the 0/1 PASS batch header",
+                      bool(report_lines) and report_lines[0]
+                      == "# qaloop batch report [0/1 PASS]",
+                      str(report_lines[:1]))
+                table_row_0 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 0 |")), None)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: parent REPORT.md row 0 is the "
+                      "exact boot-failed row",
+                      table_row_0 == exp["table_row_0"],
+                      str(table_row_0))
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                batch = (json.load(open(
+                    batch_path, encoding="utf-8"))
+                    if batch_path
+                    and os.path.isfile(batch_path) else [])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: batch.json is a bare list holding "
+                      "exactly one entry",
+                      isinstance(batch, list)
+                      and len(batch) == 1, str(batch))
+                batch0 = (batch[0]
+                          if isinstance(batch, list)
+                          and len(batch) > 0 else {})
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: batch entry 0 is the boot-failed "
+                      "matrix flow with the exact error",
+                      batch0.get("file")
+                      == flow_name + ".yaml"
+                      and batch0.get("status") == "failed"
+                      and batch0.get("steps_passed") == 0
+                      and batch0.get("steps_total") == 0
+                      and batch0.get("report") is None
+                      and batch0.get("error") == expected_error,
+                      str(batch0))
+                flow_dir = (os.path.join(
+                    parent, "flows", flow_name)
+                    if parent else "")
+                flow_entries = (sorted(os.listdir(flow_dir))
+                                if os.path.isdir(flow_dir)
+                                else [])
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: per-flow subdir holds exactly the "
+                      "services and steps entries (no matrix "
+                      "dispatch)",
+                      flow_entries == ["services", "steps"],
+                      str(flow_entries))
+                flow_files = []
+                if os.path.isdir(flow_dir):
+                    for dirpath, _dirnames, filenames in os.walk(
+                            flow_dir):
+                        for name in filenames:
+                            flow_files.append(os.path.relpath(
+                                os.path.join(dirpath, name),
+                                flow_dir))
+                    flow_files = sorted(
+                        p.replace(os.sep, "/")
+                        for p in flow_files)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: per-flow subdir file inventory is "
+                      "exactly the booted first service log",
+                      flow_files == ["services/first.log"],
+                      str(flow_files))
+                no_matrix_subdir = not os.path.isdir(
+                    os.path.join(flow_dir, "matrix"))
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: no matrix/ subdir exists in the "
+                      "per-flow dir", no_matrix_subdir,
+                      str(flow_entries))
+                rows = ledger.read_all()
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: ledger has zero rows",
+                      len(rows) == 0, str(rows))
+                env_first_url_absent = (
+                    "QALOOP_SERVICE_FIRST_URL" not in os.environ)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_FIRST_URL absent "
+                      "after the run", env_first_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_FIRST_URL")))
+                env_first_port_absent = (
+                    "QALOOP_SERVICE_FIRST_PORT" not in os.environ)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_FIRST_PORT absent "
+                      "after the run", env_first_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_FIRST_PORT")))
+                env_second_url_absent = (
+                    "QALOOP_SERVICE_SECOND_URL" not in os.environ)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_SECOND_URL absent "
+                      "after the run", env_second_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_SECOND_URL")))
+                env_second_port_absent = (
+                    "QALOOP_SERVICE_SECOND_PORT" not in os.environ)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_SECOND_PORT absent "
+                      "after the run", env_second_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_SECOND_PORT")))
+                first_dead = service_dead_settled(first_url)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: first service HTTP-dead after the "
+                      "run (bounded liveness poll)", first_dead,
+                      "port 8946 still answering after settle")
+                second_dead = service_dead_settled(second_url)
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: second service HTTP-dead after the "
+                      "run (bounded liveness poll)", second_dead,
+                      "port 8933 still answering after settle")
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: port 8946 free after the run "
+                      "(bounded polling)",
+                      port_free_settled(8946),
+                      "port 8946 still bound after settle")
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: port 8933 free after the run "
+                      "(bounded polling)",
+                      port_free_settled(8933),
+                      "port 8933 still bound after settle")
+                orphans = None
+                for _ in range(30):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f",
+                         "http.server 8946|proof_server"],
+                        capture_output=True, text=True)
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: no orphaned fixture process after "
+                      "the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "batch_line_ok": batch_line_ok,
+                           "flows_line_ok": flows_line_ok,
+                           "boot_line_count": len(boot_lines),
+                           "line_ok": line_ok,
+                           "report_line_ok": report_line_ok,
+                           "parent_count": len(parents),
+                           "parent_named_batch":
+                               parent_named_batch,
+                           "parent_entries": parent_entries,
+                           "report_first_line": (
+                               report_lines[0]
+                               if report_lines else None),
+                           "table_row_0": table_row_0,
+                           "batch_len": (
+                               len(batch)
+                               if isinstance(batch, list)
+                               else None),
+                           "batch_file": batch0.get("file"),
+                           "batch_status": batch0.get("status"),
+                           "batch_steps_passed": batch0.get(
+                               "steps_passed"),
+                           "batch_steps_total": batch0.get(
+                               "steps_total"),
+                           "batch_report": batch0.get("report"),
+                           "batch_error": batch0.get("error"),
+                           "flow_entries": flow_entries,
+                           "flow_files": flow_files,
+                           "no_matrix_subdir": no_matrix_subdir,
+                           "ledger_rows": len(rows),
+                           "env_first_url_absent":
+                               env_first_url_absent,
+                           "env_first_port_absent":
+                               env_first_port_absent,
+                           "env_second_url_absent":
+                               env_second_url_absent,
+                           "env_second_port_absent":
+                               env_second_port_absent,
+                           "first_dead_after": first_dead,
+                           "second_dead_after": second_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    batch_matrix_services_partial_boot_failed_mismatch(
+                        outcome, exp))
+                check("565 batch-matrix-services-partial-boot-failed "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
