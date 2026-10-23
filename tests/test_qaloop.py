@@ -42488,6 +42488,367 @@ def test_issue_567_batch_log_contains_boot_failed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_569_verify_matrix_log_contains_boot_failed_e2e():
+    """Issue #569: pin the CLI verify MATRIX + services
+    LOG_CONTAINS BOOT FAILED composition end to end. SPEC.md
+    states services are booted before verify/baselines run
+    and "If a service fails to boot, the run aborts with
+    SERVICE BOOT FAILED and previously booted services are
+    stopped"; execution order step 4 prints "SERVICE BOOT
+    FAILED: <Type>: <message>" and exits 3, and only step 5
+    dispatches a matrix flow - boot strictly precedes matrix
+    dispatch (boot-abort-before-matrix-dispatch), and the
+    exit-code table maps 3 to SERVICE BOOT FAILED. In code,
+    cmd_verify's services-context boot-failure branch
+    (cli.py) prints the line and returns 3 before
+    _cmd_verify_run -> _run_single_flow (matrix dispatch)
+    is ever reached. The gap: #553/#555/#557 pin the matrix
+    + services boot-failure composition only for the http
+    wait form, while #523/#525/#567 pin the log_contains
+    boot failure only for non-matrix flows (verify,
+    baselines, batch) - the verify matrix + log_contains
+    composition itself was not pinned at CLI level.
+    This test stubs NOTHING in the verify, matrix or
+    services chain: it stages a flow one level below the
+    repo root (so the service cwd ".." resolves to the
+    repo root, exactly as in flows/) combining the
+    demo-services-log-fail service block verbatim - its
+    only service (logsvc, python3 demo/log_ready_server.py
+    on port 8941) never prints the waited-for needle
+    LOGREADY-NEVER a needle the fixture never prints, so
+    boot_command raises TimeoutError at the 5s timeout -
+    with a matrix of user [ada, bob] and the #553
+    setup+steps body, drives the real build_parser ->
+    cmd_verify against a temp runs root and ledger, and
+    pins the exit code, the single printed line by
+    full-string equality, the already-created run dir
+    holding no files (only the empty steps/ scaffold
+    that new_run_dir always creates), and no ledger row:
+    run-dir entries exactly ["steps"], zero files, zero
+    ledger rows and the single stdout line together
+    prove no matrix dispatch occurred. It also pins the
+    service env exports removed, the service not live on
+    port 8941 before the run, HTTP-dead after the run via
+    bounded liveness polling, and no orphaned fixture
+    process."""
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    logsvc_url = "http://127.0.0.1:8941/"
+    expected_line = (
+        "SERVICE BOOT FAILED: TimeoutError: log never contained "
+        "'LOGREADY-NEVER a needle the fixture never prints' "
+        "after 5.0s")
+    flow_text = """version: 1
+name: probe-matrix-logsvc-bootfail
+description: probe combining matrix and a log_contains boot-failing service
+services:
+  - name: logsvc
+    command: "python3 demo/log_ready_server.py"
+    cwd: ".."
+    wait: {log_contains: "LOGREADY-NEVER a needle the fixture never prints"}
+    timeout_s: 5
+    url: "http://127.0.0.1:8941/"
+target: ${QALOOP_SERVICE_LOGSVC_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+  - name: fill the signup name as the matrix user
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email
+    fill: {target: "#email", text: "${user}@example.com"}
+
+  - name: submit and see the real confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+
+    def verify_matrix_log_contains_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 3, "line_count": 1, "line_ok": True,
+           "run_dir_count": 1, "run_dir_entries": ["steps"],
+           "run_dir_files": [], "ledger_rows": 0,
+           "env_logsvc_url_absent": True,
+           "env_logsvc_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("569 verify-matrix-log-contains-boot-failed e2e: exact "
+          "expectations return no mismatch",
+          verify_matrix_log_contains_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_matrix_log_contains_boot_failed_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("569 verify-matrix-log-contains-boot-failed e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_matrix_log_contains_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("569 verify-matrix-log-contains-boot-failed e2e: "
+          "corrupted printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_matrix_log_contains_boot_failed_mismatch(
+        dict(exp, run_dir_entries=["steps", "matrix"]), exp)
+    check("569 verify-matrix-log-contains-boot-failed e2e: "
+          "corrupted run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_matrix_log_contains_boot_failed_mismatch(
+        dict(exp, run_dir_files=["services/logsvc.log"]), exp)
+    check("569 verify-matrix-log-contains-boot-failed e2e: "
+          "corrupted run_dir_files caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_files:"), probe or "")
+    probe = verify_matrix_log_contains_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("569 verify-matrix-log-contains-boot-failed e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("569 verify-matrix-log-contains-boot-failed e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("569 verify-matrix-log-contains-boot-failed e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("569 verify-matrix-log-contains-boot-failed e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("569 verify-matrix-log-contains-boot-failed e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("569 verify-matrix-log-contains-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("569 verify-matrix-log-contains-boot-failed e2e: logsvc "
+          "service not live on port 8941 before the run",
+          service_live(logsvc_url) is False,
+          "port 8941 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_LOGSVC_URL",
+                "QALOOP_SERVICE_LOGSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        stage_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                staged_flow = os.path.join(
+                    stage_dir, "probe-matrix-logsvc-bootfail.yaml")
+                with open(staged_flow, "w",
+                          encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", staged_flow,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: real cmd_verify exits exactly 3",
+                      rc == 3, str(rc))
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: line equals the exact SERVICE BOOT "
+                      "FAILED line",
+                      line == expected_line, line)
+                line_ok = (line == expected_line)
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: exactly one new run dir created",
+                      len(run_dirs) == 1, str(run_dirs))
+                only_dir = (os.path.join(runs_root, run_dirs[0])
+                            if len(run_dirs) == 1 else "")
+                entries = (sorted(os.listdir(only_dir))
+                           if only_dir else [])
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: run dir holds only the empty steps "
+                      "scaffold (no matrix dispatch)",
+                      entries == ["steps"], str(entries))
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: run dir holds no matrix entry",
+                      "matrix" not in entries, str(entries))
+                run_dir_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        only_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        only_dir)
+                    for name in filenames) if only_dir else []
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: run dir file inventory is exactly "
+                      "empty",
+                      run_dir_files == [], str(run_dir_files))
+                rows = ledger.read_all()
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: ledger has zero rows",
+                      len(rows) == 0, str(rows))
+                env_logsvc_url_absent = (
+                    "QALOOP_SERVICE_LOGSVC_URL" not in os.environ)
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: QALOOP_SERVICE_LOGSVC_URL absent "
+                      "after the run", env_logsvc_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_LOGSVC_URL")))
+                env_logsvc_port_absent = (
+                    "QALOOP_SERVICE_LOGSVC_PORT" not in os.environ)
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: QALOOP_SERVICE_LOGSVC_PORT absent "
+                      "after the run", env_logsvc_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_LOGSVC_PORT")))
+                service_dead = service_dead_settled(logsvc_url)
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: logsvc service dead after the run "
+                      "(bounded liveness poll)", service_dead,
+                      "port 8941 still answering after settle")
+                orphans = None
+                for _ in range(100):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "log_ready_server"],
+                        capture_output=True, text=True)
+                    if orphans.returncode != 0:
+                        break
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: no orphaned log_ready_server process "
+                      "after the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line_ok,
+                           "run_dir_count": len(run_dirs),
+                           "run_dir_entries": entries,
+                           "run_dir_files": run_dir_files,
+                           "ledger_rows": len(rows),
+                           "env_logsvc_url_absent":
+                               env_logsvc_url_absent,
+                           "env_logsvc_port_absent":
+                               env_logsvc_port_absent,
+                           "service_dead_after": service_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    verify_matrix_log_contains_boot_failed_mismatch(
+                        outcome, exp))
+                check("569 verify-matrix-log-contains-boot-failed "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
