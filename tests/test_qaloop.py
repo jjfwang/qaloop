@@ -46340,6 +46340,625 @@ investigate_on_failure: false
 
 
 
+def test_issue_585_batch_matrix_port_services_success_e2e():
+    """Issue #585: pin the CLI batch verify MATRIX + services
+    PORT SUCCESS composition end to end. This is the last
+    unpinned cell in the matrix + port success series:
+    #533, #535 and #545 pinned the port wait-form SUCCESS
+    composition only for non-matrix flows, #581 pinned
+    verify matrix + port success, #583 pinned baselines
+    matrix + port success, and #575, #577 and #579
+    completed the matrix + port success series -
+    but no dedicated test drove the real build_parser ->
+    cmd_verify in batch mode on a batch dir holding
+    exactly one flow carrying BOTH matrix: and the
+    demo-services-port services block. In code, cmd_verify
+    on a directory dispatches to _cmd_verify_batch, whose
+    _batch_run_one boots the flow's services context
+    inside the per-flow subdir and dispatches the real
+    _cmd_verify_matrix inside it: the real
+    demo/port_ready_server.py boots, the boot waits for
+    TCP port 8942 to open, derives
+    http://127.0.0.1:8942/ and exports
+    QALOOP_SERVICE_PORTSVC_URL so the flow target
+    resolves, both user combinations ada and bob run
+    against the live port-gated service (each 3/4 steps,
+    the fourth being the continue_on_fail negative
+    control that must FAIL while each combination still
+    passes), services/portsvc.log lands in the per-flow
+    subdir with the exact ready line in it, batch.json
+    counts combinations for a matrix flow (steps 2/2),
+    and exactly one scripted-matrix ledger row records
+    combinations 2, passed 2, cost_usd_est 0.0. This test
+    stubs NOTHING in the batch, matrix or services chain:
+    it stages a batch dir via mkdtemp at the repo root
+    (so the service cwd ".." resolves to the repo root,
+    exactly as in flows/) holding exactly one flow
+    combining the demo-services-port services block
+    verbatim (portsvc, python3 demo/port_ready_server.py,
+    wait port 8942, timeout_s 30, no explicit url, target
+    from QALOOP_SERVICE_PORTSVC_URL) with a
+    two-combination user matrix and the demo-services-port
+    setup/steps verbatim, drives the real CLI in batch
+    mode against a temp runs root and ledger, and pins
+    exit exactly 0, the batch run dir line, flows: 1,
+    matrix: 2/2 combinations passed, batch: 1/1 flows
+    passed with the parent report line last, exactly one
+    parent run dir carrying the -batch- infix with
+    entries exactly REPORT.md, batch.json, flows, steps,
+    the parent REPORT.md first line, the batch.json bare
+    list entry, the per-flow file inventory, both
+    combinations' run.json step phases and statuses, the
+    service log's exact ready line, the ledger row, the
+    removed env exports, the service not live before the
+    run, HTTP-dead after via bounded liveness polling,
+    and no orphaned fixture process."""
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    portsvc_url = "http://127.0.0.1:8942/"
+    expected_log_line = "portsvc: port 8942 open"
+    flow_name = "probe-batch-matrix-portsvc-success"
+    flow_text = """version: 1
+name: probe-batch-matrix-portsvc-success
+description: probe combining matrix and a port service in batch mode
+services:
+  - name: portsvc
+    command: "python3 demo/port_ready_server.py"
+    cwd: ".."
+    wait: {port: 8942}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_PORTSVC_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the page served by the port-gated service
+    goto: /demo/port-ready.html
+
+steps:
+  - name: the port-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the port-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "port-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "PORTSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+    expected_flow_files = ["REPORT.md",
+                           "matrix/00-user-ada/REPORT.md",
+                           "matrix/00-user-ada/junit.xml",
+                           "matrix/00-user-ada/network.jsonl",
+                           "matrix/00-user-ada/run.json",
+                           "matrix/00-user-ada/steps/steps-02-ax.txt",
+                           "matrix/00-user-ada/steps/steps-02.png",
+                           "matrix/01-user-bob/REPORT.md",
+                           "matrix/01-user-bob/junit.xml",
+                           "matrix/01-user-bob/network.jsonl",
+                           "matrix/01-user-bob/run.json",
+                           "matrix/01-user-bob/steps/steps-02-ax.txt",
+                           "matrix/01-user-bob/steps/steps-02.png",
+                           "services/portsvc.log"]
+
+    def batch_matrix_port_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "batch_line_ok": True,
+           "flows_line_ok": True, "matrix_line": True,
+           "passed_line_ok": True, "report_line_ok": True,
+           "parent_count": 1, "parent_named_batch": True,
+           "parent_entries": ["REPORT.md", "batch.json",
+                              "flows", "steps"],
+           "report_first_line":
+               "# qaloop batch report [1/1 PASS]",
+           "batch_len": 1,
+           "batch_file": flow_name + ".yaml",
+           "batch_status": "passed",
+           "batch_steps_passed": 2, "batch_steps_total": 2,
+           "batch_report": "flows/" + flow_name + "/REPORT.md",
+           "batch_error": None,
+           "flow_files": expected_flow_files,
+           "combo_dirs": ["00-user-ada", "01-user-bob"],
+           "combo0_status": "passed",
+           "combo1_status": "passed",
+           "combo0_phases": ["setup", "steps", "steps", "steps"],
+           "combo1_phases": ["setup", "steps", "steps", "steps"],
+           "combo0_step_statuses": ["passed", "passed", "passed",
+                                    "failed"],
+           "combo1_step_statuses": ["passed", "passed", "passed",
+                                    "failed"],
+           "service_log": True,
+           "ledger_rows": 1, "ledger_kind": "scripted-matrix",
+           "ledger_flow": flow_name,
+           "ledger_status": "passed", "ledger_combinations": 2,
+           "ledger_passed": 2, "ledger_cost": 0.0,
+           "env_portsvc_url_absent": True,
+           "env_portsvc_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("585 batch-matrix-port-services-success e2e: exact "
+          "expectations return no mismatch",
+          batch_matrix_port_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, matrix_line=False), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted matrix_line caught, names field",
+          probe is not None and probe.startswith("matrix_line:"),
+          probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, parent_entries=["REPORT.md"]), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted parent_entries caught, names field",
+          probe is not None
+          and probe.startswith("parent_entries:"), probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, batch_status="failed"), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted batch_status caught, names field",
+          probe is not None
+          and probe.startswith("batch_status:"), probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, flow_files=[]), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted flow_files caught, names field",
+          probe is not None
+          and probe.startswith("flow_files:"), probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, combo0_status="failed"), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted combo0_status caught, names field",
+          probe is not None
+          and probe.startswith("combo0_status:"), probe or "")
+    probe = batch_matrix_port_services_success_mismatch(
+        dict(exp, ledger_rows=0), exp)
+    check("585 batch-matrix-port-services-success e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("585 batch-matrix-port-services-success e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("585 batch-matrix-port-services-success e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("585 batch-matrix-port-services-success e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("585 batch-matrix-port-services-success e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("585 batch-matrix-port-services-success e2e execution skipped (no browser)", True); return
+
+    check("585 batch-matrix-port-services-success e2e: "
+          "portsvc service not live on port 8942 before the run",
+          not service_live(portsvc_url),
+          "port 8942 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_PORTSVC_URL",
+                "QALOOP_SERVICE_PORTSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        batch_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                with open(os.path.join(
+                        batch_dir, flow_name + ".yaml"),
+                        "w", encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", batch_dir,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                out = buf.getvalue()
+                lines = out.splitlines()
+                check("585 batch-matrix-port-services-success "
+                      "e2e: real cmd_verify on a directory exits "
+                      "exactly 0", rc == 0, str(rc))
+                batch_line_ok = bool(
+                    [l for l in lines
+                     if l.startswith("batch run dir: ")])
+                flows_line_ok = "flows: 1" in lines
+                check("585 batch-matrix-port-services-success "
+                      "e2e: stdout carries the batch run dir "
+                      "line and the flows: 1 line",
+                      batch_line_ok and flows_line_ok,
+                      str(lines))
+                matrix_line = (
+                    "matrix: 2/2 combinations passed" in lines)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: stdout carries the matrix: 2/2 "
+                      "combinations passed line", matrix_line,
+                      str(lines))
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                passed_line_ok = (
+                    "batch: 1/1 flows passed" in lines)
+                report_line_ok = bool(lines) and bool(parent) \
+                    and lines[-1] == (
+                        "report: " + os.path.join(
+                            parent, "REPORT.md"))
+                check("585 batch-matrix-port-services-success "
+                      "e2e: stdout carries the batch: 1/1 flows "
+                      "passed line and the parent report line "
+                      "is last",
+                      passed_line_ok and report_line_ok,
+                      str(lines))
+                parent_named_batch = bool(parents) and (
+                    "-batch-" in parents[0])
+                check("585 batch-matrix-port-services-success "
+                      "e2e: exactly one parent run dir created, "
+                      "its name carrying the -batch- infix",
+                      len(parents) == 1 and parent_named_batch,
+                      str(parents))
+                parent_entries = (sorted(os.listdir(parent))
+                                  if parent else [])
+                check("585 batch-matrix-port-services-success "
+                      "e2e: parent entries are exactly "
+                      "REPORT.md, batch.json, flows, steps",
+                      parent_entries == exp["parent_entries"],
+                      str(parent_entries))
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                report_lines = (
+                    open(report_path, encoding="utf-8").read(
+                        ).splitlines()
+                    if report_path
+                    and os.path.isfile(report_path) else [])
+                check("585 batch-matrix-port-services-success "
+                      "e2e: parent REPORT.md first line is "
+                      "the batch report 1/1 PASS heading",
+                      bool(report_lines)
+                      and report_lines[0]
+                      == exp["report_first_line"],
+                      str(report_lines[:1]))
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                batch = (json.load(open(
+                    batch_path, encoding="utf-8"))
+                    if batch_path
+                    and os.path.isfile(batch_path) else [])
+                batch0 = (batch[0]
+                          if isinstance(batch, list)
+                          and len(batch) > 0 else {})
+                check("585 batch-matrix-port-services-success "
+                      "e2e: batch.json is a bare list of one "
+                      "passed entry, steps 2/2 (the batch layer "
+                      "counts combinations for a matrix flow), "
+                      "report the per-flow REPORT.md, error None",
+                      isinstance(batch, list)
+                      and len(batch) == 1
+                      and batch0.get("file")
+                      == flow_name + ".yaml"
+                      and batch0.get("status") == "passed"
+                      and batch0.get("steps_passed") == 2
+                      and batch0.get("steps_total") == 2
+                      and batch0.get("report")
+                      == exp["batch_report"]
+                      and batch0.get("error") is None,
+                      str(batch))
+                flow_dir = (os.path.join(
+                    parent, "flows", flow_name)
+                    if parent else "")
+                flow_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        flow_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        flow_dir)
+                    for name in filenames) if flow_dir else []
+                check("585 batch-matrix-port-services-success "
+                      "e2e: per-flow subdir file inventory is "
+                      "exactly REPORT.md, services/portsvc.log "
+                      "and per combination REPORT.md, junit.xml, "
+                      "network.jsonl, run.json and step "
+                      "artifacts",
+                      flow_files == expected_flow_files,
+                      str(flow_files))
+                matrix_dir = (os.path.join(flow_dir, "matrix")
+                              if flow_dir else "")
+                combo_dirs = (sorted(os.listdir(matrix_dir))
+                              if os.path.isdir(matrix_dir)
+                              else [])
+                check("585 batch-matrix-port-services-success "
+                      "e2e: matrix subdir holds exactly the "
+                      "ada and bob combination dirs",
+                      combo_dirs == ["00-user-ada",
+                                     "01-user-bob"],
+                      str(combo_dirs))
+                combo0_json = {}
+                combo0_path = (os.path.join(
+                    matrix_dir, "00-user-ada", "run.json")
+                    if matrix_dir else "")
+                if combo0_path and os.path.isfile(combo0_path):
+                    with open(combo0_path,
+                              encoding="utf-8") as fh:
+                        combo0_json = json.load(fh)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: combination 00-user-ada run.json "
+                      "status passed",
+                      combo0_json.get("status") == "passed",
+                      str(combo0_json.get("status")))
+                combo0_steps = combo0_json.get("steps") or []
+                combo0_phases = [s.get("phase")
+                                 for s in combo0_steps]
+                combo0_step_statuses = [s.get("status")
+                                        for s in combo0_steps]
+                check("585 batch-matrix-port-services-success "
+                      "e2e: combination 00-user-ada step phases "
+                      "are setup, steps, steps, steps and step "
+                      "statuses passed, passed, passed, failed",
+                      combo0_phases == ["setup", "steps", "steps",
+                                        "steps"]
+                      and combo0_step_statuses == ["passed",
+                                                   "passed",
+                                                   "passed",
+                                                   "failed"],
+                      str(combo0_steps))
+                combo1_json = {}
+                combo1_path = (os.path.join(
+                    matrix_dir, "01-user-bob", "run.json")
+                    if matrix_dir else "")
+                if combo1_path and os.path.isfile(combo1_path):
+                    with open(combo1_path,
+                              encoding="utf-8") as fh:
+                        combo1_json = json.load(fh)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: combination 01-user-bob run.json "
+                      "status passed",
+                      combo1_json.get("status") == "passed",
+                      str(combo1_json.get("status")))
+                combo1_steps = combo1_json.get("steps") or []
+                combo1_phases = [s.get("phase")
+                                 for s in combo1_steps]
+                combo1_step_statuses = [s.get("status")
+                                        for s in combo1_steps]
+                check("585 batch-matrix-port-services-success "
+                      "e2e: combination 01-user-bob step phases "
+                      "are setup, steps, steps, steps and step "
+                      "statuses passed, passed, passed, failed",
+                      combo1_phases == ["setup", "steps", "steps",
+                                        "steps"]
+                      and combo1_step_statuses == ["passed",
+                                                   "passed",
+                                                   "passed",
+                                                   "failed"],
+                      str(combo1_steps))
+                log_path = (os.path.join(
+                    flow_dir, "services", "portsvc.log")
+                    if flow_dir else "")
+                log_content = (open(
+                    log_path, encoding="utf-8").read()
+                    if log_path and os.path.isfile(log_path) else "")
+                service_log = (expected_log_line
+                               in log_content.splitlines())
+                check("585 batch-matrix-port-services-success "
+                      "e2e: per-flow services/portsvc.log "
+                      "contains the exact ready line",
+                      service_log, log_content[:200])
+                rows = ledger.read_all()
+                check("585 batch-matrix-port-services-success "
+                      "e2e: ledger has exactly one row",
+                      len(rows) == 1, str(rows))
+                row = rows[0] if len(rows) == 1 else {}
+                check("585 batch-matrix-port-services-success "
+                      "e2e: ledger row is kind "
+                      "scripted-matrix, flow "
+                      "probe-batch-matrix-portsvc-success, status "
+                      "passed, combinations 2, passed 2, "
+                      "cost_usd_est 0.0",
+                      row.get("kind") == "scripted-matrix"
+                      and row.get("flow") == flow_name
+                      and row.get("status") == "passed"
+                      and row.get("combinations") == 2
+                      and row.get("passed") == 2
+                      and row.get("cost_usd_est") == 0.0,
+                      str(row))
+                env_portsvc_url_absent = (
+                    "QALOOP_SERVICE_PORTSVC_URL" not in os.environ)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: QALOOP_SERVICE_PORTSVC_URL absent "
+                      "after the run", env_portsvc_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_PORTSVC_URL")))
+                env_portsvc_port_absent = (
+                    "QALOOP_SERVICE_PORTSVC_PORT" not in os.environ)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: QALOOP_SERVICE_PORTSVC_PORT absent "
+                      "after the run", env_portsvc_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_PORTSVC_PORT")))
+                service_dead = service_dead_settled(portsvc_url)
+                check("585 batch-matrix-port-services-success "
+                      "e2e: portsvc service dead after the run "
+                      "(bounded liveness poll)", service_dead,
+                      "port 8942 still answering after settle")
+                orphans = None
+                time.sleep(0.5)
+                for _ in range(100):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "port_ready_server"],
+                        capture_output=True, text=True)
+                    if orphans.returncode != 0:
+                        break
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("585 batch-matrix-port-services-success "
+                      "e2e: no orphaned port_ready_server process "
+                      "after the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "batch_line_ok": batch_line_ok,
+                           "flows_line_ok": flows_line_ok,
+                           "matrix_line": matrix_line,
+                           "passed_line_ok": passed_line_ok,
+                           "report_line_ok": report_line_ok,
+                           "parent_count": len(parents),
+                           "parent_named_batch":
+                               parent_named_batch,
+                           "parent_entries": parent_entries,
+                           "report_first_line": (
+                               report_lines[0]
+                               if report_lines else None),
+                           "batch_len": (
+                               len(batch)
+                               if isinstance(batch, list)
+                               else None),
+                           "batch_file": batch0.get("file"),
+                           "batch_status": batch0.get("status"),
+                           "batch_steps_passed": batch0.get(
+                               "steps_passed"),
+                           "batch_steps_total": batch0.get(
+                               "steps_total"),
+                           "batch_report": batch0.get("report"),
+                           "batch_error": batch0.get("error"),
+                           "flow_files": flow_files,
+                           "combo_dirs": combo_dirs,
+                           "combo0_status":
+                               combo0_json.get("status"),
+                           "combo1_status":
+                               combo1_json.get("status"),
+                           "combo0_phases": combo0_phases,
+                           "combo1_phases": combo1_phases,
+                           "combo0_step_statuses":
+                               combo0_step_statuses,
+                           "combo1_step_statuses":
+                               combo1_step_statuses,
+                           "service_log": service_log,
+                           "ledger_rows": len(rows),
+                           "ledger_kind": row.get("kind"),
+                           "ledger_flow": row.get("flow"),
+                           "ledger_status": row.get("status"),
+                           "ledger_combinations":
+                               row.get("combinations"),
+                           "ledger_passed": row.get("passed"),
+                           "ledger_cost": row.get("cost_usd_est"),
+                           "env_portsvc_url_absent":
+                               env_portsvc_url_absent,
+                           "env_portsvc_port_absent":
+                               env_portsvc_port_absent,
+                           "service_dead_after": service_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    batch_matrix_port_services_success_mismatch(
+                        outcome, exp))
+                check("585 batch-matrix-port-services-success "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
