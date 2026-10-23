@@ -45326,6 +45326,497 @@ investigate_on_failure: false
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
+
+
+def test_issue_581_verify_matrix_port_services_success_e2e():
+    """Issue #581: pin the CLI verify MATRIX + services
+    PORT SUCCESS composition end to end. Issue #547
+    pinned the verify matrix + services SUCCESS composition
+    for the http wait form and #575 pinned the verify
+    matrix + log_contains SUCCESS composition, but
+    the composition of matrix with the port wait form -
+    the real build_parser -> cmd_verify booting the real
+    demo/port_ready_server.py declared by the staged
+    flow, waiting for TCP port 8942 to open, deriving
+    http://127.0.0.1:8942/ and exporting
+    QALOOP_SERVICE_PORTSVC_URL so the flow target
+    resolves, dispatching the real _cmd_verify_matrix
+    over the two user combinations ada and bob (each
+    running the flow against the live port-gated
+    service, 3/4 steps with the fourth being the
+    continue_on_fail negative control that must FAIL
+    naming the observed content while each combination
+    still passes), the parent REPORT.md written by the
+    real write_matrix_summary, the per-combination
+    run.json records, services/portsvc.log copied into
+    the parent run dir with the exact ready line
+    "portsvc: port 8942 open" in it, exactly one
+    scripted-matrix/passed ledger row with combinations
+    2 and passed 2, the service env exports removed, and
+    the service torn down afterwards - was not pinned at
+    CLI level, so the whole chain could rot unobserved.
+    This test stubs NOTHING in the verify, matrix or
+    services chain: it stages the flow one level below the
+    repo root (so the service cwd ".." resolves to the repo
+    root, exactly as in flows/), drives the real CLI
+    against a temp runs root and ledger and pins the exit
+    code, the printed matrix line, the single parent run
+    dir's complete file inventory, the combination subdirs
+    and their run.json step phases and statuses, the
+    service log's exact ready line, the ledger row, the
+    removed env exports, and teardown as service LIVENESS
+    (an HTTP request to the service URL must fail afterwards
+    within a bounded poll; a naive bind check fails for
+    about 60s on TIME_WAIT sockets even though the service
+    is gone) plus the absence of an orphaned fixture
+    process."""
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    portsvc_url = "http://127.0.0.1:8942/"
+    expected_log_line = "portsvc: port 8942 open"
+    flow_text = """version: 1
+name: probe-matrix-portsvc-success
+description: probe combining matrix and a port service
+services:
+  - name: portsvc
+    command: "python3 demo/port_ready_server.py"
+    cwd: ".."
+    wait: {port: 8942}
+    timeout_s: 30
+target: ${QALOOP_SERVICE_PORTSVC_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the page served by the port-gated service
+    goto: /demo/port-ready.html
+
+steps:
+  - name: the port-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the port-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "port-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "PORTSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+    expected_files = ["REPORT.md",
+                      "matrix/00-user-ada/REPORT.md",
+                      "matrix/00-user-ada/junit.xml",
+                      "matrix/00-user-ada/network.jsonl",
+                      "matrix/00-user-ada/run.json",
+                      "matrix/00-user-ada/steps/steps-02-ax.txt",
+                      "matrix/00-user-ada/steps/steps-02.png",
+                      "matrix/01-user-bob/REPORT.md",
+                      "matrix/01-user-bob/junit.xml",
+                      "matrix/01-user-bob/network.jsonl",
+                      "matrix/01-user-bob/run.json",
+                      "matrix/01-user-bob/steps/steps-02-ax.txt",
+                      "matrix/01-user-bob/steps/steps-02.png",
+                      "services/portsvc.log"]
+
+    def verify_matrix_port_services_success_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 0, "matrix_line": True,
+           "run_dir_count": 1, "parent_files": expected_files,
+           "combo_dirs": ["00-user-ada", "01-user-bob"],
+           "combo0_status": "passed",
+           "combo1_status": "passed",
+           "combo0_phases": ["setup", "steps", "steps", "steps"],
+           "combo1_phases": ["setup", "steps", "steps", "steps"],
+           "combo0_step_statuses": ["passed", "passed", "passed",
+                                    "failed"],
+           "combo1_step_statuses": ["passed", "passed", "passed",
+                                    "failed"],
+           "service_log": True,
+           "ledger_rows": 1, "ledger_kind": "scripted-matrix",
+           "ledger_flow": "probe-matrix-portsvc-success",
+           "ledger_status": "passed", "ledger_combinations": 2,
+           "ledger_passed": 2, "ledger_cost": 0.0,
+           "env_portsvc_url_absent": True,
+           "env_portsvc_port_absent": True,
+           "service_dead_after": True, "no_orphan": True}
+    check("581 verify-matrix-port-services-success e2e: exact "
+          "expectations return no mismatch",
+          verify_matrix_port_services_success_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, matrix_line=False), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted matrix_line caught, names field",
+          probe is not None and probe.startswith("matrix_line:"),
+          probe or "")
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, parent_files=[]), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted parent_files caught, names field",
+          probe is not None and probe.startswith("parent_files:"),
+          probe or "")
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, combo0_status="failed"), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted combo0_status caught, names field",
+          probe is not None
+          and probe.startswith("combo0_status:"), probe or "")
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, combo1_status="failed"), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted combo1_status caught, names field",
+          probe is not None
+          and probe.startswith("combo1_status:"), probe or "")
+    probe = verify_matrix_port_services_success_mismatch(
+        dict(exp, ledger_rows=0), exp)
+    check("581 verify-matrix-port-services-success e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("581 verify-matrix-port-services-success e2e: "
+              "liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("581 verify-matrix-port-services-success e2e: "
+              "liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("581 verify-matrix-port-services-success e2e: "
+              "dead-poll against a live service returns False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("581 verify-matrix-port-services-success e2e: "
+              "dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("581 verify-matrix-port-services-success e2e execution skipped (no browser)", True); return
+
+    check("581 verify-matrix-port-services-success e2e: "
+          "portsvc service not live on port 8942 before the run",
+          not service_live(portsvc_url),
+          "port 8942 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_PORTSVC_URL",
+                "QALOOP_SERVICE_PORTSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        stage_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                staged_flow = os.path.join(
+                    stage_dir, "probe-matrix-portsvc-success.yaml")
+                with open(staged_flow, "w",
+                          encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", staged_flow,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                out = buf.getvalue()
+                check("581 verify-matrix-port-services-success "
+                      "e2e: real cmd_verify exits exactly 0",
+                      rc == 0, str(rc))
+                matrix_line = (
+                    "matrix: 2/2 combinations passed" in out)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: stdout carries the matrix: 2/2 "
+                      "combinations passed line", matrix_line,
+                      out[-500:])
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                check("581 verify-matrix-port-services-success "
+                      "e2e: exactly one parent run dir created",
+                      len(run_dirs) == 1, str(run_dirs))
+                parent = (os.path.join(runs_root, run_dirs[0])
+                          if len(run_dirs) == 1 else "")
+                parent_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        parent).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        parent)
+                    for name in filenames) if parent else []
+                check("581 verify-matrix-port-services-success "
+                      "e2e: parent run dir file inventory is "
+                      "exactly the parent REPORT.md, both "
+                      "combinations' REPORT.md, junit.xml, "
+                      "network.jsonl, run.json and step "
+                      "artifacts, and services/portsvc.log",
+                      parent_files == expected_files,
+                      str(parent_files))
+                matrix_dir = (os.path.join(parent, "matrix")
+                              if parent else "")
+                combo_dirs = (sorted(os.listdir(matrix_dir))
+                              if os.path.isdir(matrix_dir)
+                              else [])
+                check("581 verify-matrix-port-services-success "
+                      "e2e: matrix subdir holds exactly the "
+                      "ada and bob combination dirs",
+                      combo_dirs == ["00-user-ada",
+                                     "01-user-bob"],
+                      str(combo_dirs))
+                combo0_json = {}
+                combo0_path = (os.path.join(
+                    matrix_dir, "00-user-ada", "run.json")
+                    if matrix_dir else "")
+                if combo0_path and os.path.isfile(combo0_path):
+                    with open(combo0_path,
+                              encoding="utf-8") as fh:
+                        combo0_json = json.load(fh)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: combination 00-user-ada run.json "
+                      "status passed",
+                      combo0_json.get("status") == "passed",
+                      str(combo0_json.get("status")))
+                combo0_steps = combo0_json.get("steps") or []
+                combo0_phases = [s.get("phase")
+                                 for s in combo0_steps]
+                combo0_step_statuses = [s.get("status")
+                                        for s in combo0_steps]
+                check("581 verify-matrix-port-services-success "
+                      "e2e: combination 00-user-ada step phases "
+                      "are setup, steps, steps, steps and step "
+                      "statuses passed, passed, passed, failed",
+                      combo0_phases == ["setup", "steps", "steps",
+                                        "steps"]
+                      and combo0_step_statuses == ["passed",
+                                                   "passed",
+                                                   "passed",
+                                                   "failed"],
+                      str(combo0_steps))
+                combo1_json = {}
+                combo1_path = (os.path.join(
+                    matrix_dir, "01-user-bob", "run.json")
+                    if matrix_dir else "")
+                if combo1_path and os.path.isfile(combo1_path):
+                    with open(combo1_path,
+                              encoding="utf-8") as fh:
+                        combo1_json = json.load(fh)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: combination 01-user-bob run.json "
+                      "status passed",
+                      combo1_json.get("status") == "passed",
+                      str(combo1_json.get("status")))
+                combo1_steps = combo1_json.get("steps") or []
+                combo1_phases = [s.get("phase")
+                                 for s in combo1_steps]
+                combo1_step_statuses = [s.get("status")
+                                        for s in combo1_steps]
+                check("581 verify-matrix-port-services-success "
+                      "e2e: combination 01-user-bob step phases "
+                      "are setup, steps, steps, steps and step "
+                      "statuses passed, passed, passed, failed",
+                      combo1_phases == ["setup", "steps", "steps",
+                                        "steps"]
+                      and combo1_step_statuses == ["passed",
+                                                   "passed",
+                                                   "passed",
+                                                   "failed"],
+                      str(combo1_steps))
+                log_path = (os.path.join(
+                    parent, "services", "portsvc.log")
+                    if parent else "")
+                log_content = (open(
+                    log_path, encoding="utf-8").read()
+                    if log_path and os.path.isfile(log_path) else "")
+                service_log = (expected_log_line
+                               in log_content.splitlines())
+                check("581 verify-matrix-port-services-success "
+                      "e2e: services/portsvc.log contains the exact "
+                      "ready line", service_log, log_content[:200])
+                rows = ledger.read_all()
+                check("581 verify-matrix-port-services-success "
+                      "e2e: ledger has exactly one row",
+                      len(rows) == 1, str(rows))
+                row = rows[0] if len(rows) == 1 else {}
+                check("581 verify-matrix-port-services-success "
+                      "e2e: ledger row is kind "
+                      "scripted-matrix, flow "
+                      "probe-matrix-portsvc-success, status passed, "
+                      "combinations 2, passed 2, cost 0.0",
+                      row.get("kind") == "scripted-matrix"
+                      and row.get("flow")
+                      == "probe-matrix-portsvc-success"
+                      and row.get("status") == "passed"
+                      and row.get("combinations") == 2
+                      and row.get("passed") == 2
+                      and row.get("cost_usd_est") == 0.0,
+                      str(row))
+                env_portsvc_url_absent = (
+                    "QALOOP_SERVICE_PORTSVC_URL" not in os.environ)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: QALOOP_SERVICE_PORTSVC_URL absent "
+                      "after the run", env_portsvc_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_PORTSVC_URL")))
+                env_portsvc_port_absent = (
+                    "QALOOP_SERVICE_PORTSVC_PORT" not in os.environ)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: QALOOP_SERVICE_PORTSVC_PORT absent "
+                      "after the run", env_portsvc_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_PORTSVC_PORT")))
+                service_dead = service_dead_settled(portsvc_url)
+                check("581 verify-matrix-port-services-success "
+                      "e2e: portsvc service dead after the run "
+                      "(bounded liveness poll)", service_dead,
+                      "port 8942 still answering after settle")
+                orphans = None
+                for _ in range(100):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "port_ready_server"],
+                        capture_output=True, text=True)
+                    if orphans.returncode != 0:
+                        break
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("581 verify-matrix-port-services-success "
+                      "e2e: no orphaned port_ready_server process "
+                      "after the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "matrix_line": matrix_line,
+                           "run_dir_count": len(run_dirs),
+                           "parent_files": parent_files,
+                           "combo_dirs": combo_dirs,
+                           "combo0_status":
+                               combo0_json.get("status"),
+                           "combo1_status":
+                               combo1_json.get("status"),
+                           "combo0_phases": combo0_phases,
+                           "combo1_phases": combo1_phases,
+                           "combo0_step_statuses":
+                               combo0_step_statuses,
+                           "combo1_step_statuses":
+                               combo1_step_statuses,
+                           "service_log": service_log,
+                           "ledger_rows": len(rows),
+                           "ledger_kind": row.get("kind"),
+                           "ledger_flow": row.get("flow"),
+                           "ledger_status": row.get("status"),
+                           "ledger_combinations":
+                               row.get("combinations"),
+                           "ledger_passed": row.get("passed"),
+                           "ledger_cost": row.get("cost_usd_est"),
+                           "env_portsvc_url_absent":
+                               env_portsvc_url_absent,
+                           "env_portsvc_port_absent":
+                               env_portsvc_port_absent,
+                           "service_dead_after": service_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    verify_matrix_port_services_success_mismatch(
+                        outcome, exp))
+                check("581 verify-matrix-port-services-success "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
