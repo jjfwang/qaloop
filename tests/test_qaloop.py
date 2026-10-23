@@ -40529,6 +40529,413 @@ def test_issue_559_batch_partial_boot_failed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_561_verify_matrix_services_partial_boot_failed_e2e():
+    """Issue #561: pin the CLI verify MATRIX + SERVICES
+    PARTIAL BOOT FAILED composition end to end. The
+    matrix+services pins (#547-#557) cover the success
+    path and the single-service boot-failure path, and
+    the partial-boot pins (#519 verify, #521 baselines,
+    #559 batch) use non-matrix flows, but the verify
+    composition of a matrix flow with a PARTIAL boot
+    failure - the first service (a plain http.server on
+    port 8946) boots fine while the second service waits
+    on a health path the proof server answers 404
+    forever, so wait_for_http raises TimeoutError at the
+    5s timeout, cli.py printing the exact SERVICE BOOT
+    FAILED line and returning exit 3 before any matrix
+    dispatch, the already-booted first service torn down
+    (dead afterwards, its env exports removed) yet its
+    log still copied into the run dir as
+    services/first.log, and no ledger row appended -
+    was left unpinned and could rot unobserved.
+    This test stubs NOTHING in the verify, matrix or
+    services chain: it stages a flow one level below the
+    repo root (so the service cwd ".." resolves to the
+    repo root, exactly as in flows/) combining the
+    partial-fail services block with a matrix of user
+    [ada, bob] and the #547 setup+steps body, drives the
+    real build_parser -> cmd_verify against a temp runs
+    root and ledger, and pins the exit code, the single
+    printed line, the run dir entries and complete file
+    inventory, the absent ledger row, the removed env
+    exports, and teardown as service LIVENESS for both
+    ports (an HTTP request must fail afterwards within a
+    bounded poll; a naive bind check fails for about 60s
+    on TIME_WAIT sockets even though the service is gone)
+    plus the absence of an orphaned fixture process."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    health_url = "http://127.0.0.1:8933/api/no-such-health"
+    first_url = "http://127.0.0.1:8946/"
+    second_url = "http://127.0.0.1:8933/"
+    flow_text = """version: 1
+name: probe-matrix-services-partial-bootfail
+description: probe combining matrix and partial-boot-failing services
+services:
+  - name: first
+    command: "python3 -m http.server 8946 --bind 127.0.0.1"
+    cwd: ".."
+    wait: {port: 8946}
+    timeout_s: 15
+  - name: second
+    command: "python3 demo/proof_server.py"
+    cwd: ".."
+    wait: {http: "http://127.0.0.1:8933/api/no-such-health"}
+    timeout_s: 5
+    url: "http://127.0.0.1:8933/"
+target: ${QALOOP_SERVICE_FIRST_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the demo page on the real service
+    goto: /demo/mock-demo.html
+
+steps:
+  - name: real service serves the greeting
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "Hello from the proof server"}
+
+  - name: fill the signup name as the matrix user
+    fill: {target: "#name", text: "${user}"}
+
+  - name: fill the email
+    fill: {target: "#email", text: "${user}@example.com"}
+
+  - name: submit and see the real confirmation
+    click: "#submit"
+    expect:
+      - text_contains: {selector: "#done", text: "Welcome, "}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+
+    def verify_matrix_services_partial_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def service_live(url):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def service_dead_settled(url, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        dead = not service_live(url)
+        while not dead and time.time() < deadline:
+            time.sleep(0.25)
+            dead = not service_live(url)
+        return dead
+
+    exp = {"exit_code": 3, "line_count": 1, "line_ok": True,
+           "run_dir_count": 1,
+           "run_dir_entries": ["services", "steps"],
+           "run_dir_files": ["services/first.log"],
+           "ledger_rows": 0,
+           "env_first_url_absent": True,
+           "env_first_port_absent": True,
+           "env_second_url_absent": True,
+           "env_second_port_absent": True,
+           "first_dead_after": True,
+           "second_dead_after": True, "no_orphan": True}
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "exact expectations return no mismatch",
+          verify_matrix_services_partial_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "corrupted printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, run_dir_count=0), exp)
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "corrupted run-dir count caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_count:"), probe or "")
+    probe = verify_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, run_dir_files=[]), exp)
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "corrupted run_dir_files caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_files:"), probe or "")
+    probe = verify_matrix_services_partial_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the liveness helpers against a caller-owned
+    # throwaway server: a 200 and even a 404 both mean a server
+    # answered (live), the bounded dead-poll must not declare a
+    # live service dead, and it must notice once the server
+    # actually goes away mid-poll.
+    import http.server
+    import threading
+
+    class _SvcProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/missing":
+                self.send_response(404)
+                self.end_headers()
+            else:
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SvcProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        probe_ok = f"http://127.0.0.1:{probe_port}/ok"
+        probe_missing = f"http://127.0.0.1:{probe_port}/missing"
+        check("561 verify-matrix-services-partial-boot-failed "
+              "e2e: liveness helper sees a 200 server as live",
+              service_live(probe_ok) is True)
+        check("561 verify-matrix-services-partial-boot-failed "
+              "e2e: liveness helper sees a 404 server as live "
+              "(HTTPError still means a server answered)",
+              service_live(probe_missing) is True)
+        check("561 verify-matrix-services-partial-boot-failed "
+              "e2e: dead-poll against a live service returns "
+              "False",
+              service_dead_settled(probe_ok, timeout_s=0.6)
+              is False)
+        threading.Timer(0.3, probe_srv.shutdown).start()
+        check("561 verify-matrix-services-partial-boot-failed "
+              "e2e: dead-poll notices a service dying mid-poll",
+              service_dead_settled(probe_ok, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    if not os.path.exists(exe): check("561 verify-matrix-services-partial-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "first service not live on port 8946 before the run",
+          not service_live(first_url),
+          "port 8946 already serving")
+    check("561 verify-matrix-services-partial-boot-failed e2e: "
+          "second service not live on port 8933 before the run",
+          not service_live(second_url),
+          "port 8933 already serving")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_FIRST_URL",
+                "QALOOP_SERVICE_FIRST_PORT",
+                "QALOOP_SERVICE_SECOND_URL",
+                "QALOOP_SERVICE_SECOND_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        stage_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                staged_flow = os.path.join(
+                    stage_dir,
+                    "probe-matrix-services-partial-bootfail.yaml")
+                with open(staged_flow, "w",
+                          encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", staged_flow,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: real cmd_verify exits exactly 3",
+                      rc == 3, str(rc))
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: line starts SERVICE BOOT FAILED: "
+                      "TimeoutError:",
+                      line.startswith(
+                          "SERVICE BOOT FAILED: TimeoutError:"),
+                      line)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: line names the health URL",
+                      health_url in line, line)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: line carries the 5.0s timeout fragment",
+                      "not ready after 5.0s" in line, line)
+                line_ok = (
+                    line.startswith(
+                        "SERVICE BOOT FAILED: TimeoutError:")
+                    and health_url in line
+                    and "not ready after 5.0s" in line)
+                run_dirs = (sorted(os.listdir(runs_root))
+                            if os.path.isdir(runs_root) else [])
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: exactly one new run dir created",
+                      len(run_dirs) == 1, str(run_dirs))
+                only_dir = (os.path.join(runs_root, run_dirs[0])
+                            if len(run_dirs) == 1 else "")
+                entries = (sorted(os.listdir(only_dir))
+                           if only_dir else [])
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: run dir holds exactly the services "
+                      "and steps entries",
+                      entries == ["services", "steps"],
+                      str(entries))
+                run_dir_files = []
+                if only_dir:
+                    for dirpath, _dirnames, filenames in os.walk(
+                            only_dir):
+                        for name in filenames:
+                            run_dir_files.append(os.path.relpath(
+                                os.path.join(dirpath, name),
+                                only_dir))
+                    run_dir_files = sorted(
+                        p.replace(os.sep, "/")
+                        for p in run_dir_files)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: run dir file inventory is exactly "
+                      "the first service log",
+                      run_dir_files == ["services/first.log"],
+                      str(run_dir_files))
+                rows = ledger.read_all()
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: ledger has zero rows",
+                      len(rows) == 0, str(rows))
+                env_first_url_absent = (
+                    "QALOOP_SERVICE_FIRST_URL" not in os.environ)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_FIRST_URL absent "
+                      "after the run", env_first_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_FIRST_URL")))
+                env_first_port_absent = (
+                    "QALOOP_SERVICE_FIRST_PORT" not in os.environ)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_FIRST_PORT absent "
+                      "after the run", env_first_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_FIRST_PORT")))
+                env_second_url_absent = (
+                    "QALOOP_SERVICE_SECOND_URL" not in os.environ)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_SECOND_URL absent "
+                      "after the run", env_second_url_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_SECOND_URL")))
+                env_second_port_absent = (
+                    "QALOOP_SERVICE_SECOND_PORT" not in os.environ)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: QALOOP_SERVICE_SECOND_PORT absent "
+                      "after the run", env_second_port_absent,
+                      str(os.environ.get(
+                          "QALOOP_SERVICE_SECOND_PORT")))
+                first_dead = service_dead_settled(first_url)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: first service dead after the run "
+                      "(bounded liveness poll)", first_dead,
+                      "port 8946 still answering after settle")
+                second_dead = service_dead_settled(second_url)
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: second service dead after the run "
+                      "(bounded liveness poll)", second_dead,
+                      "port 8933 still answering after settle")
+                orphans = None
+                for _ in range(30):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f",
+                         "http.server 8946|proof_server"],
+                        capture_output=True, text=True)
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: no orphaned fixture process after "
+                      "the run", no_orphan,
+                      orphans.stdout if orphans
+                      else "no pgrep result")
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line_ok,
+                           "run_dir_count": len(run_dirs),
+                           "run_dir_entries": entries,
+                           "run_dir_files": run_dir_files,
+                           "ledger_rows": len(rows),
+                           "env_first_url_absent":
+                               env_first_url_absent,
+                           "env_first_port_absent":
+                               env_first_port_absent,
+                           "env_second_url_absent":
+                               env_second_url_absent,
+                           "env_second_port_absent":
+                               env_second_port_absent,
+                           "first_dead_after": first_dead,
+                           "second_dead_after": second_dead,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    verify_matrix_services_partial_boot_failed_mismatch(
+                        outcome, exp))
+                check("561 verify-matrix-services-partial-boot-failed "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
