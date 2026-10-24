@@ -52220,6 +52220,150 @@ def test_issue_611_verify_services_invalid_spec_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_613_verify_bad_keep_runs_e2e():
+    """Issue #613: pin the CLI single-flow verify bad
+    --keep-runs exit-2 path end to end. SPEC.md's
+    Single-flow execution order step 1 states --keep-runs
+    resolves first: an invalid value prints ERROR: {e} and
+    exits 2 before anything runs, and the exit-code
+    contract (line 878) lists a bad --keep-runs value as
+    exit 2. Today that contract is proven only at unit
+    level: resolve_keep_runs raising, parser plumbing
+    (including that -1 parses), and one cmd_verify unit
+    check with SimpleNamespace args and stubbed run_flow /
+    default_runs_root asserting only rc==2 for a bogus env
+    value on a batch directory. This test stubs NOTHING in
+    the verify chain: it drives only the real
+    build_parser -> cmd_verify in three phases - (A) flag:
+    --keep-runs -1 on a staged valid flow exits exactly 2
+    with stdout exactly one line equal to the exact
+    cannot-be-negative ERROR line, no run dir entry and
+    zero ledger rows; (B) precedence: the same flag on a
+    YAML-broken staged flow returns the identical ERROR
+    line (not INVALID SPEC), proving keep-runs resolves
+    before the services light-parse / spec load; (C) env:
+    QALOOP_KEEP_RUNS=bogus with no flag on the valid flow
+    exits exactly 2 with stdout exactly one line equal to
+    the exact quoted must-be-an-integer ERROR line, no run
+    dir entry and zero ledger rows."""
+    from qaloop import cli, ledger
+
+    def verify_bad_keep_runs_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "ledger_rows": 0}
+    check("613 verify-bad-keep-runs e2e: exact "
+          "expectations return no mismatch",
+          verify_bad_keep_runs_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_bad_keep_runs_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("613 verify-bad-keep-runs e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_bad_keep_runs_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("613 verify-bad-keep-runs e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_bad_keep_runs_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("613 verify-bad-keep-runs e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_bad_keep_runs_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("613 verify-bad-keep-runs e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_KEEP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    flag_line = ("ERROR: --keep-runs / QALOOP_KEEP_RUNS "
+                 "cannot be negative (got -1)")
+    env_line = ("ERROR: QALOOP_KEEP_RUNS must be an integer, "
+                "got 'bogus'")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+            good_path = os.path.join(td, "good.yaml")
+            with open(good_path, "w", encoding="utf-8") as f:
+                f.write("name: keep-runs-flow\n"
+                        "target: http://127.0.0.1:9/\n"
+                        "steps:\n"
+                        "  - wait_ms: 1\n")
+            bad_path = os.path.join(td, "bad.yaml")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                f.write("name: [unclosed\n")
+
+            def run_verify(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line):
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "real cmd_verify exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "line equals the exact ERROR line",
+                      line == expected_line, line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "no run dir entry in the runs root",
+                      run_dir_entries == [],
+                      str(run_dir_entries))
+                rows = ledger.read_all()
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "ledger has zero rows", len(rows) == 0,
+                      str(rows))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": run_dir_entries,
+                           "ledger_rows": len(rows)}
+                mismatch = verify_bad_keep_runs_mismatch(
+                    outcome, exp)
+                check(f"613 verify-bad-keep-runs e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            rc, lines = run_verify(
+                ["verify", good_path, "--keep-runs", "-1"])
+            pin_phase("flag", rc, lines, flag_line)
+            rc, lines = run_verify(
+                ["verify", bad_path, "--keep-runs", "-1"])
+            pin_phase("precedence", rc, lines, flag_line)
+            os.environ["QALOOP_KEEP_RUNS"] = "bogus"
+            rc, lines = run_verify(["verify", good_path])
+            pin_phase("env", rc, lines, env_line)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
