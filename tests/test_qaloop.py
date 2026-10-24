@@ -52364,6 +52364,153 @@ def test_issue_613_verify_bad_keep_runs_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_615_worker_bad_keep_runs_e2e():
+    """Issue #615: pin the CLI worker bad --keep-runs
+    exit-2 path end to end. SPEC.md (Worker flags,
+    --keep-runs, and the Retention section) states verify
+    and worker reject negative values (and non-integer
+    env values) with an error (exit 2), and in
+    qaloop/cli.py cmd_worker resolves keep-runs FIRST,
+    before the --concurrency / --job-timeout validations
+    and before run_worker is called. Today that contract
+    is proven only at unit level: resolve_keep_runs
+    raising, parser plumbing, and one cmd_worker unit
+    check with a hand-built argparse.Namespace asserting
+    only rc==2, an ERROR: prefix and a cannot-be-negative
+    substring. This test stubs NOTHING in the worker
+    chain: it drives only the real build_parser ->
+    cmd_worker in four phases - (A) flag: worker --once
+    --keep-runs -1 exits exactly 2 with stdout exactly
+    one line equal to the exact cannot-be-negative ERROR
+    line, no run dir entry and no queue database created;
+    (B) precedence: the same flag together with
+    --concurrency 0 and --job-timeout 0 returns the
+    identical ERROR line, proving keep-runs resolves
+    before the other worker validations; (C) env:
+    QALOOP_KEEP_RUNS=bogus with no flag exits exactly 2
+    with stdout exactly one line equal to the exact
+    quoted must-be-an-integer ERROR line; (D) env
+    negative: QALOOP_KEEP_RUNS=-2 with no flag exits
+    exactly 2 with the exact cannot-be-negative line,
+    no run dir entry and no queue database created."""
+    from qaloop import cli
+
+    def worker_bad_keep_runs_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "queue_db_created": False}
+    check("615 worker-bad-keep-runs e2e: exact "
+          "expectations return no mismatch",
+          worker_bad_keep_runs_mismatch(
+              dict(exp), exp) is None)
+    probe = worker_bad_keep_runs_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("615 worker-bad-keep-runs e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = worker_bad_keep_runs_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("615 worker-bad-keep-runs e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = worker_bad_keep_runs_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("615 worker-bad-keep-runs e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = worker_bad_keep_runs_mismatch(
+        dict(exp, queue_db_created=True), exp)
+    check("615 worker-bad-keep-runs e2e: corrupted "
+          "queue_db_created caught, names field",
+          probe is not None
+          and probe.startswith("queue_db_created:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_DB",
+                "QALOOP_KEEP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    flag_line = ("ERROR: --keep-runs / QALOOP_KEEP_RUNS "
+                 "cannot be negative (got -1)")
+    env_neg_line = ("ERROR: --keep-runs / QALOOP_KEEP_RUNS "
+                    "cannot be negative (got -2)")
+    env_line = ("ERROR: QALOOP_KEEP_RUNS must be an integer, "
+                "got 'bogus'")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            db_path = os.path.join(td, "q.db")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_DB"] = db_path
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+
+            def run_worker_cmd(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line):
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "real cmd_worker exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "line equals the exact ERROR line",
+                      line == expected_line, line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "no run dir entry in the runs root",
+                      run_dir_entries == [],
+                      str(run_dir_entries))
+                queue_db_created = os.path.exists(db_path)
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "no queue database created",
+                      queue_db_created is False,
+                      str(queue_db_created))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": run_dir_entries,
+                           "queue_db_created": queue_db_created}
+                mismatch = worker_bad_keep_runs_mismatch(
+                    outcome, exp)
+                check(f"615 worker-bad-keep-runs e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--keep-runs", "-1"])
+            pin_phase("flag", rc, lines, flag_line)
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--keep-runs", "-1",
+                 "--concurrency", "0", "--job-timeout", "0"])
+            pin_phase("precedence", rc, lines, flag_line)
+            os.environ["QALOOP_KEEP_RUNS"] = "bogus"
+            rc, lines = run_worker_cmd(["worker", "--once"])
+            pin_phase("env-bogus", rc, lines, env_line)
+            os.environ["QALOOP_KEEP_RUNS"] = "-2"
+            rc, lines = run_worker_cmd(["worker", "--once"])
+            pin_phase("env-negative", rc, lines, env_neg_line)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
