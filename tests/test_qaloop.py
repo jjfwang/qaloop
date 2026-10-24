@@ -52091,6 +52091,135 @@ def test_issue_609_baselines_services_invalid_spec_e2e():
 
 
 
+def test_issue_611_verify_services_invalid_spec_e2e():
+    """Issue #611: pin the CLI verify services-stage
+    INVALID SPEC path end to end. SPEC.md's exit-code
+    contract (line 878) states INVALID SPEC at any stage -
+    services light-parse or spec load - exits 2 in
+    single-flow mode. For verify the services stage is
+    pinned only by a cmd_verify unit check with run_flow
+    stubbed (rc==2 only, no exact printed line, no run-dir
+    or ledger pin) and at unit level for
+    load_services_light (name 9bad), while the baselines
+    services stage is pinned for real at #609 and the batch
+    services stage at #607 - no test drove the real
+    build_parser -> cmd_verify path on a valid-YAML
+    flow whose services block fails the light-parse. This
+    test stubs NOTHING in the verify chain: it stages a
+    flow in a temp dir whose services block carries name
+    9bad (command x, wait port 1, one wait_ms step), drives
+    only the real build_parser -> cmd_verify, and pins
+    exit exactly 2, stdout exactly one line equal to the
+    exact INVALID SPEC line naming the staged flow path
+    and the services[0] identifier error, no run dir
+    created in the runs root (the light-parse precedes
+    any run-dir creation in cmd_verify), and zero ledger
+    rows."""
+    from qaloop import cli, ledger
+
+    def verify_services_invalid_spec_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "ledger_rows": 0}
+    check("611 verify-services-invalid-spec e2e: exact "
+          "expectations return no mismatch",
+          verify_services_invalid_spec_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_services_invalid_spec_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("611 verify-services-invalid-spec e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_services_invalid_spec_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("611 verify-services-invalid-spec e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_services_invalid_spec_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("611 verify-services-invalid-spec e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_services_invalid_spec_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("611 verify-services-invalid-spec e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            flow_path = os.path.join(td, "badsvc.yaml")
+            with open(flow_path, "w", encoding="utf-8") as f:
+                f.write("name: badsvc-flow\n"
+                        "target: http://127.0.0.1:9/\n"
+                        "services:\n"
+                        "  - name: '9bad'\n"
+                        "    command: 'x'\n"
+                        "    wait: {port: 1}\n"
+                        "steps:\n"
+                        "  - wait_ms: 1\n")
+            expected_line = (
+                "INVALID SPEC: spec " + flow_path
+                + ": services[0]: service `name` must be an "
+                "identifier [a-zA-Z][a-zA-Z0-9_]*")
+            parsed = cli.build_parser().parse_args(
+                ["verify", flow_path])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("611 verify-services-invalid-spec e2e: "
+                  "real cmd_verify exits exactly 2", rc == 2,
+                  str(rc))
+            check("611 verify-services-invalid-spec e2e: "
+                  "stdout is exactly one line", len(lines) == 1,
+                  str(lines))
+            line = lines[0] if lines else ""
+            check("611 verify-services-invalid-spec e2e: "
+                  "line equals the exact services-stage "
+                  "INVALID SPEC line", line == expected_line,
+                  line)
+            line_ok = (line == expected_line)
+            run_dir_entries = sorted(os.listdir(runs_root))
+            check("611 verify-services-invalid-spec e2e: "
+                  "no run dir created in the runs root",
+                  run_dir_entries == [], str(run_dir_entries))
+            rows = ledger.read_all()
+            check("611 verify-services-invalid-spec e2e: "
+                  "ledger has zero rows", len(rows) == 0,
+                  str(rows))
+            outcome = {"exit_code": rc,
+                       "line_count": len(lines),
+                       "line_ok": line_ok,
+                       "run_dir_entries": run_dir_entries,
+                       "ledger_rows": len(rows)}
+            mismatch = verify_services_invalid_spec_mismatch(
+                outcome, exp)
+            check("611 verify-services-invalid-spec e2e: "
+                  "real composition pins the pinned fields "
+                  "exactly", mismatch is None, mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
