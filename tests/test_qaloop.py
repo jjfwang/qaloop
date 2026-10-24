@@ -52511,6 +52511,156 @@ def test_issue_615_worker_bad_keep_runs_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+
+def test_issue_617_verify_empty_batch_selection_e2e():
+    """Issue #617: pin the CLI verify empty batch
+    selection exit-2 path end to end. SPEC.md's
+    exit-code contract (line 878) lists an empty batch
+    selection as exit 2. Today that is proven only at
+    unit level: _select_flows raising
+    BatchSelectionError for an empty dir and for a tag
+    no-match, and one cmd_verify unit check with
+    SimpleNamespace args plus stubbed ledger append /
+    default_runs_root / run_flow asserting only rc==2
+    for an empty directory; the exact printed ERROR
+    lines occur nowhere in tests. This test stubs
+    NOTHING in the verify chain: it drives only the
+    real build_parser -> cmd_verify in three phases -
+    (A) empty dir: verify on a staged empty directory
+    exits exactly 2 with stdout exactly one line equal
+    to ERROR: no flow YAML files in <dir>, no run dir
+    entry and zero ledger rows; (B) tag no-match:
+    verify --tag nope on a staged directory holding
+    one valid flow carrying tags [smoke] exits exactly
+    2 with stdout exactly one line equal to
+    ERROR: no flows in <dir> carry tag(s) ['nope'], no
+    run dir entry and zero ledger rows; (C) non-YAML
+    only: verify on a staged directory holding only a
+    .txt file returns the same exact
+    no-flow-YAML-files line as (A) for that dir, exit
+    exactly 2, no run dir entry and zero ledger rows."""
+    from qaloop import cli, ledger
+
+    def verify_empty_batch_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "ledger_rows": 0}
+    check("617 verify-empty-batch e2e: exact "
+          "expectations return no mismatch",
+          verify_empty_batch_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_empty_batch_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("617 verify-empty-batch e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_empty_batch_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("617 verify-empty-batch e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_empty_batch_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("617 verify-empty-batch e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_empty_batch_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("617 verify-empty-batch e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_KEEP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+            empty_dir = os.path.join(td, "empty")
+            os.makedirs(empty_dir)
+            tagged_dir = os.path.join(td, "tagged")
+            os.makedirs(tagged_dir)
+            with open(os.path.join(tagged_dir, "a.yaml"),
+                      "w", encoding="utf-8") as f:
+                f.write("name: t\n"
+                        "target: http://127.0.0.1:9/\n"
+                        "tags: [smoke]\n"
+                        "steps:\n"
+                        "  - wait_ms: 1\n")
+            notes_dir = os.path.join(td, "notes")
+            os.makedirs(notes_dir)
+            with open(os.path.join(notes_dir, "notes.txt"),
+                      "w", encoding="utf-8") as f:
+                f.write("hi\n")
+
+            def run_verify(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line):
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "real cmd_verify exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "line equals the exact ERROR line",
+                      line == expected_line, line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "no run dir entry in the runs root",
+                      run_dir_entries == [],
+                      str(run_dir_entries))
+                rows = ledger.read_all()
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "ledger has zero rows", len(rows) == 0,
+                      str(rows))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": run_dir_entries,
+                           "ledger_rows": len(rows)}
+                mismatch = verify_empty_batch_mismatch(
+                    outcome, exp)
+                check(f"617 verify-empty-batch e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            rc, lines = run_verify(["verify", empty_dir])
+            pin_phase("empty", rc, lines,
+                      f"ERROR: no flow YAML files in {empty_dir}")
+            rc, lines = run_verify(
+                ["verify", tagged_dir, "--tag", "nope"])
+            pin_phase("tag-no-match", rc, lines,
+                      f"ERROR: no flows in {tagged_dir} "
+                      "carry tag(s) ['nope']")
+            rc, lines = run_verify(["verify", notes_dir])
+            pin_phase("non-yaml-only", rc, lines,
+                      f"ERROR: no flow YAML files in {notes_dir}")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
