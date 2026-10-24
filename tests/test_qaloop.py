@@ -51112,6 +51112,422 @@ investigate_on_failure: false
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_605_batch_invalid_spec_resilience_e2e():
+    """Issue #605: pin the CLI batch verify INVALID SPEC
+    resilience composition end to end. SPEC.md's exit-code
+    contract states a deliberate deviation: INVALID SPEC is
+    exit 2 in single-flow mode, but recorded as a per-flow
+    failure (exit 1 overall) in batch mode. That batch
+    deviation was pinned only by a unit test whose per-flow
+    path is stubbed (fake_run_flow in the _cmd_verify_batch
+    mixed-outcomes test) - no test drove the real
+    build_parser -> cmd_verify in batch mode on a batch dir
+    holding a YAML-broken flow plus a real passing sibling,
+    while the sibling batch resilience cells are pinned for
+    real (SERVICE BOOT FAILED http #527, port #597). This
+    test stubs NOTHING in the batch chain: it stages a batch
+    dir via mkdtemp at the repo root holding exactly
+    a-broken.yaml (the unclosed-YAML line used by the
+    existing unit pins) and b-pass.yaml (a verbatim copy of
+    flows/demo-teardown.yaml), serves the repo root on a
+    free port with TARGET_URL pointed at it, and pins exit
+    exactly 1, the bracketed INVALID SPEC line naming the
+    broken path, the flows: 2 / [PASS] demo-teardown 6/7 /
+    batch: 1/2 flows passed lines with the report line
+    last, the single -batch parent run dir with entries
+    exactly REPORT.md, batch.json, flows and steps, the
+    parent REPORT.md first line and both exact table rows,
+    batch.json as a bare list of exactly two entries (the
+    broken entry failed with steps 0/0, report None and the
+    exact INVALID SPEC error prefix; the passed entry
+    passed with steps 6/7, report flows/b-pass/REPORT.md
+    and no error), the broken per-flow subdir holding only
+    an empty steps dir, the passed subdir's exact five
+    entries, and exactly one scripted ledger row, for the
+    passed sibling only."""
+    import functools
+    import http.server
+    import shutil
+    import threading
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def batch_invalid_spec_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 1, "invalid_line_count": 1,
+           "line_ok": True, "flows_line_ok": True,
+           "pass_line_ok": True, "batch_line_ok": True,
+           "report_line_ok": True, "parent_count": 1,
+           "parent_named_batch": True,
+           "parent_entries": ["REPORT.md", "batch.json",
+                              "flows", "steps"],
+           "report_first_line": "# qaloop batch report [1/2 PASS]",
+           "table_row_0": "| 0 | `a-broken.yaml` | FAIL | "
+           "0/0 | — |",
+           "table_row_1": "| 1 | `b-pass.yaml` | PASS | 6/7 | "
+           "[b-pass](flows/b-pass/REPORT.md) |",
+           "batch_len": 2,
+           "batch0_file": "a-broken.yaml",
+           "batch0_status": "failed", "batch0_steps_passed": 0,
+           "batch0_steps_total": 0, "batch0_report": None,
+           "batch0_error_ok": True,
+           "batch1_file": "b-pass.yaml",
+           "batch1_status": "passed", "batch1_steps_passed": 6,
+           "batch1_steps_total": 7,
+           "batch1_report": "flows/b-pass/REPORT.md",
+           "batch1_error": None,
+           "broken_entries": ["steps"], "broken_files": [],
+           "passed_entries": ["REPORT.md", "junit.xml",
+                              "network.jsonl", "run.json",
+                              "steps"],
+           "passed_files": ["REPORT.md", "junit.xml",
+                            "network.jsonl", "run.json",
+                            "steps/teardown-01-ax.txt",
+                            "steps/teardown-01.png"],
+           "passed_status": "passed", "ledger_rows": 1,
+           "ledger_kind": "scripted",
+           "ledger_flow": "demo-teardown",
+           "ledger_status": "passed"}
+    check("605 batch-invalid-spec e2e: exact expectations "
+          "return no mismatch",
+          batch_invalid_spec_mismatch(dict(exp), exp) is None)
+    probe = batch_invalid_spec_mismatch(
+        dict(exp, exit_code=2), exp)
+    check("605 batch-invalid-spec e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = batch_invalid_spec_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("605 batch-invalid-spec e2e: corrupted printed "
+          "line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = batch_invalid_spec_mismatch(
+        dict(exp, batch0_status="passed"), exp)
+    check("605 batch-invalid-spec e2e: corrupted "
+          "batch0_status caught, names field",
+          probe is not None
+          and probe.startswith("batch0_status:"), probe or "")
+    probe = batch_invalid_spec_mismatch(
+        dict(exp, ledger_rows=0), exp)
+    check("605 batch-invalid-spec e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+    if not os.path.exists(exe): check("605 batch-invalid-spec e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+
+    class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(_QuietHandler, directory=root)
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever,
+                     daemon=True).start()
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        batch_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                os.environ["TARGET_URL"] = (
+                    f"http://127.0.0.1:{port}")
+                broken_path = os.path.join(
+                    batch_dir, "a-broken.yaml")
+                with open(broken_path, "w",
+                          encoding="utf-8") as f:
+                    f.write("name: [unclosed\n")
+                shutil.copyfile(
+                    os.path.join(root, "flows",
+                                 "demo-teardown.yaml"),
+                    os.path.join(batch_dir, "b-pass.yaml"))
+                parsed = cli.build_parser().parse_args(
+                    ["verify", batch_dir,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("605 batch-invalid-spec e2e: real "
+                      "cmd_verify on a directory exits "
+                      "exactly 1 (batch records INVALID SPEC "
+                      "as a per-flow failure, not exit 2)",
+                      rc == 1, str(rc))
+                invalid_lines = [l for l in lines
+                                 if l.startswith("[a-broken]")]
+                check("605 batch-invalid-spec e2e: stdout "
+                      "holds exactly one [a-broken] line",
+                      len(invalid_lines) == 1,
+                      str(invalid_lines))
+                invalid_line = (invalid_lines[0]
+                                if invalid_lines else "")
+                line_ok = invalid_line.startswith(
+                    "[a-broken] INVALID SPEC: spec "
+                    + broken_path + ": cannot parse YAML")
+                check("605 batch-invalid-spec e2e: the "
+                      "[a-broken] line is the INVALID SPEC "
+                      "line naming the broken path and the "
+                      "YAML parse failure", line_ok,
+                      invalid_line)
+                flows_line_ok = "flows: 2" in lines
+                check("605 batch-invalid-spec e2e: stdout "
+                      "carries the flows: 2 line",
+                      flows_line_ok, str(lines))
+                pass_line_ok = any(
+                    l.startswith("[PASS] demo-teardown")
+                    and l.endswith("6/7 steps") for l in lines)
+                check("605 batch-invalid-spec e2e: stdout "
+                      "carries the [PASS] demo-teardown line "
+                      "with 6/7 steps", pass_line_ok,
+                      str(lines))
+                batch_line_ok = (
+                    "batch: 1/2 flows passed" in lines)
+                check("605 batch-invalid-spec e2e: stdout "
+                      "carries the batch: 1/2 flows passed "
+                      "line", batch_line_ok, str(lines))
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                check("605 batch-invalid-spec e2e: exactly "
+                      "one parent run dir created",
+                      len(parents) == 1, str(parents))
+                parent_named_batch = bool(parents) and (
+                    "-batch" in parents[0])
+                check("605 batch-invalid-spec e2e: parent "
+                      "run dir name carries the -batch "
+                      "infix", parent_named_batch, str(parents))
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_line_ok = bool(lines) and bool(parent) \
+                    and lines[-1] == (
+                        "report: " + os.path.join(
+                            parent, "REPORT.md"))
+                check("605 batch-invalid-spec e2e: stdout "
+                      "last line is the parent report line",
+                      report_line_ok, str(lines[-1:]))
+                parent_entries = (sorted(os.listdir(parent))
+                                  if parent else [])
+                check("605 batch-invalid-spec e2e: parent "
+                      "entries are exactly REPORT.md, "
+                      "batch.json, flows and steps",
+                      parent_entries == exp["parent_entries"],
+                      str(parent_entries))
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                report_lines = (
+                    open(report_path, encoding="utf-8").read(
+                        ).splitlines() if report_path else [])
+                check("605 batch-invalid-spec e2e: parent "
+                      "REPORT.md first line is the 1/2 PASS "
+                      "batch header",
+                      bool(report_lines) and report_lines[0]
+                      == exp["report_first_line"],
+                      str(report_lines[:1]))
+                table_row_0 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 0 |")), None)
+                check("605 batch-invalid-spec e2e: parent "
+                      "REPORT.md row 0 is the exact broken "
+                      "row", table_row_0 == exp["table_row_0"],
+                      str(table_row_0))
+                table_row_1 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 1 |")), None)
+                check("605 batch-invalid-spec e2e: parent "
+                      "REPORT.md row 1 is the exact passed "
+                      "row", table_row_1 == exp["table_row_1"],
+                      str(table_row_1))
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                batch = (json.load(open(
+                    batch_path, encoding="utf-8"))
+                    if batch_path else [])
+                check("605 batch-invalid-spec e2e: batch.json "
+                      "is a bare list holding exactly two "
+                      "entries", isinstance(batch, list)
+                      and len(batch) == 2, str(batch))
+                batch0 = (batch[0]
+                          if isinstance(batch, list)
+                          and len(batch) > 0 else {})
+                batch1 = (batch[1]
+                          if isinstance(batch, list)
+                          and len(batch) > 1 else {})
+                batch0_error = batch0.get("error") or ""
+                batch0_error_ok = batch0_error.startswith(
+                    "INVALID SPEC: spec " + broken_path
+                    + ": cannot parse YAML")
+                check("605 batch-invalid-spec e2e: batch "
+                      "entry 0 is the broken flow, failed, "
+                      "with the INVALID SPEC error naming "
+                      "the broken path",
+                      batch0.get("file") == "a-broken.yaml"
+                      and batch0.get("status") == "failed"
+                      and batch0.get("steps_passed") == 0
+                      and batch0.get("steps_total") == 0
+                      and batch0.get("report") is None
+                      and batch0_error_ok, str(batch0))
+                check("605 batch-invalid-spec e2e: batch "
+                      "entry 1 is the passed sibling with "
+                      "its report link and no error",
+                      batch1.get("file") == "b-pass.yaml"
+                      and batch1.get("status") == "passed"
+                      and batch1.get("steps_passed") == 6
+                      and batch1.get("steps_total") == 7
+                      and batch1.get("report")
+                      == "flows/b-pass/REPORT.md"
+                      and batch1.get("error") is None,
+                      str(batch1))
+                broken_dir = (os.path.join(
+                    parent, "flows", "a-broken")
+                    if parent else "")
+                broken_entries = (sorted(os.listdir(broken_dir))
+                                  if broken_dir else [])
+                check("605 batch-invalid-spec e2e: broken "
+                      "per-flow subdir entries are exactly "
+                      "steps", broken_entries
+                      == exp["broken_entries"],
+                      str(broken_entries))
+                broken_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        broken_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        broken_dir)
+                    for name in filenames) if broken_dir else []
+                check("605 batch-invalid-spec e2e: broken "
+                      "per-flow subdir holds no files at all",
+                      broken_files == exp["broken_files"],
+                      str(broken_files))
+                passed_dir = (os.path.join(
+                    parent, "flows", "b-pass")
+                    if parent else "")
+                passed_entries = (sorted(os.listdir(passed_dir))
+                                  if passed_dir else [])
+                check("605 batch-invalid-spec e2e: passed "
+                      "per-flow subdir entries are exactly "
+                      "REPORT.md, junit.xml, network.jsonl, "
+                      "run.json and steps",
+                      passed_entries == exp["passed_entries"],
+                      str(passed_entries))
+                passed_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        passed_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        passed_dir)
+                    for name in filenames) if passed_dir else []
+                check("605 batch-invalid-spec e2e: passed "
+                      "per-flow subdir files are exactly "
+                      "REPORT.md, junit.xml, network.jsonl, "
+                      "run.json and the two designed-failure "
+                      "teardown step artifacts",
+                      passed_files == exp["passed_files"],
+                      str(passed_files))
+                passed_json = (os.path.join(
+                    passed_dir, "run.json")
+                    if passed_dir else "")
+                passed_data = (json.load(open(
+                    passed_json, encoding="utf-8"))
+                    if passed_json else {})
+                check("605 batch-invalid-spec e2e: passed "
+                      "subdir run.json status passed",
+                      passed_data.get("status") == "passed",
+                      str(passed_data.get("status")))
+                rows = ledger.read_all()
+                check("605 batch-invalid-spec e2e: ledger "
+                      "has exactly one row",
+                      len(rows) == 1, str(rows))
+                row = rows[0] if len(rows) == 1 else {}
+                check("605 batch-invalid-spec e2e: ledger "
+                      "row is the scripted passed "
+                      "demo-teardown run (the passed "
+                      "sibling only)",
+                      row.get("kind") == "scripted"
+                      and row.get("flow") == "demo-teardown"
+                      and row.get("status") == "passed",
+                      str(row))
+                outcome = {"exit_code": rc,
+                           "invalid_line_count":
+                               len(invalid_lines),
+                           "line_ok": line_ok,
+                           "flows_line_ok": flows_line_ok,
+                           "pass_line_ok": pass_line_ok,
+                           "batch_line_ok": batch_line_ok,
+                           "report_line_ok": report_line_ok,
+                           "parent_count": len(parents),
+                           "parent_named_batch":
+                               parent_named_batch,
+                           "parent_entries": parent_entries,
+                           "report_first_line": (
+                               report_lines[0]
+                               if report_lines else None),
+                           "table_row_0": table_row_0,
+                           "table_row_1": table_row_1,
+                           "batch_len": (
+                               len(batch)
+                               if isinstance(batch, list)
+                               else None),
+                           "batch0_file": batch0.get("file"),
+                           "batch0_status": batch0.get("status"),
+                           "batch0_steps_passed": batch0.get(
+                               "steps_passed"),
+                           "batch0_steps_total": batch0.get(
+                               "steps_total"),
+                           "batch0_report": batch0.get("report"),
+                           "batch0_error_ok": batch0_error_ok,
+                           "batch1_file": batch1.get("file"),
+                           "batch1_status": batch1.get("status"),
+                           "batch1_steps_passed": batch1.get(
+                               "steps_passed"),
+                           "batch1_steps_total": batch1.get(
+                               "steps_total"),
+                           "batch1_report": batch1.get("report"),
+                           "batch1_error": batch1.get("error"),
+                           "broken_entries": broken_entries,
+                           "broken_files": broken_files,
+                           "passed_entries": passed_entries,
+                           "passed_files": passed_files,
+                           "passed_status":
+                               passed_data.get("status"),
+                           "ledger_rows": len(rows),
+                           "ledger_kind": row.get("kind"),
+                           "ledger_flow": row.get("flow"),
+                           "ledger_status": row.get("status")}
+                mismatch = batch_invalid_spec_mismatch(
+                    outcome, exp)
+                check("605 batch-invalid-spec e2e: real "
+                      "composition pins the pinned fields "
+                      "exactly", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
