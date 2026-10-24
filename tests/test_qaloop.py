@@ -48783,6 +48783,13 @@ def test_issue_593_verify_port_services_boot_failed_e2e():
     threading.Thread(target=probe_srv.serve_forever,
                      daemon=True).start()
     try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{probe_port}/",
+                timeout=5) as resp:
+            probe_body = resp.read()
+        check("593 verify-port-services-boot-failed e2e: probe "
+              "server answers a real GET with ok",
+              probe_body == b"ok")
         check("593 verify-port-services-boot-failed e2e: port "
               "helper sees a listening server port as open",
               port_open(probe_port) is True)
