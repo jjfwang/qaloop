@@ -50634,6 +50634,484 @@ investigate_on_failure: false
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_603_batch_matrix_port_boot_failed_e2e():
+    """Issue #603: pin the CLI batch verify MATRIX + services
+    PORT BOOT FAILED composition end to end. The batch
+    matrix boot-failure composition is pinned for the http
+    wait form (#557), the partial form (#565) and the
+    log_contains wait form (#573), and the port boot
+    failure is pinned for non-matrix batch (#597), verify
+    matrix (#599) and baselines matrix (#601) - but no
+    dedicated test drove the real build_parser ->
+    cmd_verify in batch mode on a batch dir holding
+    exactly one flow carrying BOTH matrix: and the
+    demo-services-port-fail services block. In code,
+    cmd_verify on a directory dispatches to
+    _cmd_verify_batch, whose _batch_run_one boots the
+    flow's services context inside the per-flow subdir;
+    the boot failure is recorded as that flow's error and
+    the batch completes, exit 1 per the batch contract -
+    with no matrix dispatch ever occurring. This test
+    stubs NOTHING in the batch, matrix or services chain:
+    it stages a batch dir via mkdtemp at the repo root
+    (so the service cwd ".." resolves to the repo root,
+    exactly as in flows/) holding exactly one flow
+    combining the demo-services-port-fail service block
+    verbatim - its only service (portsvc, python3
+    demo/port_ready_server.py, which itself binds port
+    8942) is waited on at port 8951, a port nothing
+    listens on, so wait_for_port raises TimeoutError at
+    the 5s timeout - with a matrix of user [ada, bob] and
+    the demo-services-port-fail setup+steps body verbatim,
+    drives the real build_parser -> cmd_verify in batch
+    mode against a temp runs root and ledger, and pins
+    exit exactly 1, the batch run dir line, flows: 1,
+    exactly one bracketed SERVICE BOOT FAILED line by
+    full-string equality, batch: 0/1 flows passed, the
+    report line last, the parent run dir name carrying
+    the -batch infix with entries exactly [REPORT.md,
+    batch.json, flows, steps], the parent REPORT.md
+    first line and failed row, batch.json as a bare list
+    with the one failed entry (file, status, steps 0/0,
+    report None, error exactly the unbracketed SERVICE
+    BOOT FAILED string), the per-flow subdir holding only
+    the empty steps scaffold and no files (no matrix
+    dispatch, no matrix/ subdir), zero ledger rows, the
+    service env exports removed, both ports not open
+    before the run and closed after via bounded polls,
+    and no orphaned fixture process."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    flow_name = "probe-batch-matrix-portsvc-bootfail"
+    expected_error = (
+        "SERVICE BOOT FAILED: TimeoutError: port 8951 not "
+        "open after 5.0s")
+    expected_boot_line = (
+        f"[{flow_name}] " + expected_error)
+    flow_text = """version: 1
+name: probe-batch-matrix-portsvc-bootfail
+description: probe combining batch, matrix and a port boot-failing service
+services:
+  - name: portsvc
+    command: "python3 demo/port_ready_server.py"
+    cwd: ".."
+    wait: {port: 8951}
+    timeout_s: 5
+target: ${QALOOP_SERVICE_PORTSVC_URL}
+
+matrix:
+  user: [ada, bob]
+
+setup:
+  - name: open the page served by the port-gated service
+    goto: /demo/port-ready.html
+
+steps:
+  - name: the port-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the port-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "port-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "PORTSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+
+    def batch_matrix_port_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_open(port):
+        sock = socket.socket()
+        try:
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+        finally:
+            sock.close()
+
+    def port_closed_settled(port, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        closed = not port_open(port)
+        while not closed and time.time() < deadline:
+            time.sleep(0.25)
+            closed = not port_open(port)
+        return closed
+
+    exp = {"exit_code": 1, "batch_line_ok": True,
+           "flows_line_ok": True,
+           "boot_line_count": 1, "line_ok": True,
+           "passed_line_ok": True,
+           "report_line_ok": True,
+           "parent_count": 1, "parent_named_batch": True,
+           "parent_entries": ["REPORT.md", "batch.json",
+                              "flows", "steps"],
+           "report_first_line":
+               "# qaloop batch report [0/1 PASS]",
+           "table_row_0":
+               "| 0 | `probe-batch-matrix-portsvc-bootfail.yaml` "
+               "| FAIL | 0/0 | \u2014 |",
+           "batch_len": 1,
+           "batch_file":
+               "probe-batch-matrix-portsvc-bootfail.yaml",
+           "batch_status": "failed",
+           "batch_steps_passed": 0, "batch_steps_total": 0,
+           "batch_report": None,
+           "batch_error": expected_error,
+           "flow_entries": ["steps"], "flow_files": [],
+           "no_matrix_subdir": True,
+           "ledger_rows": 0,
+           "env_portsvc_url_absent": True,
+           "env_portsvc_port_absent": True,
+           "port_8951_closed_after": True,
+           "port_8942_closed_after": True, "no_orphan": True}
+    check("603 batch-matrix-port-boot-failed e2e: exact "
+          "expectations return no mismatch",
+          batch_matrix_port_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, exit_code=3), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, parent_entries=["REPORT.md"]), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted parent_entries caught, names field",
+          probe is not None
+          and probe.startswith("parent_entries:"),
+          probe or "")
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, batch_status="passed"), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted batch entry status caught, names field",
+          probe is not None
+          and probe.startswith("batch_status:"), probe or "")
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, flow_files=["services/portsvc.log"]), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted per-flow files caught, names field",
+          probe is not None
+          and probe.startswith("flow_files:"), probe or "")
+    probe = batch_matrix_port_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("603 batch-matrix-port-boot-failed e2e: "
+          "corrupted ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the port helpers against a caller-owned
+    # throwaway server (an accepting HTTP server, so repeated
+    # connects complete instead of filling a listen backlog
+    # nobody drains): its port is open, the bounded
+    # closed-poll must not declare a live port closed, and
+    # it must notice once the server goes away mid-poll.
+    import http.server
+    import threading
+
+    class _PortProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _PortProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{probe_port}/",
+                timeout=5) as resp:
+            probe_body = resp.read()
+        check("603 batch-matrix-port-boot-failed e2e: probe "
+              "server answers a real GET with ok",
+              probe_body == b"ok")
+        check("603 batch-matrix-port-boot-failed e2e: port "
+              "helper sees a listening server port as open",
+              port_open(probe_port) is True)
+        check("603 batch-matrix-port-boot-failed e2e: "
+              "closed-poll against a live port returns False",
+              port_closed_settled(probe_port, timeout_s=0.6)
+              is False)
+        def stop_probe_srv():
+            probe_srv.shutdown()
+            probe_srv.server_close()
+
+        threading.Timer(0.3, stop_probe_srv).start()
+        check("603 batch-matrix-port-boot-failed e2e: "
+              "closed-poll notices a server dying mid-poll",
+              port_closed_settled(probe_port, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    check("603 batch-matrix-port-boot-failed e2e: port "
+          "helper sees the shut-down server port as closed",
+          port_open(probe_port) is False)
+    if not os.path.exists(exe): check("603 batch-matrix-port-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("603 batch-matrix-port-boot-failed e2e: wait "
+          "port 8951 not open before the run",
+          not port_open(8951), "port 8951 already open")
+    check("603 batch-matrix-port-boot-failed e2e: fixture "
+          "port 8942 not open before the run",
+          not port_open(8942), "port 8942 already open")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_PORTSVC_URL",
+                "QALOOP_SERVICE_PORTSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        batch_dir = tempfile.mkdtemp(dir=root)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                runs_root = os.path.join(td, "runs")
+                os.environ["QALOOP_RUNS"] = runs_root
+                os.environ["QALOOP_LEDGER"] = os.path.join(
+                    td, "ledger.jsonl")
+                os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+                with open(os.path.join(
+                        batch_dir, flow_name + ".yaml"),
+                        "w", encoding="utf-8") as fh:
+                    fh.write(flow_text)
+                parsed = cli.build_parser().parse_args(
+                    ["verify", batch_dir,
+                     "--executable-path", exe])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: real cmd_verify on a directory "
+                      "exits exactly 1", rc == 1, str(rc))
+                batch_line_ok = bool(
+                    [l for l in lines
+                     if l.startswith("batch run dir: ")])
+                flows_line_ok = "flows: 1" in lines
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: stdout carries the batch run dir "
+                      "line and the flows: 1 line",
+                      batch_line_ok and flows_line_ok,
+                      str(lines))
+                boot_lines = [l for l in lines
+                              if "SERVICE BOOT FAILED" in l]
+                boot_line = boot_lines[0] if boot_lines else ""
+                line_ok = boot_line == expected_boot_line
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: stdout holds exactly one SERVICE "
+                      "BOOT FAILED line, equal to the exact "
+                      "bracketed line",
+                      len(boot_lines) == 1 and line_ok,
+                      str(boot_lines))
+                passed_line_ok = (
+                    "batch: 0/1 flows passed" in lines)
+                parents = (sorted(os.listdir(runs_root))
+                           if os.path.isdir(runs_root) else [])
+                parent = (os.path.join(runs_root, parents[0])
+                          if len(parents) == 1 else "")
+                report_line_ok = bool(lines) and bool(parent) \
+                    and lines[-1] == (
+                        "report: " + os.path.join(
+                            parent, "REPORT.md"))
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: stdout carries the batch: 0/1 "
+                      "flows passed line and the report line "
+                      "is last", passed_line_ok and report_line_ok,
+                      str(lines))
+                parent_named_batch = bool(parents) and (
+                    "-batch-" in parents[0])
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: exactly one parent run dir created, "
+                      "its name carrying the -batch infix",
+                      len(parents) == 1 and parent_named_batch,
+                      str(parents))
+                parent_entries = (sorted(os.listdir(parent))
+                                  if parent else [])
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: parent entries are exactly "
+                      "REPORT.md, batch.json, flows, steps",
+                      parent_entries == exp["parent_entries"],
+                      str(parent_entries))
+                report_path = (os.path.join(parent, "REPORT.md")
+                               if parent else "")
+                report_lines = (
+                    open(report_path, encoding="utf-8").read(
+                        ).splitlines()
+                    if report_path
+                    and os.path.isfile(report_path) else [])
+                table_row_0 = next(
+                    (l for l in report_lines
+                     if l.startswith("| 0 |")), None)
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: parent REPORT.md first line is "
+                      "the 0/1 PASS batch header and row 0 is "
+                      "the exact boot-failed row",
+                      bool(report_lines)
+                      and report_lines[0]
+                      == exp["report_first_line"]
+                      and table_row_0 == exp["table_row_0"],
+                      str(report_lines[:1]) + " " + str(table_row_0))
+                batch_path = (os.path.join(parent, "batch.json")
+                              if parent else "")
+                batch = (json.load(open(
+                    batch_path, encoding="utf-8"))
+                    if batch_path
+                    and os.path.isfile(batch_path) else [])
+                batch0 = (batch[0]
+                          if isinstance(batch, list)
+                          and len(batch) > 0 else {})
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: batch.json is a bare list of one "
+                      "entry, the boot-failed matrix flow with "
+                      "the exact unbracketed error",
+                      isinstance(batch, list)
+                      and len(batch) == 1
+                      and batch0.get("file")
+                      == flow_name + ".yaml"
+                      and batch0.get("status") == "failed"
+                      and batch0.get("steps_passed") == 0
+                      and batch0.get("steps_total") == 0
+                      and batch0.get("report") is None
+                      and batch0.get("error") == expected_error,
+                      str(batch))
+                flow_dir = (os.path.join(
+                    parent, "flows", flow_name)
+                    if parent else "")
+                flow_entries = (sorted(os.listdir(flow_dir))
+                                if os.path.isdir(flow_dir)
+                                else [])
+                flow_files = sorted(
+                    os.path.relpath(
+                        os.path.join(dirpath, name),
+                        flow_dir).replace(os.sep, "/")
+                    for dirpath, _dirnames, filenames in os.walk(
+                        flow_dir)
+                    for name in filenames) if flow_dir else []
+                no_matrix_subdir = not os.path.isdir(
+                    os.path.join(flow_dir, "matrix"))
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: per-flow subdir holds only the "
+                      "empty steps scaffold, no files and no "
+                      "matrix/ subdir (no matrix dispatch)",
+                      flow_entries == ["steps"]
+                      and flow_files == []
+                      and no_matrix_subdir,
+                      str(flow_entries) + " " + str(flow_files))
+                rows = ledger.read_all()
+                env_portsvc_url_absent = (
+                    "QALOOP_SERVICE_PORTSVC_URL" not in os.environ)
+                env_portsvc_port_absent = (
+                    "QALOOP_SERVICE_PORTSVC_PORT" not in os.environ)
+                port_8951_closed = port_closed_settled(8951)
+                port_8942_closed = port_closed_settled(8942)
+                orphans = None
+                for _ in range(100):
+                    time.sleep(0.1)
+                    orphans = subprocess.run(
+                        ["pgrep", "-f", "port_ready_server"],
+                        capture_output=True, text=True)
+                    if orphans.returncode != 0:
+                        break
+                no_orphan = (orphans is not None
+                             and orphans.returncode == 1
+                             and not orphans.stdout.strip())
+                outcome = {"exit_code": rc,
+                           "batch_line_ok": batch_line_ok,
+                           "flows_line_ok": flows_line_ok,
+                           "boot_line_count": len(boot_lines),
+                           "line_ok": line_ok,
+                           "passed_line_ok": passed_line_ok,
+                           "report_line_ok": report_line_ok,
+                           "parent_count": len(parents),
+                           "parent_named_batch":
+                               parent_named_batch,
+                           "parent_entries": parent_entries,
+                           "report_first_line": (
+                               report_lines[0]
+                               if report_lines else None),
+                           "table_row_0": table_row_0,
+                           "batch_len": (
+                               len(batch)
+                               if isinstance(batch, list)
+                               else None),
+                           "batch_file": batch0.get("file"),
+                           "batch_status": batch0.get("status"),
+                           "batch_steps_passed": batch0.get(
+                               "steps_passed"),
+                           "batch_steps_total": batch0.get(
+                               "steps_total"),
+                           "batch_report": batch0.get("report"),
+                           "batch_error": batch0.get("error"),
+                           "flow_entries": flow_entries,
+                           "flow_files": flow_files,
+                           "no_matrix_subdir": no_matrix_subdir,
+                           "ledger_rows": len(rows),
+                           "env_portsvc_url_absent":
+                               env_portsvc_url_absent,
+                           "env_portsvc_port_absent":
+                               env_portsvc_port_absent,
+                           "port_8951_closed_after":
+                               port_8951_closed,
+                           "port_8942_closed_after":
+                               port_8942_closed,
+                           "no_orphan": no_orphan}
+                mismatch = (
+                    batch_matrix_port_boot_failed_mismatch(
+                        outcome, exp))
+                check("603 batch-matrix-port-boot-failed "
+                      "e2e: real composition pins the pinned "
+                      "fields exactly (zero ledger rows, env "
+                      "exports removed, ports closed after, no "
+                      "orphan)", mismatch is None,
+                      mismatch or "")
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
