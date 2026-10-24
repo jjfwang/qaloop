@@ -1,0 +1,49 @@
+version: 1
+name: demo-services-port-fail
+tags: [smoke]
+description: >-
+  Automated non-vacuity boot control for the services wait port
+  form (companion to demo-services-port). The service command,
+  cwd, and fixture are identical to demo-services-port, but the
+  wait port is 8951, a port nothing listens on (the fixture
+  itself binds 8942), so boot must fail closed at timeout_s:
+  qaloop/env.py wait_for_port raises TimeoutError "port 8951
+  not open after 5.0s", qaloop/cli.py prints SERVICE BOOT
+  FAILED and returns exit 3, and the fixture process is
+  terminated so port 8942 is free afterwards. This flow is
+  expected to FAIL at boot - its steps never run. The proof is
+  the verify command's failure output, its exit code 3, no run
+  recorded as passed, and no orphaned fixture process left
+  alive afterwards.
+services:
+  - name: portsvc
+    command: "python3 demo/port_ready_server.py"
+    cwd: ".."
+    wait: {port: 8951}
+    timeout_s: 5
+target: ${QALOOP_SERVICE_PORTSVC_URL}
+
+setup:
+  - name: open the page served by the port-gated service
+    goto: /demo/port-ready.html
+
+steps:
+  - name: the port-gated service serves its own page
+    expect:
+      - text_contains: {selector: "#ready-note", text: "served only by the port-gated service"}
+
+  - name: load the status only this service answers
+    click: "#load"
+    expect:
+      - text_contains: {selector: "#out", text: "port-gated service answered"}
+
+  - name: negative control - the service never renders this text
+    continue_on_fail: true
+    expect:
+      - text_contains: {selector: "#out", text: "PORTSVC-WRONG never rendered"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
