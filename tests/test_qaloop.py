@@ -16052,6 +16052,7 @@ def test_issue_385_smoke_corpus_execute():
         "demo-services-http-fail": ("boot_failed", None),
         "demo-services-partial-fail": ("boot_failed", None),
         "demo-services-log-fail": ("boot_failed", None),
+        "demo-services-port-fail": ("boot_failed", None),
     }
     smoke_subset = ["demo-seed-http-json", "demo-mock-method",
                     "demo-matrix-list", "demo-setup-fail",
@@ -48658,6 +48659,278 @@ investigate_on_failure: false
             shutil.rmtree(batch_dir, ignore_errors=True)
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
+def test_issue_593_verify_port_services_boot_failed_e2e():
+    """Issue #593: pin the CLI verify services PORT BOOT
+    FAILURE composition end to end. The http boot failure is
+    pinned for cmd_verify by #511 and the log_contains twin by
+    #523, but the port case - the real build_parser ->
+    cmd_verify entering the services context on the shipped
+    flows/demo-services-port-fail.yaml, whose only service
+    (portsvc, python3 demo/port_ready_server.py, which itself
+    binds port 8942) is waited on at port 8951, a port nothing
+    listens on, so wait_for_port raises TimeoutError at the
+    5s timeout, cli.py printing the exact SERVICE BOOT FAILED
+    line and returning exit 3, the run dir holding no files
+    at all (only the empty steps scaffold; no services log,
+    no run.json, no REPORT.md), no ledger row appended, the
+    service env exports removed, the fixture process
+    terminated so both ports are dead afterwards and no
+    port_ready_server process orphaned - was previously run
+    by hand only, so the whole path could rot unobserved.
+    This test stubs NOTHING in the verify/services chain: it
+    drives the real CLI against a temp runs root and ledger
+    and pins the exit code, the printed line by full-string
+    equality, the run dir's complete file inventory, the
+    absent ledger row, the removed env exports, and teardown
+    as port CLOSEDNESS for both ports within bounded polls
+    plus the absence of an orphaned fixture process."""
+    import socket
+    import subprocess
+    import time
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+    expected_line = (
+        "SERVICE BOOT FAILED: TimeoutError: port 8951 not "
+        "open after 5.0s")
+
+    def verify_port_services_boot_failed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    def port_open(port):
+        sock = socket.socket()
+        try:
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+        finally:
+            sock.close()
+
+    def port_closed_settled(port, timeout_s=10.0):
+        deadline = time.time() + timeout_s
+        closed = not port_open(port)
+        while not closed and time.time() < deadline:
+            time.sleep(0.25)
+            closed = not port_open(port)
+        return closed
+
+    exp = {"exit_code": 3, "line_count": 1, "line_ok": True,
+           "run_dir_count": 1, "run_dir_files": [],
+           "ledger_rows": 0, "env_portsvc_url_absent": True,
+           "env_portsvc_port_absent": True,
+           "port_8951_closed_after": True,
+           "port_8942_closed_after": True, "no_orphan": True}
+    check("593 verify-port-services-boot-failed e2e: exact "
+          "expectations return no mismatch",
+          verify_port_services_boot_failed_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_port_services_boot_failed_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("593 verify-port-services-boot-failed e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_port_services_boot_failed_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("593 verify-port-services-boot-failed e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_port_services_boot_failed_mismatch(
+        dict(exp, run_dir_files=["services/portsvc.log"]), exp)
+    check("593 verify-port-services-boot-failed e2e: corrupted "
+          "run_dir_files caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_files:"), probe or "")
+    probe = verify_port_services_boot_failed_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("593 verify-port-services-boot-failed e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None
+          and probe.startswith("ledger_rows:"), probe or "")
+
+    # Exercise the port helpers against a caller-owned
+    # throwaway server (an accepting HTTP server, so repeated
+    # connects complete instead of filling a listen backlog
+    # nobody drains): its port is open, the bounded
+    # closed-poll must not declare a live port closed, and
+    # it must notice once the server goes away mid-poll.
+    import http.server
+    import threading
+
+    class _PortProbeHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    probe_srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _PortProbeHandler)
+    probe_port = probe_srv.server_address[1]
+    threading.Thread(target=probe_srv.serve_forever,
+                     daemon=True).start()
+    try:
+        check("593 verify-port-services-boot-failed e2e: port "
+              "helper sees a listening server port as open",
+              port_open(probe_port) is True)
+        check("593 verify-port-services-boot-failed e2e: "
+              "closed-poll against a live port returns False",
+              port_closed_settled(probe_port, timeout_s=0.6)
+              is False)
+        def stop_probe_srv():
+            probe_srv.shutdown()
+            probe_srv.server_close()
+
+        threading.Timer(0.3, stop_probe_srv).start()
+        check("593 verify-port-services-boot-failed e2e: "
+              "closed-poll notices a server dying mid-poll",
+              port_closed_settled(probe_port, timeout_s=5.0)
+              is True)
+    finally:
+        probe_srv.shutdown()
+        probe_srv.server_close()
+    check("593 verify-port-services-boot-failed e2e: port "
+          "helper sees the shut-down server port as closed",
+          port_open(probe_port) is False)
+    if not os.path.exists(exe): check("593 verify-port-services-boot-failed e2e execution skipped (no browser)", True); return
+
+    check("593 verify-port-services-boot-failed e2e: wait "
+          "port 8951 not open before the run",
+          not port_open(8951), "port 8951 already open")
+    check("593 verify-port-services-boot-failed e2e: fixture "
+          "port 8942 not open before the run",
+          not port_open(8942), "port 8942 already open")
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL", "QALOOP_SERVICE_PORTSVC_URL",
+                "QALOOP_SERVICE_PORTSVC_PORT")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("TARGET_URL", None)
+        for k in env_keys:
+            if k.startswith("QALOOP_SERVICE_"):
+                os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            flow_path = os.path.join(
+                root, "flows", "demo-services-port-fail.yaml")
+            parsed = cli.build_parser().parse_args(
+                ["verify", flow_path, "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            lines = buf.getvalue().splitlines()
+            check("593 verify-port-services-boot-failed e2e: "
+                  "real cmd_verify exits exactly 3", rc == 3,
+                  str(rc))
+            check("593 verify-port-services-boot-failed e2e: "
+                  "stdout is exactly one line", len(lines) == 1,
+                  str(lines))
+            line = lines[0] if lines else ""
+            check("593 verify-port-services-boot-failed e2e: "
+                  "line equals the exact SERVICE BOOT FAILED "
+                  "line", line == expected_line, line)
+            line_ok = (line == expected_line)
+            run_dirs = (sorted(os.listdir(runs_root))
+                        if os.path.isdir(runs_root) else [])
+            check("593 verify-port-services-boot-failed e2e: "
+                  "exactly one new run dir created",
+                  len(run_dirs) == 1, str(run_dirs))
+            only_dir = (os.path.join(runs_root, run_dirs[0])
+                        if len(run_dirs) == 1 else "")
+            run_dir_files = sorted(
+                os.path.relpath(
+                    os.path.join(dirpath, name),
+                    only_dir).replace(os.sep, "/")
+                for dirpath, _dirnames, filenames in os.walk(
+                    only_dir)
+                for name in filenames) if only_dir else []
+            check("593 verify-port-services-boot-failed e2e: "
+                  "run dir file inventory is exactly empty",
+                  run_dir_files == [], str(run_dir_files))
+            rows = ledger.read_all()
+            check("593 verify-port-services-boot-failed e2e: "
+                  "ledger has zero rows", len(rows) == 0,
+                  str(rows))
+            env_portsvc_url_absent = (
+                "QALOOP_SERVICE_PORTSVC_URL" not in os.environ)
+            check("593 verify-port-services-boot-failed e2e: "
+                  "QALOOP_SERVICE_PORTSVC_URL absent after "
+                  "the run", env_portsvc_url_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_PORTSVC_URL")))
+            env_portsvc_port_absent = (
+                "QALOOP_SERVICE_PORTSVC_PORT" not in os.environ)
+            check("593 verify-port-services-boot-failed e2e: "
+                  "QALOOP_SERVICE_PORTSVC_PORT absent after "
+                  "the run", env_portsvc_port_absent,
+                  str(os.environ.get(
+                      "QALOOP_SERVICE_PORTSVC_PORT")))
+            port_8951_closed = port_closed_settled(8951)
+            check("593 verify-port-services-boot-failed e2e: "
+                  "wait port 8951 closed after the run "
+                  "(bounded poll)", port_8951_closed,
+                  "port 8951 still open after settle")
+            port_8942_closed = port_closed_settled(8942)
+            check("593 verify-port-services-boot-failed e2e: "
+                  "fixture port 8942 closed after the run, "
+                  "so the fixture process was terminated "
+                  "(bounded poll)", port_8942_closed,
+                  "port 8942 still open after settle")
+            orphans = None
+            for _ in range(30):
+                time.sleep(0.1)
+                orphans = subprocess.run(
+                    ["pgrep", "-f", "port_ready_server"],
+                    capture_output=True, text=True)
+                if orphans.returncode != 0:
+                    break
+            no_orphan = (orphans is not None
+                         and orphans.returncode == 1
+                         and not orphans.stdout.strip())
+            check("593 verify-port-services-boot-failed e2e: "
+                  "no orphaned port_ready_server process "
+                  "after the run", no_orphan,
+                  orphans.stdout if orphans else "no pgrep result")
+            outcome = {"exit_code": rc,
+                       "line_count": len(lines),
+                       "line_ok": line_ok,
+                       "run_dir_count": len(run_dirs),
+                       "run_dir_files": run_dir_files,
+                       "ledger_rows": len(rows),
+                       "env_portsvc_url_absent":
+                           env_portsvc_url_absent,
+                       "env_portsvc_port_absent":
+                           env_portsvc_port_absent,
+                       "port_8951_closed_after": port_8951_closed,
+                       "port_8942_closed_after": port_8942_closed,
+                       "no_orphan": no_orphan}
+            mismatch = verify_port_services_boot_failed_mismatch(
+                outcome, exp)
+            check("593 verify-port-services-boot-failed e2e: "
+                  "real composition pins the pinned fields "
+                  "exactly", mismatch is None, mismatch or "")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
