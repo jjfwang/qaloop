@@ -53961,6 +53961,145 @@ def test_issue_633_investigate_bad_input_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_635_ledger_malformed_e2e():
+    """Issue #635: pin the CLI ledger malformed-file exit
+    path end to end. cmd_ledger called ledger.summarize()
+    with no error handling, so a malformed ledger line
+    raised an uncaught ValueError (invalid JSON), a
+    non-object line broke summarisation, and a present
+    non-numeric cost_usd_est raised in float(). This test
+    stubs NOTHING: it drives only the real build_parser
+    -> cmd_ledger and pins, for each rejected phase,
+    exit exactly 2 and stdout exactly one exact error
+    line - (A) invalid JSON on line 2, (B) a non-object
+    JSON value on line 2, (C) a non-numeric cost_usd_est
+    on line 2 - plus the valid control and the
+    missing-file control, both exit 0 with the exact
+    summary JSON."""
+    from qaloop import cli
+
+    def ledger_malformed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1, "line_ok": True}
+    check("635 ledger-malformed e2e: exact expectations "
+          "return no mismatch",
+          ledger_malformed_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = ledger_malformed_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("635 ledger-malformed e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = ledger_malformed_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("635 ledger-malformed e2e: corrupted line_ok "
+          "caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+
+    env_keys = ("QALOOP_LEDGER", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        os.environ.pop("TARGET_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            ledger_file = os.path.join(td, "ledger.jsonl")
+            os.environ["QALOOP_LEDGER"] = ledger_file
+
+            def run_ledger():
+                parsed = cli.build_parser().parse_args(["ledger"])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            valid_line = json.dumps(
+                {"kind": "scripted", "cost_usd_est": 0.0}) + "\n"
+
+            def pin_reject(tag, file_content, expected_line):
+                with open(ledger_file, "w", encoding="utf-8") as f:
+                    f.write(file_content)
+                rc, lines = run_ledger()
+                check(f"635 ledger-malformed e2e: {tag} "
+                      "real cmd_ledger exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"635 ledger-malformed e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"635 ledger-malformed e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line}
+                mismatch = ledger_malformed_mismatch(
+                    outcome, exp_reject)
+                check(f"635 ledger-malformed e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            pin_reject("invalid-json",
+                       valid_line + "not json\n",
+                       "error: ledger line 2 is not valid JSON")
+            pin_reject("non-object",
+                       valid_line + json.dumps(
+                           ["not", "an", "object"]) + "\n",
+                       "error: ledger line 2 is not a JSON object")
+            pin_reject("non-numeric-cost",
+                       valid_line + json.dumps(
+                           {"kind": "scripted",
+                            "cost_usd_est": "abc"}) + "\n",
+                       "error: ledger line 2 cost_usd_est "
+                       "is not numeric")
+
+            with open(ledger_file, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"kind": "scripted"}) + "\n")
+                f.write("\n")
+                f.write(json.dumps(
+                    {"kind": "investigation",
+                     "cost_usd_est": None}) + "\n")
+                f.write(json.dumps(
+                    {"kind": "investigation",
+                     "cost_usd_est": 0.5}) + "\n")
+            rc, lines = run_ledger()
+            check("635 ledger-malformed e2e: valid control "
+                  "exits exactly 0", rc == 0, str(rc))
+            summary = json.loads("\n".join(lines))
+            check("635 ledger-malformed e2e: valid control "
+                  "summary is the exact pinned summary",
+                  summary == {"runs": 3, "scripted_runs": 1,
+                              "investigations": 2,
+                              "total_cost_usd_est": 0.5,
+                              "investigation_cost_usd_est": 0.5},
+                  str(summary))
+
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "missing.jsonl")
+            rc, lines = run_ledger()
+            check("635 ledger-malformed e2e: missing-file "
+                  "control exits exactly 0", rc == 0, str(rc))
+            summary = json.loads("\n".join(lines))
+            check("635 ledger-malformed e2e: missing-file "
+                  "control summary is all zeros",
+                  summary == {"runs": 0, "scripted_runs": 0,
+                              "investigations": 0,
+                              "total_cost_usd_est": 0,
+                              "investigation_cost_usd_est": 0},
+                  str(summary))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
