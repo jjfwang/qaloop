@@ -52661,6 +52661,165 @@ def test_issue_617_verify_empty_batch_selection_e2e():
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
+def test_issue_619_worker_bad_concurrency_job_timeout_e2e():
+    """Issue #619: pin the CLI worker bad
+    --concurrency / --job-timeout exit-2 paths end to
+    end. SPEC.md documents the worker flags
+    --concurrency (default 1) and --job-timeout
+    (default 1800), and in qaloop/cli.py cmd_worker
+    validates them after resolving --keep-runs:
+    --concurrency < 1 prints the exact must-be->= 1
+    ERROR line and returns 2; --job-timeout <= 0
+    prints the exact must-be-> 0 ERROR line and
+    returns 2 (the value is parsed as a float, so it
+    prints in float form, e.g. got 0.0). Today that
+    contract is proven only below the CLI surface:
+    run_worker raising ValueError for concurrency 0,
+    and the merged #615 test proving keep-runs
+    resolution wins when all three are bad; the exact
+    printed ERROR lines occur nowhere in tests. This
+    test stubs NOTHING in the worker chain: it drives
+    only the real build_parser -> cmd_worker in five
+    phases - (A) concurrency zero: worker --once
+    --concurrency 0 exits exactly 2 with stdout
+    exactly one line equal to the exact concurrency
+    ERROR line, no run dir entry and no queue database
+    created; (B) concurrency negative: --concurrency
+    -3 exits exactly 2 with the exact got -3 line;
+    (C) job-timeout zero: --job-timeout 0 exits
+    exactly 2 with the exact float-form got 0.0 line;
+    (D) job-timeout negative: --job-timeout -5 exits
+    exactly 2 with the exact got -5.0 line; (E)
+    precedence: --concurrency 0 --job-timeout 0
+    returns the concurrency line, proving concurrency
+    is validated before job-timeout."""
+    from qaloop import cli
+
+    def worker_bad_conc_timeout_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "queue_db_created": False}
+    check("619 worker-bad-concurrency-job-timeout e2e: "
+          "exact expectations return no mismatch",
+          worker_bad_conc_timeout_mismatch(
+              dict(exp), exp) is None)
+    probe = worker_bad_conc_timeout_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("619 worker-bad-concurrency-job-timeout e2e: "
+          "corrupted exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = worker_bad_conc_timeout_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("619 worker-bad-concurrency-job-timeout e2e: "
+          "corrupted printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = worker_bad_conc_timeout_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("619 worker-bad-concurrency-job-timeout e2e: "
+          "corrupted run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = worker_bad_conc_timeout_mismatch(
+        dict(exp, queue_db_created=True), exp)
+    check("619 worker-bad-concurrency-job-timeout e2e: "
+          "corrupted queue_db_created caught, names field",
+          probe is not None
+          and probe.startswith("queue_db_created:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_DB",
+                "QALOOP_KEEP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    conc_zero_line = ("ERROR: --concurrency must be >= 1 "
+                      "(got 0)")
+    conc_neg_line = ("ERROR: --concurrency must be >= 1 "
+                     "(got -3)")
+    timeout_zero_line = ("ERROR: --job-timeout must be > 0 "
+                         "(got 0.0)")
+    timeout_neg_line = ("ERROR: --job-timeout must be > 0 "
+                        "(got -5.0)")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            db_path = os.path.join(td, "q.db")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_DB"] = db_path
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+
+            def run_worker_cmd(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line):
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} real cmd_worker exits "
+                      "exactly 2", rc == 2, str(rc))
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} line equals the exact "
+                      "ERROR line", line == expected_line, line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} no run dir entry in the "
+                      "runs root", run_dir_entries == [],
+                      str(run_dir_entries))
+                queue_db_created = os.path.exists(db_path)
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} no queue database created",
+                      queue_db_created is False,
+                      str(queue_db_created))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": run_dir_entries,
+                           "queue_db_created": queue_db_created}
+                mismatch = worker_bad_conc_timeout_mismatch(
+                    outcome, exp)
+                check(f"619 worker-bad-concurrency-job-timeout "
+                      f"e2e: {tag} real composition pins the "
+                      "pinned fields exactly",
+                      mismatch is None, mismatch or "")
+
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--concurrency", "0"])
+            pin_phase("concurrency-zero", rc, lines,
+                      conc_zero_line)
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--concurrency", "-3"])
+            pin_phase("concurrency-negative", rc, lines,
+                      conc_neg_line)
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--job-timeout", "0"])
+            pin_phase("job-timeout-zero", rc, lines,
+                      timeout_zero_line)
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--job-timeout", "-5"])
+            pin_phase("job-timeout-negative", rc, lines,
+                      timeout_neg_line)
+            rc, lines = run_worker_cmd(
+                ["worker", "--once", "--concurrency", "0",
+                 "--job-timeout", "0"])
+            pin_phase("precedence", rc, lines, conc_zero_line)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
