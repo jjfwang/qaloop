@@ -545,7 +545,14 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     if args.max_retries < 0:
         print(f"error: --max-retries must be >= 0 (got {args.max_retries})")
         return 2
-    payload = _json.loads(args.payload or "{}")
+    try:
+        payload = _json.loads(args.payload or "{}")
+    except ValueError:
+        print("error: --payload is not valid JSON")
+        return 2
+    if not isinstance(payload, dict):
+        print("error: --payload must be a JSON object")
+        return 2
     if args.kind == "verify-flow":
         payload.setdefault("flow", args.flow)
         if args.target:

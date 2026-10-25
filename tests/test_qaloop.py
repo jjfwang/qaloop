@@ -53630,6 +53630,169 @@ def test_issue_629_noop_demo_e2e():
 
 
 
+def test_issue_631_enqueue_bad_payload_e2e():
+    """Issue #631: pin the CLI enqueue bad --payload exit
+    path end to end. cmd_enqueue parsed --payload with an
+    unguarded json.loads and assumed an object: invalid
+    JSON raised an uncaught JSONDecodeError, a non-object
+    payload raised AttributeError on payload.setdefault
+    for verify-flow, and verify-repo silently enqueued a
+    non-object payload. This test stubs NOTHING: it drives
+    only the real build_parser -> cmd_enqueue against a
+    real queue database and pins, for each rejected phase,
+    exit exactly 2, stdout exactly one clean error line,
+    and no new queued job - (A) invalid JSON verify-flow,
+    (B) array payload verify-flow, (C) array payload
+    verify-repo, (D) number payload verify-repo,
+    (E) --max-retries -1 with a malformed payload still
+    returns the exact existing max-retries error line
+    (precedence) - plus two valid-object controls:
+    (F) verify-flow exits 0 with the exact enqueued line
+    and one queued job carrying the flow setdefault,
+    (G) verify-repo exits 0 with the payload unchanged."""
+    from qaloop import cli, queue
+
+    def enqueue_bad_payload_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1, "line_ok": True,
+                  "queued_jobs": 0}
+    check("631 enqueue-bad-payload e2e: exact expectations "
+          "return no mismatch",
+          enqueue_bad_payload_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = enqueue_bad_payload_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("631 enqueue-bad-payload e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = enqueue_bad_payload_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("631 enqueue-bad-payload e2e: corrupted printed "
+          "line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = enqueue_bad_payload_mismatch(
+        dict(exp_reject, queued_jobs=1), exp_reject)
+    check("631 enqueue-bad-payload e2e: corrupted queued_jobs "
+          "caught, names field",
+          probe is not None and probe.startswith("queued_jobs:"),
+          probe or "")
+
+    env_keys = ("QALOOP_DB", "QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    invalid_line = "error: --payload is not valid JSON"
+    object_line = "error: --payload must be a JSON object"
+    retries_line = "error: --max-retries must be >= 0 (got -1)"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["QALOOP_DB"] = os.path.join(td, "q.db")
+
+            def run_enqueue(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_reject(tag, argv, expected_line):
+                rc, lines = run_enqueue(argv)
+                jobs = queue.list_jobs(limit=100)
+                check(f"631 enqueue-bad-payload e2e: {tag} "
+                      "real cmd_enqueue exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"631 enqueue-bad-payload e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"631 enqueue-bad-payload e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                check(f"631 enqueue-bad-payload e2e: {tag} "
+                      "no job queued",
+                      len(jobs) == 0, str(len(jobs)))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "queued_jobs": len(jobs)}
+                mismatch = enqueue_bad_payload_mismatch(
+                    outcome, exp_reject)
+                check(f"631 enqueue-bad-payload e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            pin_reject("invalid-json-verify-flow",
+                       ["enqueue", "--kind", "verify-flow",
+                        "--payload", "{not json"], invalid_line)
+            pin_reject("array-verify-flow",
+                       ["enqueue", "--kind", "verify-flow",
+                        "--payload", "[1,2]"], object_line)
+            pin_reject("array-verify-repo",
+                       ["enqueue", "--kind", "verify-repo",
+                        "--payload", "[1,2]"], object_line)
+            pin_reject("number-verify-repo",
+                       ["enqueue", "--kind", "verify-repo",
+                        "--payload", "42"], object_line)
+            pin_reject("max-retries-precedence",
+                       ["enqueue", "--max-retries", "-1",
+                        "--payload", "{not json"], retries_line)
+
+            rc, lines = run_enqueue(
+                ["enqueue", "--kind", "verify-flow",
+                 "--flow", "demo-login-a.yaml",
+                 "--payload", '{"repo": "x"}'])
+            jobs = queue.list_jobs(limit=100)
+            job = jobs[0] if jobs else {}
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-flow exits exactly 0",
+                  rc == 0, str(rc))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-flow printed line exact",
+                  lines == [f"enqueued job #{job.get('id')} "
+                            f"(verify-flow, max_retries=0)"],
+                  str(lines))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-flow queues exactly one job",
+                  len(jobs) == 1, str(len(jobs)))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-flow payload carries the flow "
+                  "setdefault",
+                  job.get("payload") == {
+                      "repo": "x", "flow": "demo-login-a.yaml"},
+                  str(job.get("payload")))
+
+            rc, lines = run_enqueue(
+                ["enqueue", "--kind", "verify-repo",
+                 "--payload", '{"repo": "ac"}'])
+            jobs = queue.list_jobs(limit=100)
+            job = jobs[0] if jobs else {}
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-repo exits exactly 0",
+                  rc == 0, str(rc))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-repo printed line exact",
+                  lines == [f"enqueued job #{job.get('id')} "
+                            f"(verify-repo, max_retries=0)"],
+                  str(lines))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-repo queues exactly one more job",
+                  len(jobs) == 2, str(len(jobs)))
+            check("631 enqueue-bad-payload e2e: valid-object "
+                  "verify-repo payload unchanged",
+                  job.get("payload") == {"repo": "ac"},
+                  str(job.get("payload")))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
