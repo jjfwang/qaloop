@@ -52820,6 +52820,174 @@ def test_issue_619_worker_bad_concurrency_job_timeout_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+
+def test_issue_621_verify_keep_runs_env_negative_flag_wins_e2e():
+    """Issue #621: pin the CLI verify keep-runs
+    env-negative and flag-wins-over-env exit paths end
+    to end. SPEC.md Retention (lines 926-932) states
+    verify and worker accept --keep-runs /
+    QALOOP_KEEP_RUNS, the flag wins when both are set,
+    and negative values are rejected with an error
+    (exit 2), and Single-flow execution order step 1
+    states keep-runs resolves first. The merged #613
+    test pins only flag-negative and env-bogus for
+    verify, while the worker sibling #615 pins
+    env-negative as its phase D; flag-wins-over-a-bad-env
+    is pinned for neither command through the real
+    parser. This test stubs NOTHING in the verify
+    chain: it drives only the real build_parser ->
+    cmd_verify in four phases - (A) env-negative on a
+    staged valid flow: QALOOP_KEEP_RUNS=-2 with no flag
+    exits exactly 2 with stdout exactly one line equal
+    to the exact cannot-be-negative ERROR line, no run
+    dir entry and zero ledger rows; (B) precedence: the
+    same env-negative value on a staged YAML-broken
+    flow returns the identical ERROR line (not INVALID
+    SPEC), proving keep-runs resolves before the
+    services light-parse / spec load; (C) flag-wins
+    over bogus env: --keep-runs 5 with
+    QALOOP_KEEP_RUNS=bogus on a staged valid-YAML flow
+    whose services block carries name 9bad exits
+    exactly 2 with stdout exactly one line equal to
+    the exact services-stage INVALID SPEC line, no run
+    dir entry and zero ledger rows, proving the bad
+    env value was ignored; (D) flag-wins over negative
+    env: --keep-runs 5 with QALOOP_KEEP_RUNS=-2 on the
+    same 9bad services flow returns the identical
+    INVALID SPEC line, exit exactly 2, no run dir
+    entry and zero ledger rows."""
+    from qaloop import cli, ledger
+
+    def verify_keep_runs_env_flag_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "ledger_rows": 0}
+    check("621 verify-keep-runs-env-flag e2e: exact "
+          "expectations return no mismatch",
+          verify_keep_runs_env_flag_mismatch(
+              dict(exp), exp) is None)
+    probe = verify_keep_runs_env_flag_mismatch(
+        dict(exp, exit_code=1), exp)
+    check("621 verify-keep-runs-env-flag e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_keep_runs_env_flag_mismatch(
+        dict(exp, line_ok=False), exp)
+    check("621 verify-keep-runs-env-flag e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_keep_runs_env_flag_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("621 verify-keep-runs-env-flag e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_keep_runs_env_flag_mismatch(
+        dict(exp, ledger_rows=1), exp)
+    check("621 verify-keep-runs-env-flag e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_KEEP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    env_neg_line = ("ERROR: --keep-runs / QALOOP_KEEP_RUNS "
+                    "cannot be negative (got -2)")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            good_path = os.path.join(td, "good.yaml")
+            with open(good_path, "w", encoding="utf-8") as f:
+                f.write("name: keep-runs-flow\n"
+                        "target: http://127.0.0.1:9/\n"
+                        "steps:\n"
+                        "  - wait_ms: 1\n")
+            bad_path = os.path.join(td, "bad.yaml")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                f.write("name: [unclosed\n")
+            svc_path = os.path.join(td, "badsvc.yaml")
+            with open(svc_path, "w", encoding="utf-8") as f:
+                f.write("name: badsvc-flow\n"
+                        "target: http://127.0.0.1:9/\n"
+                        "services:\n"
+                        "  - name: '9bad'\n"
+                        "    command: 'x'\n"
+                        "    wait: {port: 1}\n"
+                        "steps:\n"
+                        "  - wait_ms: 1\n")
+            svc_line = (
+                "INVALID SPEC: spec " + svc_path
+                + ": services[0]: service `name` must be an "
+                "identifier [a-zA-Z][a-zA-Z0-9_]*")
+
+            def run_verify(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line):
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "real cmd_verify exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "line equals the exact expected line",
+                      line == expected_line, line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "no run dir entry in the runs root",
+                      run_dir_entries == [],
+                      str(run_dir_entries))
+                rows = ledger.read_all()
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "ledger has zero rows", len(rows) == 0,
+                      str(rows))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": run_dir_entries,
+                           "ledger_rows": len(rows)}
+                mismatch = verify_keep_runs_env_flag_mismatch(
+                    outcome, exp)
+                check(f"621 verify-keep-runs-env-flag e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            os.environ["QALOOP_KEEP_RUNS"] = "-2"
+            rc, lines = run_verify(["verify", good_path])
+            pin_phase("env-negative", rc, lines, env_neg_line)
+            rc, lines = run_verify(["verify", bad_path])
+            pin_phase("precedence", rc, lines, env_neg_line)
+            os.environ["QALOOP_KEEP_RUNS"] = "bogus"
+            rc, lines = run_verify(
+                ["verify", svc_path, "--keep-runs", "5"])
+            pin_phase("flag-wins-bogus", rc, lines, svc_line)
+            os.environ["QALOOP_KEEP_RUNS"] = "-2"
+            rc, lines = run_verify(
+                ["verify", svc_path, "--keep-runs", "5"])
+            pin_phase("flag-wins-negative", rc, lines, svc_line)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
