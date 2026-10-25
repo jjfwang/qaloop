@@ -1223,6 +1223,12 @@ sense given the diff and the run evidence (steps, assertions, AX snapshots,
 console/network errors, service logs). It writes `EVALUATION.md` +
 `evaluation.json` into the run dir and logs the model cost.
 
+A missing `run.json` in the run dir is tolerated (the judge proceeds on
+empty run evidence). A malformed `run.json` — not valid JSON, or a top
+level that is not a JSON object — is rejected instead: `evaluate` prints
+exactly one error line naming the problem, exits 2, writes no
+`EVALUATION.md` / `evaluation.json`, and makes no model call.
+
 Verdicts: `MAKES_SENSE`, `DOES_NOT_MAKE_SENSE`, `INSUFFICIENT_EVIDENCE`,
 `BLOCKED`.
 
