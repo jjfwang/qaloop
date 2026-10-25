@@ -745,6 +745,9 @@ def cmd_investigate(args: argparse.Namespace) -> int:
     except ValueError:
         print(f"ERROR: run.json is not valid JSON: {run_json}")
         return 2
+    except (AttributeError, KeyError, TypeError):
+        print(f"ERROR: run.json is structurally malformed: {run_json}")
+        return 2
     from qaloop.spec import SpecError
     try:
         spec = load_spec(args.flow, strict_env=False)
