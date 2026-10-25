@@ -1170,6 +1170,12 @@ Note: `scripted-matrix`, `perform`, and `evaluate` entries count
 toward `runs` and the total cost, but not toward `scripted_runs` or
 `investigations`.
 
+A malformed ledger (a line that is not valid JSON, a line that is
+not a JSON object, or a present `cost_usd_est` that is not numeric)
+makes `qaloop ledger` print exactly one `error: ledger line N ...`
+line naming the problem and the line, print no summary, and exit 2.
+Valid and missing files are unchanged (exit 0, indented JSON).
+
 ## `qaloop doctor`: environment self-check
 
 `python3 -m qaloop.cli doctor` self-checks the environment so a run never

@@ -620,7 +620,12 @@ def cmd_compare(args: argparse.Namespace) -> int:
 def cmd_ledger(args: argparse.Namespace) -> int:
     from qaloop import ledger
     import json as _json
-    print(_json.dumps(ledger.summarize(), indent=2))
+    try:
+        summary = ledger.summarize()
+    except ValueError as e:
+        print(f"error: {e}")
+        return 2
+    print(_json.dumps(summary, indent=2))
     return 0
 
 

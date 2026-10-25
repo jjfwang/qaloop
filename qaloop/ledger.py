@@ -28,10 +28,28 @@ def read_all() -> list[dict]:
         return []
     out = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
+        for n, line in enumerate(f, start=1):
             line = line.strip()
-            if line:
-                out.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                raise ValueError(
+                    f"ledger line {n} is not valid JSON") from None
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"ledger line {n} is not a JSON object")
+            if "cost_usd_est" in entry:
+                value = entry["cost_usd_est"]
+                if value is not None:
+                    try:
+                        float(value)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"ledger line {n} cost_usd_est is not numeric"
+                        ) from None
+            out.append(entry)
     return out
 
 
