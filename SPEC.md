@@ -1029,7 +1029,10 @@ flow name and, per flow, ordered by start time; the pass rate is
 computed over the trailing 10 runs (`TREND_WINDOW`), so stale history
 ages out of the trend. A run counts as passed only when its status is
 exactly `"passed"`; corrupt or fieldless entries are tolerated and
-simply count as failures. The table shows recent flakiness per flow
+simply count as failures. A run.json whose top level is not a JSON
+object (for example `42`, `[1, 2]`, or a bare string) is tolerated
+the same way as a corrupt one: it is skipped, the dashboard is
+still written, and the command exits 0. The table shows recent flakiness per flow
 without opening every report.
 
 A malformed ledger (a line that is not valid JSON, a line that is

@@ -28,9 +28,11 @@ def _load_runs(runs_root: str) -> list[dict]:
     for path in sorted(glob.glob(os.path.join(runs_root, "*", "run.json")), reverse=True):
         try:
             with open(path, encoding="utf-8") as f:
-                runs.append(json.load(f))
+                data = json.load(f)
         except Exception:
             continue
+        if isinstance(data, dict):
+            runs.append(data)
     return runs
 
 
