@@ -53467,6 +53467,168 @@ def test_issue_627_worker_keep_runs_flag_wins_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_629_noop_demo_e2e():
+    """Issue #629: give the SPEC-documented noop assertion
+    a real browser demo proof. SPEC.md's Assertions table
+    documents noop true as documenting an intentionally
+    dead control, and the runner implements it
+    (AssertionResult(key, True, 'intentional no-op')),
+    but no flow in flows/ used the noop key and no demo
+    page demonstrated the pattern. This test stubs
+    NOTHING in the verify chain: it serves the repo root
+    on a free port, drives only the real
+    build_parser -> cmd_verify on flows/demo-noop.yaml
+    (which clicks the intentionally inert export button
+    on demo/noop-demo.html), and pins exit exactly 0,
+    the run record carrying a noop assertion result
+    with passed true and detail exactly
+    'intentional no-op', the text_contains state pins
+    present and passed in the run record (proving the
+    status was unchanged after the click), exactly one
+    run dir entry and exactly one ledger row."""
+    import functools
+    import http.server
+    import threading
+
+    from qaloop import cli, ledger
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-1243/"
+        "chrome-headless-shell-linux64/chrome-headless-shell")
+
+    def noop_demo_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 0, "run_status": "passed",
+           "assertion_name": "noop", "assertion_passed": True,
+           "assertion_detail": "intentional no-op",
+           "state_pins": 2, "run_dir_entries": 1,
+           "ledger_rows": 1}
+    check("629 noop-demo e2e: exact expectations return "
+          "no mismatch",
+          noop_demo_mismatch(dict(exp), exp) is None)
+    probe = noop_demo_mismatch(dict(exp, assertion_name="x"), exp)
+    check("629 noop-demo e2e: corrupted assertion_name "
+          "caught, names field",
+          probe is not None and probe.startswith("assertion_name:"),
+          probe or "")
+    probe = noop_demo_mismatch(dict(exp, assertion_passed=False), exp)
+    check("629 noop-demo e2e: corrupted assertion_passed "
+          "caught, names field",
+          probe is not None and probe.startswith("assertion_passed:"),
+          probe or "")
+    probe = noop_demo_mismatch(dict(exp, assertion_detail="x"), exp)
+    check("629 noop-demo e2e: corrupted assertion_detail "
+          "caught, names field",
+          probe is not None and probe.startswith("assertion_detail:"),
+          probe or "")
+    probe = noop_demo_mismatch(dict(exp, run_dir_entries=0), exp)
+    check("629 noop-demo e2e: corrupted run_dir_entries "
+          "caught, names field",
+          probe is not None and probe.startswith("run_dir_entries:"),
+          probe or "")
+    probe = noop_demo_mismatch(dict(exp, ledger_rows=0), exp)
+    check("629 noop-demo e2e: corrupted ledger_rows "
+          "caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+    if not os.path.exists(exe): check("629 noop-demo e2e execution skipped (no browser)", True); return
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_KEEP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+
+    class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(_QuietHandler, directory=root)
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever,
+                     daemon=True).start()
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ["QALOOP_EXECUTABLE_PATH"] = exe
+            os.environ["TARGET_URL"] = (
+                f"http://127.0.0.1:{port}")
+            parsed = cli.build_parser().parse_args(
+                ["verify",
+                 os.path.join(root, "flows", "demo-noop.yaml"),
+                 "--executable-path", exe])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.fn(parsed)
+            check("629 noop-demo e2e: real cmd_verify on "
+                  "demo-noop exits exactly 0",
+                  rc == 0, str(rc))
+            entries = (sorted(os.listdir(runs_root))
+                       if os.path.isdir(runs_root) else [])
+            check("629 noop-demo e2e: exactly one run dir "
+                  "entry created", len(entries) == 1,
+                  str(entries))
+            run_json = (os.path.join(runs_root, entries[0],
+                                     "run.json")
+                        if len(entries) == 1 else "")
+            data = (json.load(open(run_json, encoding="utf-8"))
+                    if run_json else {})
+            check("629 noop-demo e2e: run record status "
+                  "is passed", data.get("status") == "passed",
+                  str(data.get("status")))
+            assertions = [a for st in data.get("steps", [])
+                          for a in st.get("assertions", [])]
+            noop = next((a for a in assertions
+                         if a.get("name") == "noop"), {})
+            check("629 noop-demo e2e: run record carries a "
+                  "noop assertion result",
+                  noop.get("name") == "noop", str(noop))
+            check("629 noop-demo e2e: noop assertion passed "
+                  "is true", noop.get("passed") is True,
+                  str(noop))
+            check("629 noop-demo e2e: noop assertion detail "
+                  "is exactly 'intentional no-op'",
+                  noop.get("detail") == "intentional no-op",
+                  str(noop))
+            pins = [a for a in assertions
+                    if a.get("name") == "text_contains"
+                    and a.get("passed") is True]
+            check("629 noop-demo e2e: state pins are present "
+                  "and passed in the run record (status "
+                  "unchanged before and after the click)",
+                  len(pins) == 2, str(assertions))
+            rows = ledger.read_all()
+            check("629 noop-demo e2e: ledger has exactly "
+                  "one row", len(rows) == 1, str(rows))
+            outcome = {"exit_code": rc,
+                       "run_status": data.get("status"),
+                       "assertion_name": noop.get("name"),
+                       "assertion_passed": noop.get("passed"),
+                       "assertion_detail": noop.get("detail"),
+                       "state_pins": len(pins),
+                       "run_dir_entries": len(entries),
+                       "ledger_rows": len(rows)}
+            mismatch = noop_demo_mismatch(outcome, exp)
+            check("629 noop-demo e2e: real composition pins "
+                  "the pinned fields exactly",
+                  mismatch is None, mismatch or "")
+    finally:
+        server.shutdown()
+        server.server_close()
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()

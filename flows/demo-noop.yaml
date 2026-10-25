@@ -1,0 +1,30 @@
+name: demo-noop
+description: >-
+  Browser proof for the noop assertion (issue #629, SPEC.md Assertions
+  table: noop true documents an intentionally dead control): the demo
+  page carries an export button with no effective handler plus a status
+  element a working control would change. The flow clicks the dead
+  control and asserts noop: true together with a text_contains state
+  pin proving the status is unchanged after the click.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the noop demo page
+    goto: /demo/noop-demo.html
+
+steps:
+  - name: status starts idle before the click
+    expect:
+      - text_contains: {selector: "#status", text: "idle"}
+
+  - name: clicking the intentionally dead control changes nothing
+    click: "#dead"
+    expect:
+      - noop: true
+      - text_contains: {selector: "#status", text: "idle"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
