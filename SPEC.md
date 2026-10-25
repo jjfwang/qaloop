@@ -1032,6 +1032,14 @@ exactly `"passed"`; corrupt or fieldless entries are tolerated and
 simply count as failures. The table shows recent flakiness per flow
 without opening every report.
 
+A malformed ledger (a line that is not valid JSON, a line that is
+not a JSON object, or a present `cost_usd_est` that is not numeric)
+makes `qaloop dashboard` print exactly one `error: ledger line N ...`
+line naming the problem and the line, write nothing, and exit 2.
+Valid and missing ledger files are unchanged (exit 0, dashboard
+written). This is the same malformed-ledger contract as for
+`qaloop ledger` in the Cost ledger section below.
+
 ## Queue pipeline: enqueue, webhook receiver, investigator, cost ledger
 
 The worker side is documented above; this section covers how jobs get

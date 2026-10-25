@@ -54100,6 +54100,152 @@ def test_issue_635_ledger_malformed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_637_dashboard_malformed_e2e():
+    """Issue #637: pin the CLI dashboard malformed-ledger
+    exit path end to end. cmd_dashboard called
+    dashboard.build() with no error handling, so a
+    malformed ledger line raised an uncaught ValueError
+    from ledger.summarize(). This test stubs NOTHING: it
+    drives only the real build_parser -> cmd_dashboard
+    and pins, for each rejected phase, exit exactly 2,
+    stdout exactly one exact error line, and no dashboard
+    output written - (A) invalid JSON on line 2, (B) a
+    non-object JSON value on line 2, (C) a non-numeric
+    cost_usd_est on line 2 - plus the valid control and
+    the missing-file control, both exit 0 with the exact
+    dashboard line and index.html written."""
+    from qaloop import cli
+
+    def dashboard_malformed_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1,
+                  "line_ok": True, "output_written": False}
+    check("637 dashboard-malformed e2e: exact expectations "
+          "return no mismatch",
+          dashboard_malformed_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = dashboard_malformed_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("637 dashboard-malformed e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = dashboard_malformed_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("637 dashboard-malformed e2e: corrupted line_ok "
+          "caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = dashboard_malformed_mismatch(
+        dict(exp_reject, output_written=True), exp_reject)
+    check("637 dashboard-malformed e2e: corrupted "
+          "output_written caught, names field",
+          probe is not None and probe.startswith("output_written:"),
+          probe or "")
+
+    env_keys = ("QALOOP_LEDGER", "QALOOP_RUNS",
+                "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        os.environ.pop("TARGET_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            ledger_file = os.path.join(td, "ledger.jsonl")
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_LEDGER"] = ledger_file
+            os.environ["QALOOP_RUNS"] = runs_root
+
+            def run_dashboard(out_dir):
+                parsed = cli.build_parser().parse_args(
+                    ["dashboard", "--out", out_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            valid_line = json.dumps(
+                {"kind": "scripted", "cost_usd_est": 0.0}) + "\n"
+
+            def pin_reject(tag, file_content, expected_line):
+                with open(ledger_file, "w", encoding="utf-8") as f:
+                    f.write(file_content)
+                out_dir = os.path.join(td, f"out-{tag}")
+                rc, lines = run_dashboard(out_dir)
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "real cmd_dashboard exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                written = os.path.exists(
+                    os.path.join(out_dir, "index.html"))
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "no dashboard output written",
+                      not written, str(written))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "output_written": written}
+                mismatch = dashboard_malformed_mismatch(
+                    outcome, exp_reject)
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            pin_reject("invalid-json",
+                       valid_line + "not json\n",
+                       "error: ledger line 2 is not valid JSON")
+            pin_reject("non-object",
+                       valid_line + json.dumps(
+                           ["not", "an", "object"]) + "\n",
+                       "error: ledger line 2 is not a JSON object")
+            pin_reject("non-numeric-cost",
+                       valid_line + json.dumps(
+                           {"kind": "scripted",
+                            "cost_usd_est": "abc"}) + "\n",
+                       "error: ledger line 2 cost_usd_est "
+                       "is not numeric")
+
+            def pin_control(tag, ledger_path):
+                os.environ["QALOOP_LEDGER"] = ledger_path
+                out_dir = os.path.join(td, f"out-{tag}")
+                rc, lines = run_dashboard(out_dir)
+                expected = ("dashboard: " + os.path.join(
+                    out_dir, "index.html"))
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "control exits exactly 0",
+                      rc == 0, str(rc))
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "control stdout is exactly the "
+                      "dashboard line",
+                      lines == [expected], str(lines))
+                check(f"637 dashboard-malformed e2e: {tag} "
+                      "control index.html exists",
+                      os.path.exists(os.path.join(
+                          out_dir, "index.html")))
+
+            with open(ledger_file, "w", encoding="utf-8") as f:
+                f.write(valid_line)
+            pin_control("valid", ledger_file)
+            pin_control("missing", os.path.join(
+                td, "missing.jsonl"))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
