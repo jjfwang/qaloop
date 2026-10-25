@@ -52988,6 +52988,172 @@ def test_issue_621_verify_keep_runs_env_negative_flag_wins_e2e():
     finally:
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
+def test_issue_623_verify_spec_load_invalid_spec_e2e():
+    """Issue #623: pin the CLI single-flow verify
+    spec-load-stage INVALID SPEC exit path end to end.
+    SPEC.md's exit-code contract (line 878) lists
+    INVALID SPEC at any stage (services light-parse or
+    spec load) as exit 2. The services stage is pinned
+    for real by #611, but the spec-load stage for
+    single-flow verify is proven only below the CLI
+    surface (#89 drives _cmd_verify_run directly with a
+    SimpleNamespace and a stubbed run_flow; the batch
+    spec-load failure is pinned only as batch
+    resilience at #605). This test stubs NOTHING in
+    the verify chain: it drives only the real
+    build_parser -> cmd_verify in two phases - (A)
+    missing target: a staged valid-YAML flow with a
+    name and a wait_ms step but no target (light-parse
+    succeeds: name present, no services) exits exactly
+    2 with stdout exactly one line equal to the exact
+    INVALID SPEC target-is-required line, exactly one
+    run dir entry created in the runs root containing
+    only steps/ (no run.json, no REPORT.md), and zero
+    ledger rows; (B) unknown step key: a staged flow
+    with a target and a step carrying bogus_op exits
+    exactly 2 with stdout exactly one line equal to
+    the exact INVALID SPEC unknown-keys line for
+    steps[0] naming bogus_op, exactly one additional
+    run dir entry, and zero ledger rows. Unlike the
+    services stage, a run dir IS created before the
+    spec load, and no ledger row is written."""
+    from qaloop import cli, ledger
+
+    def verify_spec_load_invalid_spec_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_a = {"exit_code": 2, "line_count": 1, "line_ok": True,
+             "run_dir_entries": 1, "ledger_rows": 0}
+    check("623 verify-spec-load-invalid-spec e2e: exact "
+          "expectations return no mismatch",
+          verify_spec_load_invalid_spec_mismatch(
+              dict(exp_a), exp_a) is None)
+    probe = verify_spec_load_invalid_spec_mismatch(
+        dict(exp_a, exit_code=1), exp_a)
+    check("623 verify-spec-load-invalid-spec e2e: corrupted "
+          "exit_code caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = verify_spec_load_invalid_spec_mismatch(
+        dict(exp_a, line_ok=False), exp_a)
+    check("623 verify-spec-load-invalid-spec e2e: corrupted "
+          "printed line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = verify_spec_load_invalid_spec_mismatch(
+        dict(exp_a, run_dir_entries=0), exp_a)
+    check("623 verify-spec-load-invalid-spec e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = verify_spec_load_invalid_spec_mismatch(
+        dict(exp_a, ledger_rows=1), exp_a)
+    check("623 verify-spec-load-invalid-spec e2e: corrupted "
+          "ledger_rows caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_KEEP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            os.environ.pop("QALOOP_KEEP_RUNS", None)
+            a_path = os.path.join(td, "a.yaml")
+            with open(a_path, "w", encoding="utf-8") as f:
+                f.write("name: probe-a\n"
+                        "steps:\n"
+                        "  - name: s\n"
+                        "    wait_ms: 1\n")
+            b_path = os.path.join(td, "b.yaml")
+            with open(b_path, "w", encoding="utf-8") as f:
+                f.write("name: probe-b\n"
+                        "target: http://h\n"
+                        "steps:\n"
+                        "  - name: s\n"
+                        "    bogus_op: 1\n")
+            a_line = (
+                "INVALID SPEC: spec " + a_path
+                + ": `target` is required (base URL, "
+                "$VAR allowed)")
+            b_line = (
+                "INVALID SPEC: steps[0]: unknown keys "
+                "['bogus_op'] (known ops: ['back', 'check', "
+                "'click', 'dblclick', 'drag', 'fill', "
+                "'focus', 'goto', 'hover', 'mock', 'press', "
+                "'reload', 'script', 'scroll', 'seed', "
+                "'select', 'type', 'uncheck', 'upload', "
+                "'wait', 'wait_ms'])")
+
+            def run_verify(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def pin_phase(tag, rc, lines, expected_line, exp):
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "real cmd_verify exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "line equals the exact expected line",
+                      line == expected_line, line)
+                entries = sorted(os.listdir(runs_root))
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "run dir entries count matches",
+                      len(entries) == exp["run_dir_entries"],
+                      str(entries))
+                rows = ledger.read_all()
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "ledger has zero rows", len(rows) == 0,
+                      str(rows))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "run_dir_entries": len(entries),
+                           "ledger_rows": len(rows)}
+                mismatch = verify_spec_load_invalid_spec_mismatch(
+                    outcome, exp)
+                check(f"623 verify-spec-load-invalid-spec e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+                return entries
+
+            rc, lines = run_verify(["verify", a_path])
+            entries_a = pin_phase("missing-target", rc, lines,
+                                  a_line, exp_a)
+            contents = []
+            if len(entries_a) == 1:
+                contents = sorted(os.listdir(
+                    os.path.join(runs_root, entries_a[0])))
+            check("623 verify-spec-load-invalid-spec e2e: "
+                  "missing-target run dir contains only steps/",
+                  contents == ["steps"], str(contents))
+            exp_b = {"exit_code": 2, "line_count": 1,
+                     "line_ok": True, "run_dir_entries": 2,
+                     "ledger_rows": 0}
+            rc, lines = run_verify(["verify", b_path])
+            pin_phase("unknown-step-key", rc, lines, b_line, exp_b)
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
