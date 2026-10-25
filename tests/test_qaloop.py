@@ -54246,6 +54246,148 @@ def test_issue_637_dashboard_malformed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_641_dashboard_nonobject_e2e():
+    """Issue #641: pin the dashboard non-object run.json
+    tolerance end to end. dashboard._load_runs tolerated
+    an unparseable run.json (skipped) but a run.json whose
+    top level was valid JSON yet not an object (42,
+    [1, 2], a bare string) loaded, was appended, and then
+    crashed dashboard.build at r.get(...) with an
+    uncaught AttributeError that cmd_dashboard, catching
+    only ValueError, let escape. This test stubs NOTHING:
+    it drives only the real build_parser -> cmd_dashboard
+    and pins, for each non-object phase, exit exactly 0,
+    the dashboard written, and zero runs counted - plus
+    the valid-object control (run counted) and the
+    corrupt-JSON control (skipped), both exit 0."""
+    import re
+
+    from qaloop import cli
+
+    def dashboard_nonobject_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_skip = {"exit_code": 0, "dashboard_written": True,
+                "run_count": 0}
+    check("641 dashboard-nonobject e2e: exact expectations "
+          "return no mismatch",
+          dashboard_nonobject_mismatch(
+              dict(exp_skip), exp_skip) is None)
+    probe = dashboard_nonobject_mismatch(
+        dict(exp_skip, exit_code=2), exp_skip)
+    check("641 dashboard-nonobject e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = dashboard_nonobject_mismatch(
+        dict(exp_skip, dashboard_written=False), exp_skip)
+    check("641 dashboard-nonobject e2e: corrupted "
+          "dashboard_written caught, names field",
+          probe is not None and probe.startswith(
+              "dashboard_written:"), probe or "")
+    probe = dashboard_nonobject_mismatch(
+        dict(exp_skip, run_count=1), exp_skip)
+    check("641 dashboard-nonobject e2e: corrupted run_count "
+          "caught, names field",
+          probe is not None and probe.startswith("run_count:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        os.environ.pop("TARGET_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "missing-ledger.jsonl")
+
+            def run_dashboard(tag, run_json_text):
+                run_dir = os.path.join(runs_root, f"run-{tag}")
+                os.makedirs(run_dir)
+                with open(os.path.join(run_dir, "run.json"),
+                          "w", encoding="utf-8") as f:
+                    f.write(run_json_text)
+                out_dir = os.path.join(td, f"out-{tag}")
+                parsed = cli.build_parser().parse_args(
+                    ["dashboard", "--out", out_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                index_path = os.path.join(out_dir, "index.html")
+                written = os.path.exists(index_path)
+                with open(index_path, encoding="utf-8") as f:
+                    html = f.read()
+                found = re.findall(r"<b>(\d+)</b>runs", html)
+                count = int(found[0])
+                return rc, lines, written, count, out_dir
+
+            def pin_skip(tag, run_json_text):
+                rc, lines, written, count, out_dir = (
+                    run_dashboard(tag, run_json_text))
+                expected = ("dashboard: " + os.path.join(
+                    out_dir, "index.html"))
+                check(f"641 dashboard-nonobject e2e: {tag} "
+                      "real cmd_dashboard exits exactly 0",
+                      rc == 0, str(rc))
+                check(f"641 dashboard-nonobject e2e: {tag} "
+                      "stdout is exactly the dashboard line",
+                      lines == [expected], str(lines))
+                check(f"641 dashboard-nonobject e2e: {tag} "
+                      "dashboard index.html written",
+                      written, str(written))
+                check(f"641 dashboard-nonobject e2e: {tag} "
+                      "entry not counted as a run",
+                      count == 0, str(count))
+                outcome = {"exit_code": rc,
+                           "dashboard_written": written,
+                           "run_count": count}
+                mismatch = dashboard_nonobject_mismatch(
+                    outcome, exp_skip)
+                check(f"641 dashboard-nonobject e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            pin_skip("numeric-top", "42\n")
+            pin_skip("list-top", "[1, 2]\n")
+            pin_skip("string-top", json.dumps("hello") + "\n")
+            pin_skip("corrupt-json", "{not json\n")
+
+            rc, lines, written, count, out_dir = run_dashboard(
+                "valid-object", json.dumps(
+                    {"flow_name": "demo", "status": "passed",
+                     "started": 1700000000,
+                     "duration_ms": 5,
+                     "run_dir": "run-valid-object"}) + "\n")
+            expected = ("dashboard: " + os.path.join(
+                out_dir, "index.html"))
+            check("641 dashboard-nonobject e2e: valid-object "
+                  "control exits exactly 0",
+                  rc == 0, str(rc))
+            check("641 dashboard-nonobject e2e: valid-object "
+                  "control stdout is exactly the dashboard "
+                  "line", lines == [expected], str(lines))
+            check("641 dashboard-nonobject e2e: valid-object "
+                  "control dashboard index.html written",
+                  written, str(written))
+            check("641 dashboard-nonobject e2e: valid-object "
+                  "control run counted",
+                  count == 1, str(count))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 def test_issue_639_evaluate_malformed_e2e():
     """Issue #639: pin the CLI evaluate malformed-run.json
     exit path end to end. collect_evidence caught only
