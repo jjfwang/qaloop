@@ -593,7 +593,11 @@ def cmd_webhook(args: argparse.Namespace) -> int:
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     from qaloop.dashboard import build
-    path = build(default_runs_root(), args.out)
+    try:
+        path = build(default_runs_root(), args.out)
+    except ValueError as e:
+        print(f"error: {e}")
+        return 2
     print(f"dashboard: {path}")
     return 0
 
