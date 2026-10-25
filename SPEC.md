@@ -1051,7 +1051,10 @@ ledger.
   in the payload when given.
 - `--payload JSON` (default `"{}"`): extra JSON payload. For
   `verify-repo` this is the whole job payload — e.g.
-  `--payload '{"repo": "ac"}'`.
+  `--payload '{"repo": "ac"}'`. The payload must be a JSON
+  object: invalid JSON, or a valid JSON value that is not an
+  object (array, number, string, boolean, null), is an error
+  (exit 2) and nothing is enqueued.
 - `--max-retries N` (int, default 0): retry the job up to N extra
   attempts after the first failure, through the queue's normal retry
   policy (see Worker above). The default 0 makes the first failure
