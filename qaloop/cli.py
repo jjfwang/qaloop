@@ -520,7 +520,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 2
     try:
         verdict = evaluate(args.claim, run_dir, diff)
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         print(f"ERROR: {e}")
         return 2
     md_path, json_path = write_evaluation(run_dir, args.claim, verdict)
