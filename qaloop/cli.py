@@ -723,9 +723,28 @@ def cmd_investigate(args: argparse.Namespace) -> int:
     from qaloop.investigate import investigate as run_investigation
     from qaloop.runner import RunResult
     from qaloop.spec import load_spec
-    with open(os.path.join(args.run, "run.json"), encoding="utf-8") as f:
-        result = RunResult.from_dict(_json.load(f))
-    spec = load_spec(args.flow, strict_env=False)
+    if not os.path.isdir(args.run):
+        print(f"ERROR: run dir not found: {args.run}")
+        return 2
+    run_json = os.path.join(args.run, "run.json")
+    try:
+        with open(run_json, encoding="utf-8") as f:
+            result = RunResult.from_dict(_json.load(f))
+    except FileNotFoundError:
+        print(f"ERROR: run.json not found: {run_json}")
+        return 2
+    except ValueError:
+        print(f"ERROR: run.json is not valid JSON: {run_json}")
+        return 2
+    from qaloop.spec import SpecError
+    try:
+        spec = load_spec(args.flow, strict_env=False)
+    except FileNotFoundError:
+        print(f"ERROR: flow not found: {args.flow}")
+        return 2
+    except SpecError as e:
+        print(f"INVALID SPEC: {e}")
+        return 2
     diagnosis = run_investigation(
         result=result, spec=spec, target=args.target or result.target,
         max_actions=args.max_actions, headless=not args.headed,

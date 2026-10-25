@@ -53793,6 +53793,174 @@ def test_issue_631_enqueue_bad_payload_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_633_investigate_bad_input_e2e():
+    """Issue #633: pin the CLI investigate bad-input exit
+    path end to end. cmd_investigate loaded run.json and
+    the flow spec with no error handling: a missing run
+    dir, a run dir without run.json, or a missing flow
+    raised an uncaught FileNotFoundError, a corrupt
+    run.json raised an uncaught JSONDecodeError, and an
+    invalid flow raised an uncaught SpecError. This test
+    stubs NOTHING: it drives only the real build_parser
+    -> cmd_investigate and pins, for each rejected phase,
+    exit exactly 2, stdout exactly one exact error line,
+    and no investigation files written - (A) missing run
+    dir, (B) run dir without run.json, (C) corrupt
+    run.json, (D) valid run.json plus a missing flow,
+    (E) valid run.json plus an invalid flow - plus the
+    valid control: (F) valid run.json plus a valid flow
+    with no model key returns 0 in manual mode and writes
+    INVESTIGATION_BRIEF.md."""
+    from qaloop import cli
+
+    def investigate_bad_input_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1, "line_ok": True,
+                  "files_written": []}
+    check("633 investigate-bad-input e2e: exact expectations "
+          "return no mismatch",
+          investigate_bad_input_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = investigate_bad_input_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("633 investigate-bad-input e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = investigate_bad_input_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("633 investigate-bad-input e2e: corrupted printed "
+          "line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = investigate_bad_input_mismatch(
+        dict(exp_reject, files_written=["INVESTIGATION.md"]),
+        exp_reject)
+    check("633 investigate-bad-input e2e: corrupted "
+          "files_written caught, names field",
+          probe is not None and probe.startswith("files_written:"),
+          probe or "")
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        with tempfile.TemporaryDirectory() as td:
+            flow = os.path.join(td, "f.yaml")
+            with open(flow, "w", encoding="utf-8") as f:
+                f.write("name: probe\n"
+                        "target: http://127.0.0.1:1/\n"
+                        "steps:\n  - name: s\n    goto: /\n")
+            bad_flow = os.path.join(td, "bad.yaml")
+            with open(bad_flow, "w", encoding="utf-8") as f:
+                f.write("name: bad\nsteps:\n"
+                        "  - name: s\n    goto: /\n")
+            missing_flow = os.path.join(td, "no-flow.yaml")
+            run_dir = os.path.join(td, "run1")
+            run_json = os.path.join(run_dir, "run.json")
+            runrec = {"flow_name": "probe",
+                      "target": "http://127.0.0.1:1/",
+                      "status": "failed", "started": 0, "ended": 0,
+                      "steps": [], "failed_step": None,
+                      "console_errors": [], "page_errors": [],
+                      "failed_requests": [], "bad_responses": [],
+                      "run_dir": run_dir, "error": "x"}
+
+            def run_investigate(argv):
+                parsed = cli.build_parser().parse_args(argv)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def written(run_path):
+                if not os.path.isdir(run_path):
+                    return []
+                return sorted(n for n in os.listdir(run_path)
+                              if n.startswith("INVESTIGATION"))
+
+            def pin_reject(tag, argv, expected_line, run_path):
+                rc, lines = run_investigate(argv)
+                files = written(run_path)
+                check(f"633 investigate-bad-input e2e: {tag} "
+                      "real cmd_investigate exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"633 investigate-bad-input e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"633 investigate-bad-input e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                check(f"633 investigate-bad-input e2e: {tag} "
+                      "no investigation files written",
+                      files == [], str(files))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "files_written": files}
+                mismatch = investigate_bad_input_mismatch(
+                    outcome, exp_reject)
+                check(f"633 investigate-bad-input e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            missing_dir = os.path.join(td, "nope")
+            pin_reject("missing-run-dir",
+                       ["investigate", "--run", missing_dir,
+                        "--flow", flow],
+                       f"ERROR: run dir not found: {missing_dir}",
+                       missing_dir)
+            os.makedirs(run_dir)
+            pin_reject("no-run-json",
+                       ["investigate", "--run", run_dir,
+                        "--flow", flow],
+                       f"ERROR: run.json not found: {run_json}",
+                       run_dir)
+            with open(run_json, "w", encoding="utf-8") as f:
+                f.write("{not json")
+            pin_reject("corrupt-run-json",
+                       ["investigate", "--run", run_dir,
+                        "--flow", flow],
+                       "ERROR: run.json is not valid JSON: "
+                       f"{run_json}", run_dir)
+            with open(run_json, "w", encoding="utf-8") as f:
+                json.dump(runrec, f)
+            pin_reject("missing-flow",
+                       ["investigate", "--run", run_dir,
+                        "--flow", missing_flow],
+                       f"ERROR: flow not found: {missing_flow}",
+                       run_dir)
+            pin_reject("invalid-flow",
+                       ["investigate", "--run", run_dir,
+                        "--flow", bad_flow],
+                       f"INVALID SPEC: spec {bad_flow}: "
+                       "`target` is required (base URL, "
+                       "$VAR allowed)", run_dir)
+
+            rc, lines = run_investigate(
+                ["investigate", "--run", run_dir, "--flow", flow])
+            check("633 investigate-bad-input e2e: valid control "
+                  "exits exactly 0", rc == 0, str(rc))
+            check("633 investigate-bad-input e2e: valid control "
+                  "runs in manual mode",
+                  any('"mode": "manual"' in ln for ln in lines),
+                  str(lines))
+            check("633 investigate-bad-input e2e: valid control "
+                  "writes INVESTIGATION_BRIEF.md",
+                  written(run_dir) == ["INVESTIGATION_BRIEF.md"],
+                  str(written(run_dir)))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

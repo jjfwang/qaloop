@@ -1118,6 +1118,9 @@ flags:
 
 It loads `run.json` as a `RunResult`, loads the flow spec, runs the
 investigation, and prints the diagnosis as JSON to stdout (exit 0).
+A missing run directory, a missing or corrupt `run.json`, or a
+missing or invalid flow is an error: exactly one error line is
+printed and the exit code is 2, with nothing written.
 Two modes:
 
 - No model credentials configured -> manual mode: writes
