@@ -1020,6 +1020,9 @@ with a final `identical` / `differ` line.
 
 Exit codes: 0 when the runs are identical, 1 when they differ (like
 `diff`), 2 on error (missing or corrupt run dir, ambiguous run id).
+A run.json whose steps is not a list of step objects is corrupt for
+compare purposes: compare prints one error line, exits 2, and prints
+no diff.
 
 ### Flakiness tracking: pass rate over time
 

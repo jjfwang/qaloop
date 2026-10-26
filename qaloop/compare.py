@@ -31,6 +31,13 @@ def _load_run_json(run_dir: str) -> dict:
         raise CompareError(f"corrupt run.json in {run_dir}: {e}")
     if not isinstance(data, dict):
         raise CompareError(f"corrupt run.json in {run_dir}: top level is not an object")
+    if "steps" in data:
+        steps = data["steps"]
+        if not isinstance(steps, list):
+            raise CompareError(f"corrupt run.json in {run_dir}: steps is not a list")
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise CompareError(f"corrupt run.json in {run_dir}: steps[{i}] is not an object")
     return data
 
 
