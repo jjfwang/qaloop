@@ -84,8 +84,13 @@ def build(runs_root: str, out_dir: str) -> str:
         diag = ""
         if r.get("diagnosis"):
             dg = r["diagnosis"]
-            diag = f"<br><span class='muted'>dx: {(dg.get('likely_cause') or '')[:90]}</span>"
-        retried = [s for s in r.get("steps", []) if s.get("attempts", 1) > 1]
+            if isinstance(dg, dict):
+                diag = f"<br><span class='muted'>dx: {(dg.get('likely_cause') or '')[:90]}</span>"
+        steps = r.get("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+        retried = [s for s in steps
+                   if isinstance(s, dict) and s.get("attempts", 1) > 1]
         if retried:
             labels = "; ".join(
                 f"{s.get('name', '?')}: {s['attempts']} attempts" for s in retried)
