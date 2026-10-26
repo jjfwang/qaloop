@@ -54777,6 +54777,214 @@ def test_issue_639_evaluate_malformed_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_651_evaluate_steps_shape_e2e():
+    """Issue #651: pin the CLI evaluate steps-shape exit
+    path end to end. collect_evidence iterated
+    run.get("steps", []) without validating its shape, so
+    a run.json whose steps was not a list of step objects
+    raised an uncaught TypeError/AttributeError through
+    cmd_evaluate. This test stubs only the model network
+    seam (qaloop.evaluate._chat, the issue-411 pattern)
+    and drives only the real build_parser -> cmd_evaluate,
+    pinning, for each rejected phase, exit exactly 2,
+    stdout exactly one exact error line, no EVALUATION.md
+    / evaluation.json written and zero model calls -
+    steps as a number, a string, an object, and a list
+    holding a non-object step - plus the missing-file and
+    valid controls, both exit 0 with the verdict line
+    printed and both evaluation files written."""
+    from qaloop import cli
+    from qaloop import evaluate as evaluate_mod
+
+    def evaluate_steps_shape_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1,
+                  "line_ok": True, "files_written": False,
+                  "chat_calls": 0}
+    check("651 evaluate-steps-shape e2e: exact expectations "
+          "return no mismatch",
+          evaluate_steps_shape_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = evaluate_steps_shape_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("651 evaluate-steps-shape e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = evaluate_steps_shape_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("651 evaluate-steps-shape e2e: corrupted line_ok "
+          "caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = evaluate_steps_shape_mismatch(
+        dict(exp_reject, files_written=True), exp_reject)
+    check("651 evaluate-steps-shape e2e: corrupted "
+          "files_written caught, names field",
+          probe is not None and probe.startswith("files_written:"),
+          probe or "")
+    probe = evaluate_steps_shape_mismatch(
+        dict(exp_reject, chat_calls=1), exp_reject)
+    check("651 evaluate-steps-shape e2e: corrupted chat_calls "
+          "caught, names field",
+          probe is not None and probe.startswith("chat_calls:"),
+          probe or "")
+
+    env_keys = ("QALOOP_MODEL_API_KEY", "QALOOP_MODEL_BASE_URL",
+                "QALOOP_MODEL_NAME", "QALOOP_RUNS",
+                "QALOOP_LEDGER", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    real_chat = evaluate_mod._chat
+    calls = []
+
+    def fake_chat(cfg, messages, timeout_s=90):
+        calls.append(messages)
+        verdict = {"verdict": "MAKES_SENSE",
+                   "confidence": "medium",
+                   "rationale": "the run evidence fits the claim",
+                   "evidence": [], "risks": []}
+        return json.dumps(verdict), {"prompt_tokens": 10,
+                                     "completion_tokens": 5}
+
+    try:
+        os.environ["QALOOP_MODEL_API_KEY"] = "probe-key-651"
+        os.environ.pop("QALOOP_MODEL_BASE_URL", None)
+        os.environ.pop("QALOOP_MODEL_NAME", None)
+        os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        os.environ.pop("TARGET_URL", None)
+        evaluate_mod._chat = fake_chat
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["QALOOP_RUNS"] = os.path.join(td, "runs")
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            diff_path = os.path.join(td, "change.diff")
+            with open(diff_path, "w", encoding="utf-8") as f:
+                f.write("--- a/x.py\n+++ b/x.py\n"
+                        "@@ -1 +1 @@\n-old\n+new\n")
+
+            def run_evaluate(run_dir):
+                parsed = cli.build_parser().parse_args(
+                    ["evaluate", "--claim", "the change works",
+                     "--run", run_dir, "--diff", diff_path])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def files_written(run_dir):
+                return (os.path.exists(os.path.join(
+                            run_dir, "EVALUATION.md"))
+                        or os.path.exists(os.path.join(
+                            run_dir, "evaluation.json")))
+
+            def pin_reject(tag, content, expected_line_fn):
+                run_dir = os.path.join(td, f"run-{tag}")
+                os.makedirs(run_dir)
+                run_path = os.path.join(run_dir, "run.json")
+                with open(run_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                expected_line = expected_line_fn(run_path)
+                before = len(calls)
+                rc, lines = run_evaluate(run_dir)
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "real cmd_evaluate exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                written = files_written(run_dir)
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "no evaluation files written",
+                      not written, str(written))
+                made = len(calls) - before
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "no model call made",
+                      made == 0, str(made))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "files_written": written,
+                           "chat_calls": made}
+                mismatch = evaluate_steps_shape_mismatch(
+                    outcome, exp_reject)
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            not_list = lambda p: (
+                f"ERROR: run.json steps is not a list: {p}")
+            pin_reject(
+                "steps-number",
+                json.dumps({"flow_name": "demo",
+                            "status": "passed", "steps": 42}),
+                not_list)
+            pin_reject(
+                "steps-string",
+                json.dumps({"flow_name": "demo",
+                            "status": "passed", "steps": "abc"}),
+                not_list)
+            pin_reject(
+                "steps-object",
+                json.dumps({"flow_name": "demo",
+                            "status": "passed",
+                            "steps": {"a": 1}}),
+                not_list)
+            pin_reject(
+                "step-not-object",
+                json.dumps({"flow_name": "demo",
+                            "status": "passed", "steps": [42]}),
+                lambda p: ("ERROR: run.json step is not a "
+                           f"JSON object: {p}"))
+
+            def pin_control(tag, content):
+                run_dir = os.path.join(td, f"run-{tag}")
+                os.makedirs(run_dir)
+                if content is not None:
+                    with open(os.path.join(run_dir, "run.json"),
+                              "w", encoding="utf-8") as f:
+                        f.write(content)
+                before = len(calls)
+                rc, lines = run_evaluate(run_dir)
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "control exits exactly 0",
+                      rc == 0, str(rc))
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "control verdict line is first",
+                      bool(lines) and lines[0] == (
+                          "verdict: MAKES_SENSE "
+                          "(confidence: medium)"),
+                      str(lines))
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "control writes both evaluation files",
+                      os.path.exists(os.path.join(
+                          run_dir, "EVALUATION.md"))
+                      and os.path.exists(os.path.join(
+                          run_dir, "evaluation.json")))
+                check(f"651 evaluate-steps-shape e2e: {tag} "
+                      "control reaches the model (judge + critic)",
+                      len(calls) - before == 2,
+                      str(len(calls) - before))
+
+            pin_control("missing", None)
+            pin_control("valid", json.dumps(
+                {"flow_name": "demo", "status": "passed",
+                 "steps": []}))
+    finally:
+        evaluate_mod._chat = real_chat
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 def test_issue_643_investigate_malformed_e2e():
     """Issue #643: pin the CLI investigate structurally-
     malformed run.json exit path end to end. cmd_investigate
