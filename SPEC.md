@@ -1023,6 +1023,10 @@ Exit codes: 0 when the runs are identical, 1 when they differ (like
 A run.json whose steps is not a list of step objects is corrupt for
 compare purposes: compare prints one error line, exits 2, and prints
 no diff.
+A run.json whose top-level or any step's duration_ms is present and
+not a number is likewise corrupt for compare purposes: compare
+prints one error line, exits 2, and prints no diff; a missing
+duration_ms remains valid and is treated as 0.
 
 ### Flakiness tracking: pass rate over time
 
