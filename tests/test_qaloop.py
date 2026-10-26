@@ -55114,6 +55114,208 @@ def test_issue_645_compare_steps_shape_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_649_compare_duration_ms_e2e():
+    """Issue #649: pin the CLI compare duration_ms exit
+    path end to end. _load_run_json tolerated a run.json
+    whose duration_ms was present and not a number, so
+    the duration delta raised an uncaught error instead
+    of the clean CompareError exit 2. This test stubs
+    NOTHING: it drives only the real
+    build_parser -> cmd_compare with hand-written run.json
+    files and pins, for each rejected phase, exit exactly
+    2, stdout exactly one exact error line, and no diff
+    printed - non-numeric top-level duration_ms on side A
+    and on side B, non-numeric step duration_ms on side A
+    and on side B, and boolean duration_ms rejected - plus
+    the unchanged controls: valid-identical exits 0,
+    valid-differ exits 1, a missing-duration_ms pair still
+    compares, and corrupt JSON, a non-object top level, a
+    steps-shape case, and a missing run.json each exit 2."""
+    from qaloop import cli
+
+    def compare_duration_ms_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_reject = {"exit_code": 2, "line_count": 1, "line_ok": True,
+                  "diff_printed": False}
+    check("649 compare-duration-ms e2e: exact expectations "
+          "return no mismatch",
+          compare_duration_ms_mismatch(
+              dict(exp_reject), exp_reject) is None)
+    probe = compare_duration_ms_mismatch(
+        dict(exp_reject, exit_code=1), exp_reject)
+    check("649 compare-duration-ms e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = compare_duration_ms_mismatch(
+        dict(exp_reject, line_ok=False), exp_reject)
+    check("649 compare-duration-ms e2e: corrupted printed "
+          "line caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = compare_duration_ms_mismatch(
+        dict(exp_reject, diff_printed=True), exp_reject)
+    check("649 compare-duration-ms e2e: corrupted "
+          "diff_printed caught, names field",
+          probe is not None and probe.startswith("diff_printed:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["QALOOP_RUNS"] = td
+            os.environ.pop("QALOOP_MODEL_API_KEY", None)
+            os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+            os.environ.pop("TARGET_URL", None)
+            a_dir = os.path.join(td, "runA")
+            b_dir = os.path.join(td, "runB")
+            os.makedirs(a_dir)
+            os.makedirs(b_dir)
+            valid = {"status": "passed", "duration_ms": 100,
+                     "steps": [{"name": "s1", "status": "passed",
+                                "duration_ms": 100}]}
+            missing = {"status": "passed",
+                       "steps": [{"name": "s1", "status": "passed"}]}
+
+            def write_run(run_dir, payload):
+                with open(os.path.join(run_dir, "run.json"),
+                          "w", encoding="utf-8") as f:
+                    if isinstance(payload, str):
+                        f.write(payload)
+                    else:
+                        json.dump(payload, f)
+
+            def run_compare():
+                parsed = cli.build_parser().parse_args(
+                    ["compare", a_dir, b_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                return rc, buf.getvalue().splitlines()
+
+            def diff_printed(lines):
+                return any(ln.startswith("compare: ")
+                           or ln in ("identical", "differ")
+                           for ln in lines)
+
+            def pin_reject(tag, side_dir, problem):
+                rc, lines = run_compare()
+                expected_line = (f"ERROR: corrupt run.json in "
+                                 f"{side_dir}: {problem}")
+                line = lines[0] if lines else ""
+                printed = diff_printed(lines)
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "real cmd_compare exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "line equals the exact error line",
+                      line == expected_line, line)
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "no diff printed",
+                      not printed, str(lines))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line == expected_line,
+                           "diff_printed": printed}
+                mismatch = compare_duration_ms_mismatch(
+                    outcome, exp_reject)
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            write_run(a_dir, dict(valid, duration_ms="100"))
+            write_run(b_dir, valid)
+            pin_reject("non-numeric-top-A", a_dir,
+                       "duration_ms is not a number")
+            write_run(a_dir, valid)
+            write_run(b_dir, dict(valid, duration_ms="100"))
+            pin_reject("non-numeric-top-B", b_dir,
+                       "duration_ms is not a number")
+            write_run(a_dir, dict(valid, steps=[{"name": "s1", "status": "passed", "duration_ms": "100"}]))
+            write_run(b_dir, valid)
+            pin_reject("non-numeric-step-A", a_dir,
+                       "steps[0].duration_ms is not a number")
+            write_run(a_dir, valid)
+            write_run(b_dir, dict(valid, steps=[{"name": "s1", "status": "passed", "duration_ms": "100"}]))
+            pin_reject("non-numeric-step-B", b_dir,
+                       "steps[0].duration_ms is not a number")
+            write_run(a_dir, valid)
+            write_run(b_dir, dict(valid, duration_ms=True))
+            pin_reject("bool-top-B", b_dir,
+                       "duration_ms is not a number")
+
+            write_run(a_dir, valid)
+            write_run(b_dir, valid)
+            rc, lines = run_compare()
+            check("649 compare-duration-ms e2e: valid-identical "
+                  "control exits exactly 0", rc == 0, str(rc))
+            check("649 compare-duration-ms e2e: valid-identical "
+                  "control final line is identical",
+                  bool(lines) and lines[-1] == "identical",
+                  str(lines))
+            write_run(b_dir, dict(valid, status="failed"))
+            rc, lines = run_compare()
+            check("649 compare-duration-ms e2e: valid-differ "
+                  "control exits exactly 1", rc == 1, str(rc))
+            check("649 compare-duration-ms e2e: valid-differ "
+                  "control final line is differ",
+                  bool(lines) and lines[-1] == "differ",
+                  str(lines))
+            write_run(a_dir, missing)
+            write_run(b_dir, missing)
+            rc, lines = run_compare()
+            check("649 compare-duration-ms e2e: missing-duration "
+                  "control exits exactly 0", rc == 0, str(rc))
+            check("649 compare-duration-ms e2e: missing-duration "
+                  "control final line is identical",
+                  bool(lines) and lines[-1] == "identical",
+                  str(lines))
+            write_run(b_dir, valid)
+            write_run(a_dir, dict(valid, steps=42))
+            rc, lines = run_compare()
+            check("649 compare-duration-ms e2e: steps-shape "
+                  "control exits exactly 2", rc == 2, str(rc))
+            check("649 compare-duration-ms e2e: steps-shape "
+                  "control is exactly one ERROR line",
+                  len(lines) == 1
+                  and lines[0].startswith("ERROR: "),
+                  str(lines))
+            for tag, raw in (("corrupt-json", "{not json"),
+                             ("non-object-top", "42")):
+                write_run(a_dir, raw)
+                rc, lines = run_compare()
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "control exits exactly 2",
+                      rc == 2, str(rc))
+                check(f"649 compare-duration-ms e2e: {tag} "
+                      "control is exactly one ERROR line",
+                      len(lines) == 1
+                      and lines[0].startswith("ERROR: "),
+                      str(lines))
+            os.remove(os.path.join(a_dir, "run.json"))
+            rc, lines = run_compare()
+            check("649 compare-duration-ms e2e: missing-run-json "
+                  "control exits exactly 2", rc == 2, str(rc))
+            check("649 compare-duration-ms e2e: missing-run-json "
+                  "control is exactly one ERROR line",
+                  len(lines) == 1
+                  and lines[0].startswith("ERROR: "),
+                  str(lines))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

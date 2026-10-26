@@ -31,6 +31,10 @@ def _load_run_json(run_dir: str) -> dict:
         raise CompareError(f"corrupt run.json in {run_dir}: {e}")
     if not isinstance(data, dict):
         raise CompareError(f"corrupt run.json in {run_dir}: top level is not an object")
+    if "duration_ms" in data:
+        value = data["duration_ms"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CompareError(f"corrupt run.json in {run_dir}: duration_ms is not a number")
     if "steps" in data:
         steps = data["steps"]
         if not isinstance(steps, list):
@@ -38,6 +42,10 @@ def _load_run_json(run_dir: str) -> dict:
         for i, step in enumerate(steps):
             if not isinstance(step, dict):
                 raise CompareError(f"corrupt run.json in {run_dir}: steps[{i}] is not an object")
+            if "duration_ms" in step:
+                value = step["duration_ms"]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise CompareError(f"corrupt run.json in {run_dir}: steps[{i}].duration_ms is not a number")
     return data
 
 
