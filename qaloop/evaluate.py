@@ -129,6 +129,13 @@ def collect_evidence(run_dir: str, diff: str) -> dict:
         raise ValueError(f"run.json is not valid JSON: {run_path}")
     if not isinstance(run, dict):
         raise ValueError(f"run.json is not a JSON object: {run_path}")
+    if "steps" in run and not isinstance(run["steps"], list):
+        raise ValueError(f"run.json steps is not a list: {run_path}")
+    if isinstance(run.get("steps"), list):
+        for s in run["steps"]:
+            if not isinstance(s, dict):
+                raise ValueError(
+                    f"run.json step is not a JSON object: {run_path}")
 
     steps = []
     for s in run.get("steps", []):

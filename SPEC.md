@@ -1247,7 +1247,10 @@ A missing `run.json` in the run dir is tolerated (the judge proceeds on
 empty run evidence). A malformed `run.json` — not valid JSON, or a top
 level that is not a JSON object — is rejected instead: `evaluate` prints
 exactly one error line naming the problem, exits 2, writes no
-`EVALUATION.md` / `evaluation.json`, and makes no model call.
+`EVALUATION.md` / `evaluation.json`, and makes no model call. A `run.json`
+whose `steps` is not a list of step objects is likewise malformed for
+evaluate purposes: `evaluate` prints exactly one error line naming the
+problem, exits 2, writes no evaluation files, and makes no model call.
 
 Verdicts: `MAKES_SENSE`, `DOES_NOT_MAKE_SENSE`, `INSUFFICIENT_EVIDENCE`,
 `BLOCKED`.
