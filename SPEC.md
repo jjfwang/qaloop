@@ -1251,6 +1251,11 @@ exactly one error line naming the problem, exits 2, writes no
 whose `steps` is not a list of step objects is likewise malformed for
 evaluate purposes: `evaluate` prints exactly one error line naming the
 problem, exits 2, writes no evaluation files, and makes no model call.
+A `run.json` whose `error` (top-level or step-level) is not a string, or
+whose `console_errors` / `page_errors` / `failed_requests` /
+`bad_responses` is not a list, is likewise malformed for evaluate
+purposes: `evaluate` prints exactly one error line naming the problem,
+exits 2, writes no evaluation files, and makes no model call.
 
 Verdicts: `MAKES_SENSE`, `DOES_NOT_MAKE_SENSE`, `INSUFFICIENT_EVIDENCE`,
 `BLOCKED`.

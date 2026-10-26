@@ -136,6 +136,17 @@ def collect_evidence(run_dir: str, diff: str) -> dict:
             if not isinstance(s, dict):
                 raise ValueError(
                     f"run.json step is not a JSON object: {run_path}")
+    if "error" in run and not isinstance(run["error"], str):
+        raise ValueError(f"run.json error is not a string: {run_path}")
+    if isinstance(run.get("steps"), list):
+        for s in run["steps"]:
+            if "error" in s and not isinstance(s["error"], str):
+                raise ValueError(
+                    f"run.json step error is not a string: {run_path}")
+    for field in ("console_errors", "page_errors", "failed_requests",
+                  "bad_responses"):
+        if field in run and not isinstance(run[field], list):
+            raise ValueError(f"run.json {field} is not a list: {run_path}")
 
     steps = []
     for s in run.get("steps", []):
