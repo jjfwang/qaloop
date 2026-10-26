@@ -54388,6 +54388,201 @@ def test_issue_641_dashboard_nonobject_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_647_dashboard_malformed_fields_e2e():
+    """Issue #647: pin the dashboard malformed-fields
+    tolerance end to end. dashboard.build tolerated a
+    corrupt or non-object run.json (skipped, #637/#641)
+    but a run.json that IS a JSON object with malformed
+    fields bricked the whole dashboard: build iterated
+    r.get("steps", []) calling s.get(...) per entry and
+    called .get(...) on a truthy r["diagnosis"], and
+    cmd_dashboard catches only ValueError, so steps: 42
+    raised TypeError, steps: [42] and steps: "abc" raised
+    AttributeError, and diagnosis: "x" / diagnosis: 42
+    raised AttributeError - all uncaught, no dashboard
+    written. This test stubs NOTHING: it drives only the
+    real build_parser -> cmd_dashboard and pins, for each
+    of the five malformed phases, exit exactly 0, the
+    dashboard written, the run still counted, and no dx
+    or retry label rendered from the malformed value -
+    plus the valid control (a real retried step and an
+    object diagnosis render their retry and dx labels
+    unchanged) and the corrupt-JSON and non-object
+    controls unchanged (skipped, exit 0)."""
+    import re
+
+    from qaloop import cli
+
+    def dashboard_fields_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp_tolerate = {"exit_code": 0, "dashboard_written": True,
+                    "run_count": 1}
+    check("647 dashboard-fields e2e: exact expectations "
+          "return no mismatch",
+          dashboard_fields_mismatch(
+              dict(exp_tolerate), exp_tolerate) is None)
+    probe = dashboard_fields_mismatch(
+        dict(exp_tolerate, exit_code=2), exp_tolerate)
+    check("647 dashboard-fields e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = dashboard_fields_mismatch(
+        dict(exp_tolerate, dashboard_written=False),
+        exp_tolerate)
+    check("647 dashboard-fields e2e: corrupted "
+          "dashboard_written caught, names field",
+          probe is not None and probe.startswith(
+              "dashboard_written:"), probe or "")
+    probe = dashboard_fields_mismatch(
+        dict(exp_tolerate, run_count=0), exp_tolerate)
+    check("647 dashboard-fields e2e: corrupted run_count "
+          "caught, names field",
+          probe is not None and probe.startswith("run_count:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY",
+                "QALOOP_EXECUTABLE_PATH", "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        os.environ.pop("QALOOP_MODEL_API_KEY", None)
+        os.environ.pop("QALOOP_EXECUTABLE_PATH", None)
+        os.environ.pop("TARGET_URL", None)
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "missing-ledger.jsonl")
+
+            def run_dashboard(tag, run_json_text):
+                tag_root = os.path.join(td, f"runs-{tag}")
+                os.makedirs(tag_root)
+                os.environ["QALOOP_RUNS"] = tag_root
+                run_dir = os.path.join(tag_root, f"run-{tag}")
+                os.makedirs(run_dir)
+                with open(os.path.join(run_dir, "run.json"),
+                          "w", encoding="utf-8") as f:
+                    f.write(run_json_text)
+                out_dir = os.path.join(td, f"out-{tag}")
+                parsed = cli.build_parser().parse_args(
+                    ["dashboard", "--out", out_dir])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                index_path = os.path.join(out_dir, "index.html")
+                written = os.path.exists(index_path)
+                html = ""
+                if written:
+                    with open(index_path, encoding="utf-8") as f:
+                        html = f.read()
+                found = re.findall(r"<b>(\d+)</b>runs", html)
+                count = int(found[0]) if found else -1
+                return rc, lines, written, count, html, out_dir
+
+            def run_obj(tag, **fields):
+                base = {"flow_name": "demo", "status": "failed",
+                        "started": 1700000000, "duration_ms": 5,
+                        "run_dir": f"run-{tag}"}
+                base.update(fields)
+                return json.dumps(base) + "\n"
+
+            def pin_tolerate(tag, run_json_text):
+                rc, lines, written, count, html, out_dir = (
+                    run_dashboard(tag, run_json_text))
+                expected = ("dashboard: " + os.path.join(
+                    out_dir, "index.html"))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "real cmd_dashboard exits exactly 0",
+                      rc == 0, str(rc))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "stdout is exactly the dashboard line",
+                      lines == [expected], str(lines))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "dashboard index.html written",
+                      written, str(written))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "run still counted",
+                      count == 1, str(count))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "no dx label from malformed value",
+                      "dx:" not in html, html[-200:])
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "no retry label from malformed value",
+                      "retry \u2014" not in html, html[-200:])
+                outcome = {"exit_code": rc,
+                           "dashboard_written": written,
+                           "run_count": count}
+                mismatch = dashboard_fields_mismatch(
+                    outcome, exp_tolerate)
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "real composition pins the pinned "
+                      "fields exactly", mismatch is None,
+                      mismatch or "")
+
+            pin_tolerate("steps-num", run_obj(
+                "steps-num", steps=42))
+            pin_tolerate("steps-entry", run_obj(
+                "steps-entry", steps=[42]))
+            pin_tolerate("steps-string", run_obj(
+                "steps-string", steps="abc"))
+            pin_tolerate("diagnosis-string", run_obj(
+                "diagnosis-string", diagnosis="x"))
+            pin_tolerate("diagnosis-num", run_obj(
+                "diagnosis-num", diagnosis=42))
+
+            rc, lines, written, count, html, out_dir = (
+                run_dashboard("valid", run_obj(
+                    "valid", status="passed",
+                    steps=[{"name": "login", "attempts": 3}],
+                    diagnosis={"likely_cause":
+                               "flaky locator"})))
+            expected = ("dashboard: " + os.path.join(
+                out_dir, "index.html"))
+            check("647 dashboard-fields e2e: valid control "
+                  "exits exactly 0", rc == 0, str(rc))
+            check("647 dashboard-fields e2e: valid control "
+                  "stdout is exactly the dashboard line",
+                  lines == [expected], str(lines))
+            check("647 dashboard-fields e2e: valid control "
+                  "dashboard index.html written",
+                  written, str(written))
+            check("647 dashboard-fields e2e: valid control "
+                  "run counted", count == 1, str(count))
+            check("647 dashboard-fields e2e: valid control "
+                  "dx label rendered unchanged",
+                  "dx: flaky locator" in html, html[-300:])
+            check("647 dashboard-fields e2e: valid control "
+                  "retry label rendered unchanged",
+                  "retry \u2014 login: 3 attempts" in html,
+                  html[-300:])
+
+            def pin_skip(tag, run_json_text):
+                rc, lines, written, count, html, out_dir = (
+                    run_dashboard(tag, run_json_text))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "control exits exactly 0",
+                      rc == 0, str(rc))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "control dashboard index.html written",
+                      written, str(written))
+                check(f"647 dashboard-fields e2e: {tag} "
+                      "control entry not counted as a run",
+                      count == 0, str(count))
+
+            pin_skip("corrupt-json", "{not json\n")
+            pin_skip("nonobject-top", "42\n")
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 def test_issue_639_evaluate_malformed_e2e():
     """Issue #639: pin the CLI evaluate malformed-run.json
     exit path end to end. collect_evidence caught only

@@ -1035,7 +1035,13 @@ exactly `"passed"`; corrupt or fieldless entries are tolerated and
 simply count as failures. A run.json whose top level is not a JSON
 object (for example `42`, `[1, 2]`, or a bare string) is tolerated
 the same way as a corrupt one: it is skipped, the dashboard is
-still written, and the command exits 0. The table shows recent flakiness per flow
+still written, and the command exits 0. A run.json object whose
+`steps` is not a list of step objects, or whose `diagnosis` is
+not an object, is tolerated the same way: the malformed
+decorations are ignored (no retry or dx label is rendered from
+them), the run row still renders and counts as a failure unless
+its status is exactly `"passed"`, the dashboard is still
+written, and the command exits 0. The table shows recent flakiness per flow
 without opening every report.
 
 A malformed ledger (a line that is not valid JSON, a line that is
