@@ -1,0 +1,63 @@
+version: 1
+name: game-care-hint-routing
+description: >-
+  C-01 care-feedback hint routing after the #698 thirst-hint change. On a
+  fresh session the pet's dominant deficit is hunger, so a wrong-but-safe
+  PET_SOOTHE read still escalates the generic hunger hint
+  (它看起来更想吃东西) - the new thirst routing only wins on a
+  comfortDeficit-dominant read with an empty water stock or a prior water
+  decline, which a fresh session cannot reach (comfortDeficit never rises
+  on its own in v1; the thirst branch is covered by the vitest routing
+  tests in wire.test.mjs). This flow exercises the changed client call
+  site end to end: server ACK careVerdict -> careFeedbackForVerdict with
+  the new water opts -> #care-feedback panel renders the behavior line +
+  the escalated hint, qualitative only (no counts, OD-029).
+target: ${TARGET_URL}
+
+setup:
+  - name: fresh profile so the one-time guidance renders
+    seed: {js: "localStorage.clear()"}
+  - name: open the client (real game server must be up on :3123 — boot per apps/game-server README section 1 with tsx src/main.ts, PORT=3123, and ALLOWED_ORIGINS set to this client's origin, e.g. http://127.0.0.1:8901; the socket fixture fixtures/game_socket_fixture.py never sends ACKs, so this flow cannot pass against it)
+    goto: /
+
+steps:
+  - name: S-01 handshake completes — connected line, loading frame gone
+    wait: {target: "#connection-state", state: visible, text: "Connected — a new game session started.", timeout_ms: 20000}
+    expect:
+      - text_contains: {selector: "#connection-state", text: "Connected — a new game session started."}
+      - hidden: "#loading-frame"
+      - hidden: "#load-error"
+
+  - name: S-02 guided first moment appears on first connect
+    expect:
+      - visible: "#guidance-overlay"
+      - visible: "#guidance-follow"
+
+  - name: S-03 dismissing the guidance lands on the W-01 tutorial hint
+    click: "#guidance-follow"
+    expect:
+      - hidden: "#guidance-overlay"
+      - visible: "#tutorial-hint"
+
+  - name: S-04 the Soothe care option opens the C-01 confirm
+    click: "#soothe-button"
+    expect:
+      - visible: "#care-confirm"
+
+  - name: S-05 confirming the care command
+    click: "#care-confirm-confirm"
+
+  - name: S-06 the C-01 feedback panel renders with the escalated hunger hint
+    wait: {target: "#care-feedback", state: visible, timeout_ms: 20000}
+    expect:
+      - visible: "#care-feedback"
+      - text_contains: {selector: "#care-feedback-behavior", text: "它轻轻闻了闻，然后安静地挨着你趴了下来。"}
+      - text_contains: {selector: "#care-feedback-hint", text: "它看起来更想吃东西"}
+
+teardown:
+  - name: clean profile state
+    seed: {js: "localStorage.clear()"}
+
+artifacts: {screenshot: per-step, ax_snapshot: on-failure, trace: true}
+timeouts: {step_ms: 25000, run_ms: 180000}
+investigate_on_failure: true
