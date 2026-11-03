@@ -55849,6 +55849,133 @@ def test_issue_655_init_e2e():
                   os.path.join(nested, "my-first-flow.yaml")), str(rc4))
 
 
+def test_issue_657_verify_baselines_missing_flow_e2e():
+    """Issue #657: pin the CLI verify and baselines
+    missing-flow-file path end to end. Both commands
+    call _flow_services_info -> load_services_light
+    before any run dir is created, but
+    load_services_light opened the file outside its
+    try block, so a missing file raised an uncaught
+    FileNotFoundError (real CLI exit 1, traceback on
+    stderr) instead of the INVALID SPEC exit 2 that
+    verify's SPEC exit-code contract already promises
+    at the services light-parse stage. This test
+    stubs NOTHING in either chain: it drives only
+    the real build_parser -> cmd_verify and
+    cmd_baselines on a missing flow path, and pins
+    exit exactly 2, stdout exactly one INVALID SPEC
+    line naming the missing path, no run dir created
+    in the runs root, and zero ledger rows for each
+    command; plus a negative control pinning that
+    validate on the same missing file still raises
+    FileNotFoundError (issue #298 pinned behaviour,
+    unchanged)."""
+    from qaloop import cli, ledger
+
+    def missing_flow_mismatch(outcome, exp):
+        for field in exp:
+            if outcome.get(field) != exp.get(field):
+                return (f"{field}: expected {exp.get(field)!r}, "
+                        f"got {outcome.get(field)!r}")
+        return None
+
+    exp = {"exit_code": 2, "line_count": 1, "line_ok": True,
+           "run_dir_entries": [], "ledger_rows": 0}
+    check("657 missing-flow e2e: exact expectations "
+          "return no mismatch",
+          missing_flow_mismatch(dict(exp), exp) is None)
+    probe = missing_flow_mismatch(dict(exp, exit_code=1), exp)
+    check("657 missing-flow e2e: corrupted exit_code "
+          "caught, names field",
+          probe is not None and probe.startswith("exit_code:"),
+          probe or "")
+    probe = missing_flow_mismatch(dict(exp, line_ok=False), exp)
+    check("657 missing-flow e2e: corrupted printed line "
+          "caught, names field",
+          probe is not None and probe.startswith("line_ok:"),
+          probe or "")
+    probe = missing_flow_mismatch(
+        dict(exp, run_dir_entries=["x-run-abc"]), exp)
+    check("657 missing-flow e2e: corrupted "
+          "run_dir_entries caught, names field",
+          probe is not None
+          and probe.startswith("run_dir_entries:"), probe or "")
+    probe = missing_flow_mismatch(dict(exp, ledger_rows=1), exp)
+    check("657 missing-flow e2e: corrupted ledger_rows "
+          "caught, names field",
+          probe is not None and probe.startswith("ledger_rows:"),
+          probe or "")
+
+    env_keys = ("QALOOP_RUNS", "QALOOP_LEDGER",
+                "QALOOP_MODEL_API_KEY", "QALOOP_EXECUTABLE_PATH",
+                "TARGET_URL")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            runs_root = os.path.join(td, "runs")
+            os.makedirs(runs_root)
+            os.environ["QALOOP_RUNS"] = runs_root
+            os.environ["QALOOP_LEDGER"] = os.path.join(
+                td, "ledger.jsonl")
+            missing = os.path.join(td, "no-such-flow.yaml")
+            expected_line = (
+                "INVALID SPEC: spec " + missing
+                + ": cannot read file ([Errno 2] No such "
+                "file or directory: '" + missing + "')")
+            for cmd in ("verify", "baselines"):
+                parsed = cli.build_parser().parse_args(
+                    [cmd, missing])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = parsed.fn(parsed)
+                lines = buf.getvalue().splitlines()
+                check(f"657 missing-flow e2e: real cmd_{cmd} "
+                      "exits exactly 2", rc == 2, str(rc))
+                check(f"657 missing-flow e2e: cmd_{cmd} "
+                      "stdout is exactly one line",
+                      len(lines) == 1, str(lines))
+                line = lines[0] if lines else ""
+                check(f"657 missing-flow e2e: cmd_{cmd} "
+                      "line equals the exact INVALID SPEC "
+                      "line naming the missing path",
+                      line == expected_line, line)
+                line_ok = (line == expected_line)
+                run_dir_entries = sorted(os.listdir(runs_root))
+                check(f"657 missing-flow e2e: cmd_{cmd} "
+                      "creates no run dir in the runs root",
+                      run_dir_entries == [],
+                      str(run_dir_entries))
+                rows = ledger.read_all()
+                check(f"657 missing-flow e2e: cmd_{cmd} "
+                      "writes zero ledger rows",
+                      len(rows) == 0, str(rows))
+                outcome = {"exit_code": rc,
+                           "line_count": len(lines),
+                           "line_ok": line_ok,
+                           "run_dir_entries": run_dir_entries,
+                           "ledger_rows": len(rows)}
+                mismatch = missing_flow_mismatch(outcome, exp)
+                check(f"657 missing-flow e2e: cmd_{cmd} "
+                      "composition pins the pinned fields "
+                      "exactly", mismatch is None,
+                      mismatch or "")
+            parsed = cli.build_parser().parse_args(
+                ["validate", missing])
+            buf = io.StringIO()
+            raised = None
+            with contextlib.redirect_stdout(buf):
+                try:
+                    parsed.fn(parsed)
+                except FileNotFoundError as e:
+                    raised = e
+            check("657 missing-flow e2e: validate on the "
+                  "same missing file still raises "
+                  "FileNotFoundError (issue #298, unchanged)",
+                  raised is not None, str(raised))
+    finally:
+        for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):
