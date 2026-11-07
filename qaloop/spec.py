@@ -309,10 +309,16 @@ def load_services_light(path: str) -> tuple[str, list[dict]]:
     are available as ${QALOOP_SERVICE_<NAME>_URL} during env substitution.
     Never boots anything itself. Raises SpecError when the file cannot
     be parsed (issue #89: the batch path records this as an INVALID-SPEC
-    failure instead of crashing).
+    failure instead of crashing) or cannot be read (issue #657: a
+    missing, unreadable, or directory flow path is a SpecError too, so
+    verify/baselines print INVALID SPEC and exit 2 instead of crashing
+    with an uncaught traceback).
     """
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise SpecError(f"spec {path}: cannot read file ({e})")
     try:
         raw = yaml.safe_load(text)
     except Exception as e:

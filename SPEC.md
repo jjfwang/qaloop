@@ -351,7 +351,10 @@ baseline-update mode; the exit code is 0 iff every combination passed.
 `baselines` also accepts `--upload-dir <dir>` (env
 `QALOOP_UPLOAD_DIR`) with the same semantics as `verify`: the flag
 wins when both are set; when neither is declared, the runner is
-fail-closed (issue #76).
+fail-closed (issue #76). Like `verify`, `baselines` light-parses
+`services:` first, so a missing, unreadable, or directory flow path
+prints exactly one `INVALID SPEC` line naming the path and exits 2,
+writing no run dir and no ledger entry.
 
 ### Diff artifacts on mismatch
 
@@ -848,7 +851,10 @@ Semantics, verified against `qaloop/cli.py` (`cmd_verify`):
 1. `--keep-runs` resolves first; an invalid value prints `ERROR: {e}`
    and exits 2 before anything runs.
 2. The flow's `services:` are light-parsed (no env substitution). A
-   parse failure prints `INVALID SPEC: {e}` and exits 2.
+   parse failure prints `INVALID SPEC: {e}` and exits 2. A missing,
+   unreadable, or directory flow path at this stage is a light-parse
+   failure too: it prints exactly one `INVALID SPEC` line naming the
+   path and exits 2, writing no run dir and no ledger entry.
 3. A run dir `<runs>/YYYYMMDDTHHMMSSZ-<flow-name>` is created under the
    `QALOOP_RUNS` env var, or `<repo>/runs` by default. `verify` prints
    `run dir: <run_dir>` and `target:  <target>`.
