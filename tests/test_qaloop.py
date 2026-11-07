@@ -55755,6 +55755,100 @@ def test_issue_649_compare_duration_ms_e2e():
         for k in env_keys: os.environ.pop(k, None) if saved[k] is None else os.environ.update({k: saved[k]})
 
 
+def test_issue_655_init_e2e():
+    """Issue #655: pin the CLI init scaffold path end to end.
+
+    Drives only the real build_parser -> cmd_init: init in an empty
+    directory writes my-first-flow.yaml + my-first-flow.html, the
+    generated flow validates with no flags beyond the flow path, the
+    flow carries only goto + text_contains + ax (no
+    screenshot_matches, so no baselines step is needed), the printed
+    steps name validate, the server step and verify --target, a
+    second init over the same path exits exactly 2 naming the
+    existing file and leaves both files byte-identical, and a
+    pre-existing page alone also refuses with exit 2 and writes no
+    flow file.
+    """
+    from qaloop import cli
+
+    def run_init(d):
+        parsed = cli.build_parser().parse_args(["init", "--dir", d])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = parsed.fn(parsed)
+        return rc, buf.getvalue()
+
+    def run_validate(path):
+        parsed = cli.build_parser().parse_args(["validate", path])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = parsed.fn(parsed)
+        return rc, buf.getvalue()
+
+    parsed_default = cli.build_parser().parse_args(["init"])
+    check("655 init e2e: --dir defaults to current directory",
+          parsed_default.dir == ".", str(parsed_default.dir))
+    with tempfile.TemporaryDirectory() as td:
+        rc, out = run_init(td)
+        flow_path = os.path.join(td, "my-first-flow.yaml")
+        page_path = os.path.join(td, "my-first-flow.html")
+        check("655 init e2e: init in empty dir exits 0", rc == 0, str(rc))
+        check("655 init e2e: flow file written",
+              os.path.isfile(flow_path))
+        check("655 init e2e: page file written",
+              os.path.isfile(page_path))
+        with open(flow_path, encoding="utf-8") as f:
+            flow_text = f.read()
+        with open(page_path, encoding="utf-8") as f:
+            page_text = f.read()
+        check("655 init e2e: flow targets the generated page",
+              "goto: /my-first-flow.html" in flow_text, flow_text)
+        check("655 init e2e: flow has text_contains assertion",
+              "text_contains" in flow_text and "Hello from qaloop" in flow_text)
+        check("655 init e2e: flow has ax assertion",
+              "ax: {role: button, name: \"Say hello\"}" in flow_text)
+        check("655 init e2e: flow needs no baselines step",
+              "screenshot_matches" not in flow_text)
+        check("655 init e2e: page carries heading and button",
+              "<h1>Hello from qaloop</h1>" in page_text
+              and "Say hello" in page_text)
+        vrc, vout = run_validate(flow_path)
+        check("655 init e2e: generated flow validates", vrc == 0, vout)
+        check("655 init e2e: printed steps name validate, server, verify",
+              f"validate {flow_path}" in out
+              and "http.server 8901" in out
+              and f"TARGET_URL=http://127.0.0.1:8901 python3 -m qaloop.cli "
+                  f"verify {flow_path}" in out,
+              out)
+        before_flow = open(flow_path, "rb").read()
+        before_page = open(page_path, "rb").read()
+        rc2, out2 = run_init(td)
+        check("655 init e2e: second init exits exactly 2",
+              rc2 == 2, str(rc2))
+        check("655 init e2e: second init names the existing file",
+              flow_path in out2, out2)
+        check("655 init e2e: second init leaves flow byte-identical",
+              open(flow_path, "rb").read() == before_flow)
+        check("655 init e2e: second init leaves page byte-identical",
+              open(page_path, "rb").read() == before_page)
+        with tempfile.TemporaryDirectory() as td2:
+            page_only = os.path.join(td2, "my-first-flow.html")
+            with open(page_only, "w", encoding="utf-8") as f:
+                f.write("<html></html>\n")
+            rc3, out3 = run_init(td2)
+            check("655 init e2e: page-only existing refuses with exit 2",
+                  rc3 == 2, str(rc3))
+            check("655 init e2e: page-only refusal names the page",
+                  page_only in out3, out3)
+            check("655 init e2e: page-only refusal writes no flow",
+                  not os.path.exists(os.path.join(td2, "my-first-flow.yaml")))
+        nested = os.path.join(td, "sub", "starter")
+        rc4, _ = run_init(nested)
+        check("655 init e2e: nested --dir is created, exits 0",
+              rc4 == 0 and os.path.isfile(
+                  os.path.join(nested, "my-first-flow.yaml")), str(rc4))
+
+
 if __name__ == "__main__":
     for fn in sorted([v for k, v in globals().items()
                       if k.startswith("test_")], key=lambda f: f.__name__):

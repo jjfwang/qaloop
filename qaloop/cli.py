@@ -19,6 +19,80 @@ def default_runs_root() -> str:
     return os.environ.get("QALOOP_RUNS", os.path.join(QALOOP_HOME, "runs"))
 
 
+INIT_FLOW_FILENAME = "my-first-flow.yaml"
+INIT_PAGE_FILENAME = "my-first-flow.html"
+
+INIT_FLOW_TEMPLATE = """name: my-first-flow
+description: >-
+  Starter flow written by `qaloop init`: opens the starter page written
+  alongside this flow, checks its heading text, and checks its button
+  by accessible role and name. It uses no screenshot assertion, so
+  this flow needs no baselines step to pass.
+target: ${TARGET_URL}
+
+setup:
+  - name: open the starter page
+    goto: /my-first-flow.html
+
+steps:
+  - name: starter page shows its heading
+    expect:
+      - text_contains: {selector: "h1", text: "Hello from qaloop"}
+
+  - name: starter button matches role and name
+    expect:
+      - ax: {role: button, name: "Say hello"}
+
+teardown: []
+
+artifacts: {screenshot: on-failure, ax_snapshot: on-failure, trace: false}
+timeouts: {step_ms: 15000, run_ms: 120000}
+investigate_on_failure: false
+"""
+
+INIT_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>my first flow</title>
+</head>
+<body>
+<h1>Hello from qaloop</h1>
+<button id="say-hello" type="button">Say hello</button>
+</body>
+</html>
+"""
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Issue #655: scaffold a minimal first flow in an empty directory.
+
+    Writes my-first-flow.yaml and my-first-flow.html under --dir
+    (default: the current directory). Refuses to overwrite an existing
+    file with a clean exit 2, naming the existing path, and writes
+    nothing in that case.
+    """
+    out_dir = os.path.abspath(args.dir)
+    flow_path = os.path.join(out_dir, INIT_FLOW_FILENAME)
+    page_path = os.path.join(out_dir, INIT_PAGE_FILENAME)
+    for path in (flow_path, page_path):
+        if os.path.exists(path):
+            print(f"init: refusing to overwrite existing file: {path}")
+            return 2
+    os.makedirs(out_dir, exist_ok=True)
+    with open(flow_path, "w", encoding="utf-8") as f:
+        f.write(INIT_FLOW_TEMPLATE)
+    with open(page_path, "w", encoding="utf-8") as f:
+        f.write(INIT_PAGE_TEMPLATE)
+    print(f"Created {flow_path}")
+    print(f"Created {page_path}")
+    print("Next steps:")
+    print(f"  python3 -m qaloop.cli validate {flow_path}")
+    print(f"  python3 -m http.server 8901 --directory {out_dir}  # keep this running")
+    print(f"  TARGET_URL=http://127.0.0.1:8901 python3 -m qaloop.cli verify {flow_path}")
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     try:
         spec = load_spec(args.flow, strict_env=False)
@@ -769,6 +843,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="qaloop",
                                 description="Agentic QA loop: deterministic flows + browser investigator")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("init", help="scaffold a minimal first flow")
+    i.add_argument("--dir", default=".",
+                   help="directory to write the starter flow and page into "
+                        "(default: current directory)")
+    i.set_defaults(fn=cmd_init)
 
     v = sub.add_parser("validate", help="validate a flow spec")
     v.add_argument("flow", help="path to flow YAML")

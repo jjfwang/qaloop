@@ -90,6 +90,7 @@ alongside the feature. Conventions:
 
 | command | what it does |
 |---|---|
+| `init [--dir DIR]` | scaffold a minimal first flow (`my-first-flow.yaml` + page) in DIR (default: current directory); refuses to overwrite, exit 2 |
 | `validate <flow>` | check spec structure (env vars not required) |
 | `verify <flow\|dir> [--tag T] [--target URL] [--investigate] [--headed] [--executable-path PATH] [--max-investigation-actions N]` | run once (or a whole directory), print card, write `runs/<id>/REPORT.md` + `junit.xml` |
 | `baselines <flow> [--target URL]` | **update mode**: save `screenshot_matches` baselines instead of comparing |
